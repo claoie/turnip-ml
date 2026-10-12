@@ -123,10 +123,10 @@ class GateTestCase(unittest.TestCase):
     def ingested(self, entries=None, name="ingested.json"):
         if entries is None:
             entries = [
-                {"source_id": SRC_C, "user_id": "user-2"},
-                {"source_id": SRC_A, "user_id": "user-1"},
-                {"source_id": SRC_B, "user_id": "user-1"},
-                {"source_id": SRC_A, "user_id": "user-1"},  # dup, same owner
+                SRC_C,
+                SRC_A,
+                SRC_B,
+                SRC_A,  # listed twice
             ]
         return self.write_json(name, entries)
 
@@ -161,7 +161,7 @@ class RegressionTest(GateTestCase):
         self.assertEqual(record["metrics"]["delta"], -0.2)
 
         # Alert fired once, at the configured webhook, with the delta and
-        # the affected source and user ids; mentions disabled.
+        # the affected source ids; mentions disabled.
         self.assertEqual(len(self.sender.calls), 1)
         url, payload = self.sender.calls[0]
         self.assertEqual(url, WEBHOOK)
@@ -171,7 +171,8 @@ class RegressionTest(GateTestCase):
         self.assertIn("delta -0.200000", content)
         for src in (SRC_A, SRC_B, SRC_C):
             self.assertIn(src, content)
-        self.assertIn("users: `user-1`, `user-2`", content)
+        self.assertIn(f"sources: `{SRC_A}`, `{SRC_B}`, `{SRC_C}`", content)
+        self.assertNotIn("user", content)
         self.assertIn("fixture set: `fx-1`", content)
         self.assertEqual(record["alert_status"], "sent")
 
@@ -179,9 +180,9 @@ class RegressionTest(GateTestCase):
         # like a data_quarantine insert.
         rows = self.quarantine_rows()
         self.assertEqual([r["source_id"] for r in rows], [SRC_A, SRC_B, SRC_C])
-        self.assertEqual([r["user_id"] for r in rows], ["user-1", "user-1", "user-2"])
         for row in rows:
-            self.assertEqual(set(row), {"source_id", "user_id", "reason", "metrics"})
+            # No account id: farm-side attribution only (data_quarantine).
+            self.assertEqual(set(row), {"source_id", "reason", "metrics"})
             self.assertEqual(row["reason"], record["reason"])
             self.assertEqual(row["metrics"], record["metrics"])
         self.assertEqual(record["quarantined_sources"], 3)
@@ -304,10 +305,7 @@ class RegressionTest(GateTestCase):
         self.assertEqual(self.sender.calls, [])
 
     def test_alert_content_fits_discord_limit(self):
-        ingested = [
-            {"source_id": f"{i:064x}", "user_id": f"user-{i:04d}-" + "x" * 200}
-            for i in range(500)
-        ]
+        ingested = [f"{i:064x}" for i in range(500)]
         metrics = {
             "fixture_set": "fx-1",
             "tolerance": 0.01,
@@ -317,7 +315,7 @@ class RegressionTest(GateTestCase):
         }
         content = fixture_gate.alert_content(metrics, ingested)
         self.assertLessEqual(len(content), fixture_gate.DISCORD_MAX_CONTENT)
-        self.assertIn("quarantined 500 source(s) from 500 user(s)", content)
+        self.assertIn("quarantined 500 source(s)", content)
         self.assertIn("+490 more", content)
 
 
@@ -404,9 +402,9 @@ class PassTest(GateTestCase):
         # Same inputs, different listing order of the ingested sources.
         reordered = self.ingested(
             [
-                {"source_id": SRC_B, "user_id": "user-1"},
-                {"source_id": SRC_A, "user_id": "user-1"},
-                {"source_id": SRC_C, "user_id": "user-2"},
+                SRC_B,
+                SRC_A,
+                SRC_C,
             ],
             name="ingested2.json",
         )
@@ -497,28 +495,17 @@ class FailClosedTest(GateTestCase):
         cases = {
             "number": 5,
             "null": None,
-            "object": {"source_id": SRC_A, "user_id": "u"},
-            "extra-key": [{"source_id": SRC_A, "user_id": "u", "x": 1}],
-            "missing-user": [{"source_id": SRC_A}],
-            "numeric-id": [{"source_id": 123, "user_id": "u"}],
-            "uppercase-id": [{"source_id": "A" * 64, "user_id": "u"}],
-            "short-id": [{"source_id": "a" * 63, "user_id": "u"}],
-            "trailing-newline": [{"source_id": SRC_A + "\n", "user_id": "u"}],
-            "numeric-user": [{"source_id": SRC_A, "user_id": 123}],
-            "empty-user": [{"source_id": SRC_A, "user_id": ""}],
-            "user-injects-lines": [
-                {
-                    "source_id": SRC_A,
-                    "user_id": "x\n**ALL CLEAR**[go](https://evil.example)",
-                }
-            ],
-            "user-space": [{"source_id": SRC_A, "user_id": "u 1"}],
-            "user-backtick": [{"source_id": SRC_A, "user_id": "u`1"}],
-            "user-control-char": [{"source_id": SRC_A, "user_id": "u\x07"}],
-            "two-owners": [
-                {"source_id": SRC_A, "user_id": "u1"},
-                {"source_id": SRC_A, "user_id": "u2"},
-            ],
+            "object": {"source_id": SRC_A},
+            # Object entries are refused outright: they could carry an
+            # account id along, and training data carries none.
+            "entry-object": [{"source_id": SRC_A}],
+            "entry-with-user-id": [{"source_id": SRC_A, "user_id": "u1"}],
+            "numeric-id": [123],
+            "null-id": [None],
+            "uppercase-id": ["A" * 64],
+            "short-id": ["a" * 63],
+            "trailing-newline": [SRC_A + "\n"],
+            "injected-text": [SRC_A, "x\n**ALL CLEAR**[go](https://evil.example)"],
         }
         for name, data in cases.items():
             with self.subTest(case=name):

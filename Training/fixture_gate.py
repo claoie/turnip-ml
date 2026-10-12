@@ -11,9 +11,10 @@ Inputs
 ------
 --champion    fixture scores recorded for the current champion.
 --challenger  fixture scores for the challenger, from the same fixture set.
---ingested    JSON array of the sources ingested since the last watermark,
-              one {"source_id", "user_id"} object per source. These are the
-              quarantine candidates; attribution is the source's owner.
+--ingested    JSON array of the source ids ingested since the last
+              watermark: the quarantine candidates. Plain id strings, so
+              nothing account-shaped can ride along (training data carries
+              no account identifier).
 --out         fresh per-run directory; quarantine.json is written here.
 --tolerance   absolute slack on the composite score. Default: 0.01.
 --registry    model-registry stand-in: a JSON array file each decision
@@ -30,9 +31,9 @@ Fixture scores file:
 scores from different fixture sets are not comparable. Both components
 are in [0, 1]. Extra keys are kept in the record but not compared.
 
-Identifiers shown in the alert (`fixture_set`, `user_id`) must be printable
-with no whitespace or backticks, so they render inside Discord code spans
-and cannot inject lines, formatting or links.
+`fixture_set` is shown in the alert, so it must be printable with no
+whitespace or backticks: it renders inside a Discord code span and cannot
+inject lines, formatting or links.
 
 Decision rule
 -------------
@@ -40,10 +41,12 @@ Decision rule
     regression iff challenger_composite < champion_composite - tolerance
 On regression:
   - quarantine.json: one row per ingested source, shaped like a
-    `data_quarantine` insert (source_id, user_id, reason, metrics); the
-    farm assigns id and quarantined_at.
+    `data_quarantine` insert (source_id, reason, metrics); the farm
+    assigns id and quarantined_at. No account id: who uploaded a source
+    is read farm-side from source_attribution while it exists.
   - Discord alert (webhook from TURNIP_DISCORD_WEBHOOK_URL) with the
-    metrics delta and the affected source and user ids.
+    metrics delta and the affected source ids. Never account ids: a
+    Discord message outlives the farm's 30-day attribution window.
   - Exit 3 so the pipeline skips promotion.
 quarantine.json and the registry record (with `alert_status: "pending"`)
 are written before the alert is attempted; the record is then updated
@@ -182,36 +185,19 @@ def composite(scores: dict[str, Any]) -> float:
     return sum(float(scores[name]) for name in COMPONENTS) / len(COMPONENTS)
 
 
-def load_ingested(path: Path) -> list[dict[str, str]]:
-    """Validated ingested sources, deduplicated and sorted by source_id."""
+def load_ingested(path: Path) -> list[str]:
+    """Validated ingested source ids, deduplicated and sorted."""
     data = load_json(path, "ingested sources")
     if not isinstance(data, list):
         raise GateError(f"ingested sources file {path} must contain a JSON array")
-    owners: dict[str, str] = {}
-    for i, entry in enumerate(data):
-        if not isinstance(entry, dict) or set(entry) != {"source_id", "user_id"}:
-            raise GateError(
-                f"ingested entry {i} in {path} must be an object with exactly "
-                f"source_id and user_id: {entry!r}"
-            )
-        source_id, user_id = entry["source_id"], entry["user_id"]
+    for i, source_id in enumerate(data):
+        # Only bare ids: an object entry could carry an account id along.
         if not isinstance(source_id, str) or not SOURCE_ID_RE.fullmatch(source_id):
             raise GateError(
-                f"ingested entry {i} in {path}: source_id must be 64 lowercase "
-                f"hex chars: {source_id!r}"
+                f"ingested entry {i} in {path} must be a source id of 64 "
+                "lowercase hex chars"
             )
-        if not is_identifier(user_id):
-            raise GateError(
-                f"ingested entry {i} in {path}: user_id must be a non-empty "
-                f"printable string without whitespace or backticks: {user_id!r}"
-            )
-        # A source has exactly one owner; two owners means a corrupt list.
-        if owners.setdefault(source_id, user_id) != user_id:
-            raise GateError(
-                f"source {source_id} listed with two owners in {path}: "
-                f"{owners[source_id]!r} and {user_id!r}"
-            )
-    return [{"source_id": s, "user_id": owners[s]} for s in sorted(owners)]
+    return sorted(set(data))
 
 
 def load_registry(path: Path) -> list[Any]:
@@ -261,16 +247,11 @@ def metrics_snapshot(
 
 
 def quarantine_rows(
-    ingested: list[dict[str, str]], reason: str, metrics: dict[str, Any]
+    ingested: list[str], reason: str, metrics: dict[str, Any]
 ) -> list[dict[str, Any]]:
     return [
-        {
-            "source_id": src["source_id"],
-            "user_id": src["user_id"],
-            "reason": reason,
-            "metrics": metrics,
-        }
-        for src in ingested
+        {"source_id": source_id, "reason": reason, "metrics": metrics}
+        for source_id in ingested
     ]
 
 
@@ -282,10 +263,8 @@ def _preview(items: list[str]) -> str:
     return f"{shown}, ... +{hidden} more" if hidden > 0 else shown
 
 
-def alert_content(metrics: dict[str, Any], ingested: list[dict[str, str]]) -> str:
+def alert_content(metrics: dict[str, Any], ingested: list[str]) -> str:
     champ, chall = metrics["champion"], metrics["challenger"]
-    sources = [s["source_id"] for s in ingested]
-    users = sorted({s["user_id"] for s in ingested})
     lines = [
         "**turnip-ml: fixture regression, promotion skipped**",
         f"fixture set: `{metrics['fixture_set']}`",
@@ -298,12 +277,8 @@ def alert_content(metrics: dict[str, Any], ingested: list[dict[str, str]]) -> st
             f"{n}: {champ[n]:.6f} -> {chall[n]:.6f} (delta {chall[n] - champ[n]:+.6f})"
             for n in COMPONENTS
         ),
-        (
-            f"quarantined {len(sources)} source(s) from {len(users)} user(s); "
-            f"full list in {QUARANTINE_FILE}"
-        ),
-        f"sources: {_preview(sources)}",
-        f"users: {_preview(users)}",
+        f"quarantined {len(ingested)} source(s); full list in {QUARANTINE_FILE}",
+        f"sources: {_preview(ingested)}",
     ]
     content = "\n".join(lines)
     if len(content) > DISCORD_MAX_CONTENT:
@@ -336,7 +311,7 @@ def deliver_alert(
     elif not webhook_url.startswith("https://"):
         status = "failed: webhook URL is not https"
     else:
-        # No mentions: the content carries user-supplied ids, never pings.
+        # No mentions: the alert informs, it never pings anyone.
         payload = {"content": content, "allowed_mentions": {"parse": []}}
         try:
             (send or send_discord)(webhook_url, payload)
@@ -469,7 +444,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--ingested",
         required=True,
         type=Path,
-        help="JSON array of {source_id, user_id} ingested since the watermark",
+        help="JSON array of source ids ingested since the watermark",
     )
     p.add_argument(
         "--out",
