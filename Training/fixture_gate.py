@@ -14,7 +14,7 @@ Inputs
 --ingested    JSON array of the sources ingested since the last watermark,
               one {"source_id", "user_id"} object per source. These are the
               quarantine candidates; attribution is the source's owner.
---out         run directory; quarantine.json is written here.
+--out         fresh per-run directory; quarantine.json is written here.
 --tolerance   absolute slack on the composite score. Default: 0.01.
 --registry    model-registry stand-in: a JSON array file each decision
               record is appended to. Default: Training/registry.json.
@@ -30,6 +30,10 @@ Fixture scores file:
 scores from different fixture sets are not comparable. Both components
 are in [0, 1]. Extra keys are kept in the record but not compared.
 
+Identifiers shown in the alert (`fixture_set`, `user_id`) must be printable
+with no whitespace or backticks, so they render inside Discord code spans
+and cannot inject lines, formatting or links.
+
 Decision rule
 -------------
     composite  = mean(segment_iou, name_accuracy)
@@ -41,10 +45,13 @@ On regression:
   - Discord alert (webhook from TURNIP_DISCORD_WEBHOOK_URL) with the
     metrics delta and the affected source and user ids.
   - Exit 3 so the pipeline skips promotion.
-The quarantine rows are written before the alert is attempted, and an
-alert that cannot be delivered (webhook unset or request failed) does not
-change the decision: promotion is still skipped and the failure is
-recorded as `alert_status`.
+quarantine.json and the registry record (with `alert_status: "pending"`)
+are written before the alert is attempted; the record is then updated
+with the outcome. The alert is best-effort: an alert that cannot be
+delivered (webhook unset or invalid, request failed) never changes the
+decision, promotion is still skipped, and the failure is recorded as
+`alert_status`. A record left at "pending" means the run died during or
+right after alerting.
 
 Exit codes: 0 = pass (or overridden), 3 = regression, 2 = input/usage
 error (fail closed).
@@ -52,11 +59,14 @@ error (fail closed).
 Determinism
 -----------
 The decision, the alert text and quarantine.json are pure functions of the
-inputs. quarantine.json is always written (an empty array when nothing is
-quarantined) with sorted keys and rows sorted by source_id, so a stale
-file from an earlier run is never left behind. The registry record carries
-a wall-clock `decided_at` (a registry is a log, not a reproducible
-artifact). Floats are rounded to 6 decimals in every output.
+inputs. quarantine.json is written on every decided run (an empty array
+when nothing is quarantined) with sorted keys and rows sorted by
+source_id; a run that exits 2 writes nothing, so --out must be a fresh
+directory per run for its quarantine.json to be trusted. The registry
+record carries a wall-clock `decided_at` (a registry is a log, not a
+reproducible artifact). Computed floats (components, composites, delta,
+tolerance in `metrics`) are rounded to 6 decimals; `champion_scores` and
+`challenger_scores` are recorded verbatim as read.
 
 Fail closed
 -----------
@@ -64,13 +74,14 @@ Missing/unreadable files, invalid JSON (including NaN, Infinity and numbers
 that overflow to infinity), a missing, non-numeric or out-of-range score,
 mismatched fixture sets, a malformed ingested-source list, a non-finite or
 negative tolerance, an empty override reason, or a malformed existing
-registry are errors, never silently a pass. All inputs are validated before
-any side effect (file write, alert).
+registry are errors, never silently a pass. All inputs are validated and
+every output is serialized before any side effect (file write, alert).
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -94,6 +105,9 @@ WEBHOOK_ENV = "TURNIP_DISCORD_WEBHOOK_URL"
 
 COMPONENTS = ("segment_iou", "name_accuracy")
 SOURCE_ID_RE = re.compile(r"[0-9a-f]{64}")
+# Safe inside a Discord code span: no whitespace (no injected lines), no
+# backticks (no breaking out of the span).
+IDENTIFIER_RE = re.compile(r"[^\s`]+")
 
 # Discord rejects message content over 2000 characters; the full lists
 # live in quarantine.json, the alert only previews them.
@@ -127,9 +141,18 @@ def load_json(path: Path, what: str) -> Any:
             return json.load(
                 fh, parse_constant=_reject_constant, parse_float=_finite_float
             )
-    except (OSError, ValueError) as e:
-        # ValueError covers JSONDecodeError and UnicodeDecodeError.
+    except (OSError, ValueError, RecursionError) as e:
+        # ValueError covers JSONDecodeError and UnicodeDecodeError;
+        # RecursionError is pathologically deep nesting.
         raise GateError(f"cannot read {what} JSON from {path}: {e}") from e
+
+
+def is_identifier(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.isprintable()
+        and IDENTIFIER_RE.fullmatch(value) is not None
+    )
 
 
 def load_scores(path: Path) -> dict[str, Any]:
@@ -137,8 +160,11 @@ def load_scores(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise GateError(f"fixture scores file {path} must contain a JSON object")
     fixture_set = data.get("fixture_set")
-    if not isinstance(fixture_set, str) or not fixture_set:
-        raise GateError(f"fixture_set in {path} must be a non-empty string")
+    if not is_identifier(fixture_set):
+        raise GateError(
+            f"fixture_set in {path} must be a non-empty printable string without "
+            f"whitespace or backticks: {fixture_set!r}"
+        )
     for name in COMPONENTS:
         if name not in data:
             raise GateError(f"score {name!r} missing from {path}")
@@ -174,10 +200,10 @@ def load_ingested(path: Path) -> list[dict[str, str]]:
                 f"ingested entry {i} in {path}: source_id must be 64 lowercase "
                 f"hex chars: {source_id!r}"
             )
-        if not isinstance(user_id, str) or not user_id:
+        if not is_identifier(user_id):
             raise GateError(
                 f"ingested entry {i} in {path}: user_id must be a non-empty "
-                f"string: {user_id!r}"
+                f"printable string without whitespace or backticks: {user_id!r}"
             )
         # A source has exactly one owner; two owners means a corrupt list.
         if owners.setdefault(source_id, user_id) != user_id:
@@ -189,8 +215,11 @@ def load_ingested(path: Path) -> list[dict[str, str]]:
 
 
 def load_registry(path: Path) -> list[Any]:
-    if not path.exists():
-        return []
+    try:
+        if not path.exists():
+            return []
+    except OSError as e:  # e.g. an unsearchable parent directory
+        raise GateError(f"cannot access registry file {path}: {e}") from e
     data = load_json(path, "registry")
     if not isinstance(data, list):
         raise GateError(f"registry file {path} must contain a JSON array")
@@ -248,7 +277,7 @@ def quarantine_rows(
 def _preview(items: list[str]) -> str:
     if not items:
         return "(none)"
-    shown = ", ".join(items[:ALERT_LIST_PREVIEW])
+    shown = ", ".join(f"`{item}`" for item in items[:ALERT_LIST_PREVIEW])
     hidden = len(items) - ALERT_LIST_PREVIEW
     return f"{shown}, ... +{hidden} more" if hidden > 0 else shown
 
@@ -259,7 +288,7 @@ def alert_content(metrics: dict[str, Any], ingested: list[dict[str, str]]) -> st
     users = sorted({s["user_id"] for s in ingested})
     lines = [
         "**turnip-ml: fixture regression, promotion skipped**",
-        f"fixture set: {metrics['fixture_set']}",
+        f"fixture set: `{metrics['fixture_set']}`",
         (
             f"composite: champion {champ['composite']:.6f} -> challenger "
             f"{chall['composite']:.6f} (delta {metrics['delta']:+.6f}, "
@@ -312,10 +341,11 @@ def deliver_alert(
         try:
             (send or send_discord)(webhook_url, payload)
             return "sent"
-        except (OSError, ValueError) as e:
-            # URLError/HTTPError/timeouts are OSError. The decision stands
-            # regardless: quarantine and the skipped promotion must not
-            # depend on Discord being reachable.
+        except Exception as e:  # noqa: BLE001
+            # Deliberately blind. The alert is best-effort: the decision must
+            # never depend on Discord, and an escaping error (e.g. the
+            # http.client.InvalidURL a malformed URL raises) would print the
+            # webhook URL, token included, in its traceback.
             status = f"failed: {_describe(e)}"
     print(f"fixture_gate: alert not delivered ({status})", file=sys.stderr)
     return status
@@ -331,17 +361,25 @@ def _describe(e: Exception) -> str:
     return type(e).__name__
 
 
-def write_json_atomic(path: Path, data: Any) -> None:
+def dump_json(data: Any, path: Path) -> str:
+    try:
+        return json.dumps(data, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    except (ValueError, RecursionError) as e:
+        # ValueError: allow_nan=False refusing a non-finite float;
+        # RecursionError: nesting the encoder cannot handle.
+        raise GateError(f"cannot serialize {path}: {e}") from e
+
+
+def write_text_atomic(path: Path, text: str) -> None:
     # A crash mid-write must not leave a malformed file behind.
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, sort_keys=True, allow_nan=False)
-            fh.write("\n")
+        tmp.write_text(text, encoding="utf-8")
         tmp.replace(path)
-    except (OSError, ValueError) as e:
-        # ValueError: allow_nan=False refusing a non-finite float.
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
         raise GateError(f"cannot write {path}: {e}") from e
 
 
@@ -381,17 +419,9 @@ def run(
     elif regressed:
         decision = "override"
         rows = []
-        print(f"fixture_gate: regression overridden: {override}", file=sys.stderr)
     else:
         decision = "pass"
         rows = []
-    write_json_atomic(out_dir / QUARANTINE_FILE, rows)
-
-    alert_status = "not-needed"
-    if decision == "regression":
-        alert_status = deliver_alert(
-            alert_content(metrics, ingested), webhook_url, send
-        )
 
     record = {
         "gate": "fixture-regression",
@@ -403,10 +433,23 @@ def run(
         "champion_scores": champion,
         "challenger_scores": challenger,
         "quarantined_sources": len(rows),
-        "alert_status": alert_status,
+        "alert_status": "pending" if decision == "regression" else "not-needed",
     }
-    registry.append(record)
-    write_json_atomic(registry_path, registry)
+    # Serialize everything up front: from here on only I/O can fail.
+    quarantine_path = out_dir / QUARANTINE_FILE
+    quarantine_text = dump_json(rows, quarantine_path)
+    registry_text = dump_json([*registry, record], registry_path)
+
+    if decision == "override":
+        print(f"fixture_gate: regression overridden: {override}", file=sys.stderr)
+    # Durable state before the alert: if either write fails, nothing was sent.
+    write_text_atomic(quarantine_path, quarantine_text)
+    write_text_atomic(registry_path, registry_text)
+    if decision == "regression":
+        record["alert_status"] = deliver_alert(
+            alert_content(metrics, ingested), webhook_url, send
+        )
+        write_text_atomic(registry_path, dump_json([*registry, record], registry_path))
 
     return record, EXIT_REGRESSION if decision == "regression" else EXIT_PASS
 

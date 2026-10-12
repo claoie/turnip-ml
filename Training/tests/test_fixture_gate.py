@@ -6,9 +6,11 @@ Run with:  python -m unittest discover -s Training/tests -t .
 """
 
 import contextlib
+import http.client
 import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -35,14 +37,21 @@ SRC_C = "c" * 64
 
 
 class FakeSender:
-    """Records webhook calls; optionally raises to simulate an outage."""
+    """Records webhook calls; optionally raises to simulate an outage.
 
-    def __init__(self, error=None):
+    `on_call` runs at send time, to observe what was durable before the
+    alert went out.
+    """
+
+    def __init__(self, error=None, on_call=None):
         self.calls = []
         self.error = error
+        self.on_call = on_call
 
     def __call__(self, url, payload):
         self.calls.append((url, payload))
+        if self.on_call is not None:
+            self.on_call()
         if self.error is not None:
             raise self.error
 
@@ -90,7 +99,7 @@ class GateTestCase(unittest.TestCase):
         self.sender = FakeSender()
         # The gate reports on stdout/stderr; keep the test output clean.
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
-        self.enterContext(contextlib.redirect_stderr(io.StringIO()))
+        self.stderr = self.enterContext(contextlib.redirect_stderr(io.StringIO()))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -162,7 +171,8 @@ class RegressionTest(GateTestCase):
         self.assertIn("delta -0.200000", content)
         for src in (SRC_A, SRC_B, SRC_C):
             self.assertIn(src, content)
-        self.assertIn("users: user-1, user-2", content)
+        self.assertIn("users: `user-1`, `user-2`", content)
+        self.assertIn("fixture set: `fx-1`", content)
         self.assertEqual(record["alert_status"], "sent")
 
         # One quarantine row per ingested source (deduped, sorted), shaped
@@ -199,19 +209,80 @@ class RegressionTest(GateTestCase):
         self.assertEqual(record["alert_status"], "failed: URLError: timed out")
         self.assertEqual(len(self.quarantine_rows()), 3)
 
-    def test_alert_failure_never_records_the_webhook_secret(self):
+    def test_any_alert_error_is_contained_without_leaking_the_secret(self):
         champion = self.scores("champion.json", 0.80, 0.90)
         challenger = self.scores("challenger.json", 0.60, 0.70)
-        errors = [
-            ValueError(f"URL can't contain control characters. {WEBHOOK!r}"),
-            urllib.error.HTTPError(WEBHOOK, 404, "Not Found", None, None),
+        path = "/api/webhooks/123/SECRET-TOKEN"
+        cases = [
+            # Raised by http.client, which is neither OSError nor ValueError.
+            (
+                http.client.InvalidURL(
+                    f"URL can't contain control characters. {path!r}"
+                ),
+                "failed: InvalidURL",
+            ),
+            (http.client.BadStatusLine(f"garbage {WEBHOOK}"), "failed: BadStatusLine"),
+            (
+                urllib.error.HTTPError(WEBHOOK, 404, "Not Found", None, None),
+                "failed: HTTP 404",
+            ),
+            (ValueError(WEBHOOK), "failed: ValueError"),
+            (RuntimeError(WEBHOOK), "failed: RuntimeError"),
         ]
-        for error, expected in zip(errors, ["failed: ValueError", "failed: HTTP 404"]):
+        for error, expected in cases:
             with self.subTest(error=type(error).__name__):
                 self.sender = FakeSender(error)
-                record, _ = self.run_gate(champion, challenger)
+                record, code = self.run_gate(champion, challenger)
+                self.assertEqual(code, EXIT_REGRESSION)
                 self.assertEqual(record["alert_status"], expected)
+                self.assertEqual(self.registry_entries()[-1]["alert_status"], expected)
         self.assertNotIn("SECRET-TOKEN", self.registry.read_text(encoding="utf-8"))
+        self.assertNotIn("SECRET-TOKEN", self.stderr.getvalue())
+
+    def test_malformed_webhook_url_through_real_sender(self):
+        # The reviewed failure: a control character in the configured URL
+        # makes http.client raise InvalidURL (echoing the path, token
+        # included) before any connection is opened. Any network attempt
+        # would surface as a different status.
+        champion = self.scores("champion.json", 0.80, 0.90)
+        challenger = self.scores("challenger.json", 0.60, 0.70)
+        url = "https://discord.invalid/api/webhooks/123/SECRET\tTOKEN"
+        with mock.patch.object(
+            socket, "create_connection", side_effect=AssertionError("network")
+        ):
+            record, code = self.run_gate(
+                champion, challenger, webhook_url=url, send=None
+            )
+        self.assertEqual(code, EXIT_REGRESSION)
+        self.assertEqual(record["alert_status"], "failed: InvalidURL")
+        self.assertEqual(len(self.quarantine_rows()), 3)
+        self.assertNotIn("TOKEN", self.registry.read_text(encoding="utf-8"))
+        self.assertNotIn("TOKEN", self.stderr.getvalue())
+
+    def test_state_is_durable_before_the_alert(self):
+        seen = {}
+
+        def snapshot():
+            seen["registry"] = self.registry_entries()
+            seen["quarantine"] = self.quarantine_rows()
+
+        self.sender = FakeSender(on_call=snapshot)
+        champion = self.scores("champion.json", 0.80, 0.90)
+        challenger = self.scores("challenger.json", 0.60, 0.70)
+        self.run_gate(champion, challenger)
+        self.assertEqual(seen["registry"][-1]["alert_status"], "pending")
+        self.assertEqual(len(seen["quarantine"]), 3)
+        self.assertEqual(self.registry_entries()[-1]["alert_status"], "sent")
+
+    def test_unwritable_registry_fails_before_alerting(self):
+        blocker = self.root / "blocker"
+        blocker.write_text("", encoding="utf-8")
+        self.registry = blocker / "registry.json"  # parent is a file
+        champion = self.scores("champion.json", 0.80, 0.90)
+        challenger = self.scores("challenger.json", 0.60, 0.70)
+        with self.assertRaises(GateError):
+            self.run_gate(champion, challenger)
+        self.assertEqual(self.sender.calls, [])
 
     def test_webhook_unset_still_quarantines_and_skips(self):
         champion = self.scores("champion.json", 0.80, 0.90)
@@ -296,6 +367,27 @@ class PassTest(GateTestCase):
         self.assertEqual([e["decision"] for e in entries], ["promote", "pass"])
         self.assertFalse((self.root / "registry.json.tmp").exists())
 
+    def test_score_bounds_are_inclusive(self):
+        champion = self.scores("champion.json", 0, 1)
+        challenger = self.scores("challenger.json", 1, 0)
+        record, code = self.run_gate(champion, challenger)
+        self.assertEqual(code, EXIT_PASS)
+        self.assertEqual(record["metrics"]["delta"], 0.0)
+
+    def test_zero_tolerance_through_run(self):
+        champion = self.scores("champion.json", 0.80, 0.90)
+        challenger = self.scores("challenger.json", 0.80, 0.90)
+        _, code = self.run_gate(champion, challenger, tolerance=0.0)
+        self.assertEqual(code, EXIT_PASS)
+
+    def test_computed_metrics_rounded_inputs_verbatim(self):
+        champion = self.scores("champion.json", 0.123456789, 0.9)
+        challenger = self.scores("challenger.json", 0.123456789, 0.9)
+        record, _ = self.run_gate(champion, challenger)
+        self.assertEqual(record["metrics"]["champion"]["segment_iou"], 0.123457)
+        self.assertEqual(record["metrics"]["champion"]["composite"], 0.511728)
+        self.assertEqual(record["champion_scores"]["segment_iou"], 0.123456789)
+
     def test_extra_score_keys_are_kept_not_compared(self):
         champion = self.scores("champion.json", 0.80, 0.90, model="trick-v1.3")
         challenger = self.scores("challenger.json", 0.80, 0.90, model="cand")
@@ -327,13 +419,17 @@ class PassTest(GateTestCase):
 
 
 class FailClosedTest(GateTestCase):
+    def registry_bytes(self):
+        return self.registry.read_bytes() if self.registry.exists() else None
+
     def assert_refused(self, champion, challenger, ingested=None, **kwargs):
+        before = self.registry_bytes()
         with self.assertRaises(GateError):
             self.run_gate(champion, challenger, ingested, **kwargs)
         # Validation happens before any side effect.
         self.assertEqual(self.sender.calls, [])
         self.assertFalse(self.quarantine.exists())
-        self.assertFalse(self.registry.exists())
+        self.assertEqual(self.registry_bytes(), before)
 
     def test_fixture_set_mismatch(self):
         champion = self.scores("champion.json", 0.80, 0.90, fixture_set="fx-1")
@@ -345,6 +441,18 @@ class FailClosedTest(GateTestCase):
             "champion.json", {"segment_iou": 0.8, "name_accuracy": 0.9}
         )
         challenger = self.scores("challenger.json", 0.80, 0.90)
+        self.assert_refused(champion, challenger)
+
+    def test_invalid_fixture_set(self):
+        for bad in ("", "fx\n**ALL CLEAR**", "fx 1", "fx`1", "fx\x07", 7):
+            with self.subTest(fixture_set=bad):
+                champion = self.scores("champion.json", 0.80, 0.90, fixture_set=bad)
+                challenger = self.scores("challenger.json", 0.6, 0.7, fixture_set=bad)
+                self.assert_refused(champion, challenger)
+
+    def test_scores_not_an_object(self):
+        champion = self.scores("champion.json", 0.80, 0.90)
+        challenger = self.write_json("challenger.json", [])
         self.assert_refused(champion, challenger)
 
     def test_missing_component(self):
@@ -387,13 +495,26 @@ class FailClosedTest(GateTestCase):
         champion = self.scores("champion.json", 0.80, 0.90)
         challenger = self.scores("challenger.json", 0.60, 0.70)
         cases = {
-            "not-array": {"source_id": SRC_A, "user_id": "u"},
+            "number": 5,
+            "null": None,
+            "object": {"source_id": SRC_A, "user_id": "u"},
             "extra-key": [{"source_id": SRC_A, "user_id": "u", "x": 1}],
             "missing-user": [{"source_id": SRC_A}],
+            "numeric-id": [{"source_id": 123, "user_id": "u"}],
             "uppercase-id": [{"source_id": "A" * 64, "user_id": "u"}],
             "short-id": [{"source_id": "a" * 63, "user_id": "u"}],
             "trailing-newline": [{"source_id": SRC_A + "\n", "user_id": "u"}],
+            "numeric-user": [{"source_id": SRC_A, "user_id": 123}],
             "empty-user": [{"source_id": SRC_A, "user_id": ""}],
+            "user-injects-lines": [
+                {
+                    "source_id": SRC_A,
+                    "user_id": "x\n**ALL CLEAR**[go](https://evil.example)",
+                }
+            ],
+            "user-space": [{"source_id": SRC_A, "user_id": "u 1"}],
+            "user-backtick": [{"source_id": SRC_A, "user_id": "u`1"}],
+            "user-control-char": [{"source_id": SRC_A, "user_id": "u\x07"}],
             "two-owners": [
                 {"source_id": SRC_A, "user_id": "u1"},
                 {"source_id": SRC_A, "user_id": "u2"},
@@ -405,13 +526,54 @@ class FailClosedTest(GateTestCase):
                 self.assert_refused(champion, challenger, ingested)
 
     def test_malformed_registry(self):
-        self.registry.write_text("not json", encoding="utf-8")
         champion = self.scores("champion.json", 0.80, 0.90)
         challenger = self.scores("challenger.json", 0.60, 0.70)
-        with self.assertRaises(GateError):
-            self.run_gate(champion, challenger)
+        for content in ("not json", "{}", "null"):
+            with self.subTest(registry=content):
+                self.registry.write_text(content, encoding="utf-8")
+                self.assert_refused(champion, challenger)
+
+    def test_inaccessible_registry(self):
+        champion = self.scores("champion.json", 0.80, 0.90)
+        challenger = self.scores("challenger.json", 0.60, 0.70)
+        ingested = self.ingested()
+        with (
+            mock.patch.object(Path, "exists", side_effect=PermissionError("denied")),
+            self.assertRaises(GateError),
+        ):
+            self.run_gate(champion, challenger, ingested)
         self.assertEqual(self.sender.calls, [])
         self.assertFalse(self.quarantine.exists())
+
+    def test_unserializable_output_refused_before_side_effects(self):
+        # e.g. an extra score key nested deeper than the encoder handles.
+        champion = self.scores("champion.json", 0.80, 0.90)
+        challenger = self.scores("challenger.json", 0.60, 0.70)
+        ingested = self.ingested()
+        with mock.patch.object(
+            fixture_gate.json, "dumps", side_effect=RecursionError("too deep")
+        ):
+            self.assert_refused(champion, challenger, ingested)
+
+    def test_deeply_nested_input_refused(self):
+        champion = self.scores("champion.json", 0.80, 0.90)
+        path = self.root / "challenger.json"
+        depth = 200_000
+        path.write_text(
+            '{"fixture_set": "fx-1", "segment_iou": 0.8, "name_accuracy": 0.9, '
+            f'"note": {"[" * depth}{"]" * depth}}}',
+            encoding="utf-8",
+        )
+        self.assert_refused(champion, path)
+
+    def test_failed_write_leaves_existing_files_intact(self):
+        self.write_json("registry.json", [{"decision": "promote"}])
+        champion = self.scores("champion.json", 0.80, 0.90)
+        challenger = self.scores("challenger.json", 0.60, 0.70)
+        with mock.patch.object(Path, "replace", side_effect=OSError("disk full")):
+            self.assert_refused(champion, challenger)
+        self.assertEqual(list(self.out.glob("*.tmp")), [])
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
 
     def test_bad_tolerance(self):
         champion = self.scores("champion.json", 0.80, 0.90)
