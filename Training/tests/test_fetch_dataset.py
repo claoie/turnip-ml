@@ -58,10 +58,9 @@ BLOBS = {
 }
 
 
-def row(source, clip, name, start=5, end=15, user=None, version=1, **overrides):
+def row(source, clip, name, start=5, end=15, version=1, **overrides):
     data = {
         "source_id": source,
-        "user_id": user or {SRC_A: "user-1", SRC_B: "user-1", SRC_C: "user-2"}[source],
         "r2_key": f"poses/{source}.tkp1.gz",
         "blob_sha256": hashlib.sha256(BLOBS[source]).hexdigest(),
         "clip_id": CLIP[clip],
@@ -178,11 +177,12 @@ class BuildTest(FetchTestCase):
                 "label_rows": 6,
                 "taxonomy_version": 2,
                 "unmapped_tokens": 1,
+                "cache_pruned": 0,
             },
         )
         a = self.sample(SRC_A)
         self.assertEqual(a["sample_id"], SRC_A)
-        self.assertEqual(a["user_id"], "user-1")
+        self.assertEqual(set(a), {"sample_id", "fps", "keypoints", "tricks"})
         self.assertEqual(a["fps"], 10)
         self.assertEqual(len(a["keypoints"]), 40)
         self.assertEqual(len(a["keypoints"][0]), 17)
@@ -216,13 +216,14 @@ class BuildTest(FetchTestCase):
         self.assertEqual(
             [json.loads(line) for line in manifest.splitlines()],
             [
-                {"sample_id": SRC_A, "user_id": "user-1"},
-                {"sample_id": SRC_B, "user_id": "user-1"},
-                {"sample_id": SRC_C, "user_id": "user-2"},
+                {"sample_id": SRC_A, "source_id": SRC_A},
+                {"sample_id": SRC_B, "source_id": SRC_B},
+                {"sample_id": SRC_C, "source_id": SRC_C},
             ],
         )
         meta = json.loads((self.root / "dataset" / "dataset_manifest.json").read_text())
         self.assertEqual(meta["sample_ids"], [SRC_A, SRC_B, SRC_C])
+        self.assertNotIn("cache_pruned", meta)  # describes the cache, not the data
         self.assertEqual(meta["taxonomy_version"], 2)
         self.assertEqual(meta["export_cursor"], "cur-5")
         log = (self.root / "dataset" / "unmapped_labels.log").read_text(
@@ -252,28 +253,76 @@ class BuildTest(FetchTestCase):
         self.assertEqual(meta_null.pop("export_cursor"), "cur-3")
         self.assertEqual(meta_null, meta_ref)
 
-    def test_blobs_are_cached_by_content_hash(self):
+    def test_blobs_are_cached_by_r2_key(self):
         self.build(out="first")
         self.assertEqual(len(self.blobs.calls), 3)
+        entry = self.cache / "poses" / f"{SRC_A}.tkp1.gz"
+        self.assertEqual(entry.read_bytes(), BLOBS[SRC_A])
         self.build(out="second")
         self.assertEqual(len(self.blobs.calls), 3)  # all served from cache
         # A corrupt cache entry is discarded and refetched.
-        entry = self.cache / f"{hashlib.sha256(BLOBS[SRC_A]).hexdigest()}.tkp1.gz"
         entry.write_bytes(b"corrupt")
         self.build(out="third")
         self.assertEqual(self.blobs.calls[3:], [f"poses/{SRC_A}.tkp1.gz"])
         self.assertEqual(entry.read_bytes(), BLOBS[SRC_A])
+
+    def test_recontributed_source_is_refetched(self):
+        self.build(out="first")
+        # The owner re-contributes SRC_A: same r2_key, new bytes and digest.
+        new_blob = tkp1.encode_gz(pose(40, 99))
+        self.blobs.blobs[f"poses/{SRC_A}.tkp1.gz"] = new_blob
+        digest = hashlib.sha256(new_blob).hexdigest()
+        rows = [
+            {**r, "blob_sha256": digest} if r["source_id"] == SRC_A else r for r in ROWS
+        ]
+        self.build(FakeExport(rows), out="second")
+        self.assertEqual(self.blobs.calls[3:], [f"poses/{SRC_A}.tkp1.gz"])
+        entry = self.cache / "poses" / f"{SRC_A}.tkp1.gz"
+        self.assertEqual(entry.read_bytes(), new_blob)
+        self.assertEqual(
+            self.sample(SRC_A, out="second")["keypoints"],
+            tkp1.decode_gz(new_blob).keypoints,
+        )
+
+    def test_cache_is_pruned_to_the_pull(self):
+        self.build(out="first")
+        poses = self.cache / "poses"
+        foreign = self.cache / "notes.txt"
+        foreign.write_text("not ours")
+        (poses / "readme.md").write_text("not ours")
+        (poses / f"{SRC_A}.tkp1.gz.tmp").write_bytes(b"interrupted write")
+        # SRC_C was deleted farm-side, so it is absent from the next full pull.
+        rows = [r for r in ROWS if r["source_id"] != SRC_C]
+        stats = self.build(FakeExport(rows), out="second")
+        self.assertEqual(stats["cache_pruned"], 2)  # C's blob and the leftover
+        self.assertEqual(
+            sorted(p.name for p in poses.iterdir()),
+            sorted([f"{SRC_A}.tkp1.gz", f"{SRC_B}.tkp1.gz", "readme.md"]),
+        )
+        self.assertTrue(foreign.exists())
+
+    def test_empty_pull_prunes_everything_then_refuses(self):
+        self.build(out="first")
+        with self.assertRaises(FetchError):
+            self.build(FakeExport([]), out="second")
+        self.assertEqual(list((self.cache / "poses").glob("*.tkp1.gz")), [])
+
+    def test_failed_pull_never_prunes(self):
+        self.build(out="first")
+
+        def broken(url, headers):
+            raise FetchError("export request failed: HTTP 500")
+
+        with self.assertRaises(FetchError):
+            self.build(broken, out="second")
+        self.assertEqual(len(list((self.cache / "poses").glob("*.tkp1.gz"))), 3)
 
     def test_checksum_mismatch_fails_closed(self):
         self.blobs.blobs[f"poses/{SRC_B}.tkp1.gz"] = BLOBS[SRC_A]
         with self.assertRaises(FetchError):
             self.build()
         self.assertFalse((self.root / "dataset").exists())
-        self.assertFalse(
-            (
-                self.cache / f"{hashlib.sha256(BLOBS[SRC_B]).hexdigest()}.tkp1.gz"
-            ).exists()
-        )
+        self.assertFalse((self.cache / "poses" / f"{SRC_B}.tkp1.gz").exists())
 
     def test_undecodable_blob_fails_closed(self):
         bad = b"not gzip"
@@ -324,7 +373,9 @@ class RowValidationTest(FetchTestCase):
             "negative-start": row(SRC_A, 1, "cork", -1, 10),
             "empty-name": row(SRC_A, 1, "  "),
             "version-zero": row(SRC_A, 1, "cork", version=0),
-            "user-whitespace": row(SRC_A, 1, "cork", user="user 1"),
+            # Training data carries no account identifier, at the boundary.
+            "carries-user-id": row(SRC_A, 1, "cork", user_id="user-1"),
+            "carries-null-user-id": row(SRC_A, 1, "cork", user_id=None),
         }
         for name, data in cases.items():
             with self.subTest(case=name):
@@ -335,9 +386,9 @@ class RowValidationTest(FetchTestCase):
 
     def test_rows_that_disagree(self):
         cases = {
-            "source-owner": [
+            "source-blob": [
                 row(SRC_A, 1, "cork"),
-                row(SRC_A, 2, "hook", user="user-9"),
+                row(SRC_A, 2, "hook", blob_sha256="f" * 64),
             ],
             "clip-window": [row(SRC_A, 1, "cork", 5, 15), row(SRC_A, 1, "hook", 5, 16)],
             "duplicate-label": [row(SRC_A, 1, "cork"), row(SRC_A, 1, "cork")],
@@ -501,7 +552,7 @@ class MainTest(FetchTestCase):
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(json.loads(self.stdout.getvalue())["samples"], 3)
         output = self.stdout.getvalue() + self.stderr.getvalue()
-        for secret in ("user-1", "user-2", "Mystery", "corkscrew", "cur-", KEY):
+        for secret in ("Mystery", "corkscrew", "cur-", KEY):
             self.assertNotIn(secret, output)
 
     def test_build_failure_exits_2_without_leaking(self):
@@ -510,7 +561,7 @@ class MainTest(FetchTestCase):
         code = fetch_dataset.main(argv, transport=FakeExport(), blob_getter=self.blobs)
         self.assertEqual(code, EXIT_ERROR)
         self.assertIn("blob_sha256", self.stderr.getvalue())
-        for secret in ("user-1", "Mystery", KEY):
+        for secret in ("Mystery", KEY):
             self.assertNotIn(secret, self.stderr.getvalue())
 
     def test_missing_environment(self):

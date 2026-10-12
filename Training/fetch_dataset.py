@@ -12,20 +12,26 @@ count --out-state FILE [--state FILE]
     watermark always means "last successful export".
 
 build --out DIR --cache DIR
-    Full pull of the export (never incremental: purges, quarantines and
-    releases change what is training-eligible, and the export does not
-    report deletions), then for each source fetches its pose blob from R2,
-    verifies it against `blob_sha256` (the SHA-256 of the stored
-    `.tkp1.gz` bytes) on download and on every cache read, and decodes it.
-    Writes into DIR, which must not exist yet (built in a temporary sibling
-    directory, moved into place on success):
+    Full pull of the export (never incremental: deletions, purges,
+    quarantines, releases and replaced label sets change what is
+    training-eligible, and the export does not report deletions). Right
+    after the pull, every cached blob whose source is absent from it is
+    deleted, so data deleted farm-side never outlives one full pull here.
+    Then for each source it fetches the pose blob from R2, caches it under
+    its r2_key, verifies it against `blob_sha256` (the SHA-256 of the
+    stored `.tkp1.gz` bytes) on download and on every cache read (a
+    mismatch on read means the source was re-contributed, or the file is
+    corrupt: it is fetched again), and decodes it. Writes into DIR, which
+    must not exist yet (built in a temporary sibling directory, moved into
+    place on success):
       samples/<source_id>.json  train.py's sample format: sample_id (the
-                                source id), user_id, fps 10, keypoints
+                                source id), fps 10, keypoints
                                 [frame][17][x, y, confidence] (gap frames
                                 kept as zeros), and one trick entry per
                                 (clip, canonical name) on the clip window
-      manifest.jsonl            {"sample_id", "user_id"} per sample, the
-                                split_dataset.py input
+      manifest.jsonl            {"sample_id", "source_id"} per sample, the
+                                split_dataset.py input (splits group by
+                                source)
       dataset_manifest.json     pinned taxonomy_version, export cursor,
                                 counts and sorted sample ids
       unmapped_labels.log       "<count>\t<token>" per unmapped label token,
@@ -42,17 +48,20 @@ TURNIP_PIPELINE_KEY   service key sent as a Bearer token
 R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
                       pose-blob bucket (build only; needs boto3)
 
-Privacy: stdout and stderr carry counts only, never user ids, raw labels,
+Privacy: training data carries no account identifier. The farm exports
+none, and an export row that carries a user_id is refused rather than
+passed along. Stdout and stderr carry counts only, never raw labels,
 cursors or pose values; CI logs of this public repository are public. The
-dataset itself belongs under data/ (gitignored) and must never be uploaded
-as a CI artifact.
+dataset and the blob cache belong under data/ (gitignored) and must never
+be uploaded as a CI artifact or cache.
 
 Determinism: rows are re-sorted after the pull (keyset pages split sources
 arbitrarily), JSON keys are sorted, float32 pose values are written
 losslessly, and nothing carries a timestamp, so the same export and blobs
 always produce byte-identical files.
 
-Fail closed: a malformed page or row, rows that disagree about a source or
+Fail closed: a malformed page or row (including one carrying a user_id),
+rows that disagree about a source or
 clip, a duplicate label row, a stuck or cycling cursor, a clip window
 outside its pose sequence, a checksum mismatch or an undecodable blob are
 errors (exit 2), never skipped.
@@ -95,8 +104,8 @@ PIPELINE_KEY_ENV = "TURNIP_PIPELINE_KEY"
 R2_ENV = ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET")
 
 HEX64_RE = re.compile(r"[0-9a-f]{64}")
-# Printable, no whitespace: matches the fixture gate's user_id rule.
-USER_ID_RE = re.compile(r"[^\s`]+")
+# The only files the blob cache writes, under <cache>/poses/.
+CACHE_ENTRY_RE = re.compile(r"([0-9a-f]{64})\.tkp1\.gz(\.tmp)?")
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 Transport = Callable[[str, dict[str, str]], Any]
@@ -110,7 +119,6 @@ class FetchError(Exception):
 @dataclass(frozen=True)
 class LabelRow:
     source_id: str
-    user_id: str
     r2_key: str
     blob_sha256: str
     clip_id: str
@@ -141,7 +149,6 @@ def _hex64(value: Any) -> bool:
 def parse_row(i: int, row: Any) -> LabelRow:
     fields = {
         "source_id",
-        "user_id",
         "r2_key",
         "blob_sha256",
         "clip_id",
@@ -152,15 +159,14 @@ def parse_row(i: int, row: Any) -> LabelRow:
     }
     if not isinstance(row, dict) or not fields <= set(row):
         raise FetchError(f"export row {i} is missing fields")
-    source_id, user_id = row["source_id"], row["user_id"]
+    if "user_id" in row:
+        raise FetchError(
+            f"export row {i} carries a user_id; training data must carry no "
+            "account identifier"
+        )
+    source_id = row["source_id"]
     if not _hex64(source_id):
         raise FetchError(f"export row {i}: source_id is not 64 lowercase hex chars")
-    if not (
-        isinstance(user_id, str)
-        and user_id.isprintable()
-        and USER_ID_RE.fullmatch(user_id)
-    ):
-        raise FetchError(f"export row {i}: malformed user_id")
     if row["r2_key"] != f"poses/{source_id}.tkp1.gz":
         raise FetchError(f"export row {i}: r2_key does not match its source_id")
     if not _hex64(row["blob_sha256"]):
@@ -183,7 +189,6 @@ def parse_row(i: int, row: Any) -> LabelRow:
         raise FetchError(f"export row {i}: taxonomy_version must be an integer >= 1")
     return LabelRow(
         source_id=source_id,
-        user_id=user_id,
         r2_key=row["r2_key"],
         blob_sha256=row["blob_sha256"],
         clip_id=clip_id,
@@ -301,20 +306,24 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 
 class BlobCache:
-    """Pose blobs by content hash; verified on download and on cache read."""
+    """Pose blobs keyed by r2_key; verified on download and on every read."""
 
     def __init__(self, cache_dir: Path, get: BlobGetter):
         self.cache_dir = cache_dir
         self.get = get
 
     def fetch(self, r2_key: str, sha256: str) -> bytes:
-        path = self.cache_dir / f"{sha256}.tkp1.gz"
+        # r2_key is validated as poses/<64 hex>.tkp1.gz, so this stays
+        # inside the cache directory.
+        path = self.cache_dir / r2_key
         try:
             if path.exists():
                 data = path.read_bytes()
                 if _sha256(data) == sha256:
                     return data
-                path.unlink()  # corrupt cache entry: the bucket is the truth
+                # Re-contributed source or corrupt entry: the bucket is the
+                # truth.
+                path.unlink()
         except OSError as e:
             raise FetchError(f"cannot use blob cache {self.cache_dir}: {e}") from e
         try:
@@ -328,11 +337,32 @@ class BlobCache:
         if not isinstance(data, bytes) or _sha256(data) != sha256:
             raise FetchError(f"{r2_key}: downloaded bytes do not match blob_sha256")
         try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
             _write_atomic(path, data)
         except OSError as e:
             raise FetchError(f"cannot write blob cache {self.cache_dir}: {e}") from e
         return data
+
+    def prune(self, keep: set[str]) -> int:
+        """Delete cached blobs whose source is not in `keep`; returns the count.
+
+        Only files this cache writes are touched (poses/<64 hex>.tkp1.gz and
+        leftover .tmp siblings), never anything else in the directory.
+        """
+        poses = self.cache_dir / "poses"
+        pruned = 0
+        try:
+            entries = sorted(poses.iterdir()) if poses.is_dir() else []
+            for path in entries:
+                match = CACHE_ENTRY_RE.fullmatch(path.name)
+                if match is None or not path.is_file():
+                    continue
+                if match.group(2) or match.group(1) not in keep:
+                    path.unlink()
+                    pruned += 1
+        except OSError as e:
+            raise FetchError(f"cannot prune blob cache {self.cache_dir}: {e}") from e
+        return pruned
 
 
 def r2_getter_from_env() -> BlobGetter:
@@ -377,14 +407,8 @@ def _group(rows: list[LabelRow]) -> dict[str, dict[str, list[LabelRow]]]:
         seen_labels.add(label)
         clips = sources.setdefault(row.source_id, {})
         first = next(iter(clips.values()))[0] if clips else row
-        if (first.user_id, first.r2_key, first.blob_sha256) != (
-            row.user_id,
-            row.r2_key,
-            row.blob_sha256,
-        ):
-            raise FetchError(
-                f"rows for source {row.source_id} disagree on its owner/blob"
-            )
+        if (first.r2_key, first.blob_sha256) != (row.r2_key, row.blob_sha256):
+            raise FetchError(f"rows for source {row.source_id} disagree on its blob")
         clip_rows = clips.setdefault(row.clip_id, [])
         if clip_rows and (clip_rows[0].start_frame, clip_rows[0].end_frame) != (
             row.start_frame,
@@ -405,6 +429,9 @@ def _dump(data: Any) -> str:
 
 def build_dataset(pull: ExportPull, blobs: BlobCache, out_dir: Path) -> dict[str, Any]:
     """Write the dataset into out_dir (must not exist). Returns the stats."""
+    # Prune first: an empty pull means every cached source is gone, which
+    # is exactly when deleting matters.
+    pruned = blobs.prune({row.source_id for row in pull.rows})
     if not pull.rows:
         raise FetchError("the export is empty: nothing to train on")
     if out_dir.exists():
@@ -432,7 +459,8 @@ def build_dataset(pull: ExportPull, blobs: BlobCache, out_dir: Path) -> dict[str
         # Gone after a successful rename; otherwise never leave a partial
         # dataset behind.
         shutil.rmtree(staging, ignore_errors=True)
-    return stats
+    # Not in dataset_manifest.json: it describes this cache, not the data.
+    return {**stats, "cache_pruned": pruned}
 
 
 def _write_dataset(
@@ -446,7 +474,7 @@ def _write_dataset(
     (staging / "samples").mkdir()
     unmapped: Counter[str] = Counter()
     clips_dropped = 0
-    owners: dict[str, str] = {}
+    sample_ids: list[str] = []
     for source_id, clips in sources.items():
         first = next(iter(clips.values()))[0]
         try:
@@ -478,16 +506,15 @@ def _write_dataset(
         )
         sample = {
             "sample_id": source_id,
-            "user_id": first.user_id,
             "fps": FPS,
             "keypoints": pose.keypoints,
             "tricks": tricks,
         }
         path = staging / "samples" / f"{source_id}.json"
         path.write_text(_dump(sample), encoding="utf-8")
-        owners[source_id] = first.user_id
+        sample_ids.append(source_id)
 
-    sample_ids = sorted(owners)
+    sample_ids.sort()
     stats = {
         "samples": len(sample_ids),
         "clips": sum(len(clips) for clips in sources.values()) - clips_dropped,
@@ -498,7 +525,7 @@ def _write_dataset(
     }
     manifest = {**stats, "export_cursor": pull.cursor, "sample_ids": sample_ids}
     (staging / "manifest.jsonl").write_text(
-        "".join(_dump({"sample_id": s, "user_id": owners[s]}) for s in sample_ids),
+        "".join(_dump({"sample_id": s, "source_id": s}) for s in sample_ids),
         encoding="utf-8",
     )
     (staging / "dataset_manifest.json").write_text(
