@@ -60,11 +60,12 @@ artifact). Floats are rounded to 6 decimals in every output.
 
 Fail closed
 -----------
-Missing/unreadable files, invalid JSON (including NaN/Infinity), a missing,
-non-numeric or out-of-range score, mismatched fixture sets, a malformed
-ingested-source list, a non-finite or negative tolerance, an empty override
-reason, or a malformed existing registry are errors, never silently a pass.
-All inputs are validated before any side effect (file write, alert).
+Missing/unreadable files, invalid JSON (including NaN, Infinity and numbers
+that overflow to infinity), a missing, non-numeric or out-of-range score,
+mismatched fixture sets, a malformed ingested-source list, a non-finite or
+negative tolerance, an empty override reason, or a malformed existing
+registry are errors, never silently a pass. All inputs are validated before
+any side effect (file write, alert).
 """
 
 from __future__ import annotations
@@ -111,10 +112,21 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"non-finite number {name} is not valid JSON")
 
 
+def _finite_float(text: str) -> float:
+    # json parses an overflowing literal such as 1e400 to inf without
+    # going through parse_constant.
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"number {text} overflows to {value}")
+    return value
+
+
 def load_json(path: Path, what: str) -> Any:
     try:
         with open(path, encoding="utf-8") as fh:
-            return json.load(fh, parse_constant=_reject_constant)
+            return json.load(
+                fh, parse_constant=_reject_constant, parse_float=_finite_float
+            )
     except (OSError, ValueError) as e:
         # ValueError covers JSONDecodeError and UnicodeDecodeError.
         raise GateError(f"cannot read {what} JSON from {path}: {e}") from e
@@ -328,7 +340,8 @@ def write_json_atomic(path: Path, data: Any) -> None:
             json.dump(data, fh, indent=2, sort_keys=True, allow_nan=False)
             fh.write("\n")
         tmp.replace(path)
-    except OSError as e:
+    except (OSError, ValueError) as e:
+        # ValueError: allow_nan=False refusing a non-finite float.
         raise GateError(f"cannot write {path}: {e}") from e
 
 

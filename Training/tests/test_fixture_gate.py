@@ -363,7 +363,7 @@ class FailClosedTest(GateTestCase):
 
     def test_non_finite_json_rejected(self):
         champion = self.scores("champion.json", 0.80, 0.90)
-        for literal in ("NaN", "Infinity", "-Infinity"):
+        for literal in ("NaN", "Infinity", "-Infinity", "1e400", "-1e400"):
             with self.subTest(literal=literal):
                 path = self.root / "challenger.json"
                 path.write_text(
