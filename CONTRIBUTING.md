@@ -12,7 +12,7 @@ CI is Python 3.12 on Ubuntu.
 
 | Path | What |
 |---|---|
-| `Training/` (upcoming — arrives with the feat/5–15 rebases) | Trick-detection training code |
+| `Training/` | Trick-detection training code (more arrives with the feat/12–15 rebases) |
 | `.github/workflows/` | CI |
 
 This file is the pointer doc; the READMEs under each directory are the source of truth.

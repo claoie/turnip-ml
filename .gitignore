@@ -20,6 +20,9 @@ venv/
 data/
 datasets/
 
+# Local run artifacts (never commit decision logs)
+Training/registry.json
+
 # Jupyter
 .ipynb_checkpoints/
 

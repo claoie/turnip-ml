@@ -5,6 +5,11 @@
 [tool.ruff]
 target-version = "py312"
 
+[tool.ruff.lint.per-file-ignores]
+# `Training/` is the pipeline directory name the design docs fix; it is run
+# as scripts and unittest discovery, never imported by package name.
+"Training/**" = ["N999"]
+
 [tool.mypy]
 python_version = "3.12"
 # Optional third-party deps don't always ship type stubs in every
