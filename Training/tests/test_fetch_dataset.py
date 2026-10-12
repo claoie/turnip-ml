@@ -286,6 +286,20 @@ class BuildTest(FetchTestCase):
         # Ending exactly at the last frame boundary is fine.
         self.build(FakeExport([row(SRC_A, 1, "cork", 30, 40)]))
 
+    def test_any_download_failure_fails_closed(self):
+        url = "https://acct.r2.example/bucket/poses/x?X-Amz-Signature=SECRET"
+        for error in (KeyError("missing"), RuntimeError(url), OSError(url)):
+            with self.subTest(error=type(error).__name__):
+
+                def failing(r2_key, error=error):
+                    raise error
+
+                self.blobs = failing
+                with self.assertRaisesRegex(FetchError, type(error).__name__) as ctx:
+                    self.build(out=f"dl-{type(error).__name__}")
+                self.assertNotIn("SECRET", str(ctx.exception))
+                self.assertFalse((self.root / f"dl-{type(error).__name__}").exists())
+
     def test_out_dir_must_be_fresh(self):
         (self.root / "dataset").mkdir()
         with self.assertRaises(FetchError):

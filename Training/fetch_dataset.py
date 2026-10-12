@@ -317,8 +317,15 @@ class BlobCache:
                 path.unlink()  # corrupt cache entry: the bucket is the truth
         except OSError as e:
             raise FetchError(f"cannot use blob cache {self.cache_dir}: {e}") from e
-        data = self.get(r2_key)
-        if _sha256(data) != sha256:
+        try:
+            data = self.get(r2_key)
+        except FetchError:
+            raise
+        except Exception as e:
+            # Any getter failure is a failed download (exit 2), never a
+            # traceback; report the type only, as messages can echo URLs.
+            raise FetchError(f"{r2_key}: download failed: {type(e).__name__}") from e
+        if not isinstance(data, bytes) or _sha256(data) != sha256:
             raise FetchError(f"{r2_key}: downloaded bytes do not match blob_sha256")
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)

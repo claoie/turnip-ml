@@ -84,7 +84,7 @@ class SpecVectorTest(unittest.TestCase):
 
     def test_values_outside_unit_range_are_kept(self):
         pose = tkp1.decode(tkp1.encode([frame({3: (-0.25, 1.5, 0.5)})]))
-        self.assertEqual(pose.keypoints[0][3], [-0.25, 1.5, 0.5])
+        self.assertEqual(pose.keypoints[0][3], [f32(-0.25), f32(1.5), f32(0.5)])
 
 
 class RejectTest(unittest.TestCase):
