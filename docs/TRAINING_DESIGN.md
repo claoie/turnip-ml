@@ -17,8 +17,11 @@ what those PRs implement, it says so explicitly.
 - Only **confirmed** clips + labels. The farm has no draft/pending clip
   lifecycle (master plan §1–§2), so everything reachable via
   `GET /api/labels/export?since=` is training-eligible by construction.
-- Privacy posture: pose keypoints (pose format) + labels only. Never video, never
-  personal data (master plan §1).
+- Privacy posture: pose keypoints (pose format) + labels only. Never
+  video, and no account identifier: the farm links a contribution to an
+  account only internally, until 30 days after its last write, and
+  never exports that link (master plan §1; `BACKEND_DESIGN.md`
+  §1.2.17).
 - The export excludes quarantined sources (master plan §4) and presents
   one **(source, clip, canonical trick name)** row per label — see §2.2.
 
@@ -26,12 +29,24 @@ what those PRs implement, it says so explicitly.
 
 ### 2.1 Export and watermarking
 
-- The nightly job pulls `GET /api/labels/export?since=<watermark>`,
-  receiving pose-blob R2 references, clip windows, raw label strings,
-  `user_id`, and the `taxonomy_version` in effect at label time.
-- The watermark is the last successful export timestamp, stored in the
-  training workspace (not in the farm). Per master plan §6, the nightly
-  run only proceeds when new labels since the watermark exceed 50.
+- **Change detection.** The nightly job first pulls
+  `GET /api/labels/export?since=<watermark>` and proceeds only when the
+  new label rows exceed 50 (master plan §6). The watermark is the last
+  successful export timestamp, stored in the training workspace (not
+  in the farm).
+- **Dataset pull.** The dataset itself is always built from a **full
+  pull** (no `since`). The export carries no deletions
+  (`BACKEND_DESIGN.md` §6): a source deleted by its owner, by account
+  deletion, or by a quarantine purge, and a label dropped when a clip's
+  label set is replaced, simply stop appearing. A dataset accumulated
+  from incremental pulls would keep training on deleted data.
+- **Row contents.** Each row carries the pose-blob R2 reference and its
+  digest, the clip window, the raw label string, and the
+  `taxonomy_version` in effect at label time. There is no account
+  identifier.
+- **Blob cache.** Pose blobs may be cached locally, keyed by `r2_key`
+  and verified against `blob_sha256`. After each full pull, every
+  cached blob whose source is absent from the pull is deleted.
 
 ### 2.2 Canonicalization (raw → canonical)
 
@@ -97,19 +112,19 @@ through `label_taxonomy` at the pinned `taxonomy_version` (above).
 
 ### 2.6 Splits (aligns with PR #17)
 
-- Stratified by `user_id`, target 80/10/10 train/val/holdout. No user's
-  clips leak across splits; all sources of one user land in one split.
+- Grouped by `source_id`, target 80/10/10 train/val/holdout: all clips
+  of one source land in one split. The export carries no account
+  identifier (§1), so one person's different videos can land in
+  different splits, which can flatter validation scores slightly. The
+  admin-curated holdout is the check on that. (PR #17 groups by
+  `user_id`; it needs to group by `source_id`.)
 - Deterministic: seeded RNG, sorted ids, byte-identical `split.json`
   (PR #17's `split_dataset.py` is the implementation).
-- Admin-curated holdout pinning: a pinned sample id pulls its whole user
-  into holdout — the poisoning-defense anchor. The holdout set stays
-  admin-curated (master plan §6).
+- Admin-curated holdout pinning: a pinned sample id pulls its whole
+  source into holdout — the poisoning-defense anchor. The holdout set
+  stays admin-curated (master plan §6).
 - The holdout split is **never loaded for training** — enforced at load
   time by the training script (PR #18), not by convention.
-- Bootstrap guard (master plan §6): until the contributor pool exceeds
-  ~20 users (or any split would hold fewer than 50 clips), fall back to
-  unstratified random splits — user-stratification on a handful of
-  contributors yields degenerate splits.
 - The dataset manifest (sample ids, split assignment, taxonomy_version,
   export watermark, split seed) is written next to the dataset; a
   training run is reproducible from the manifest alone.
@@ -170,11 +185,13 @@ action.
 
 Nightly pipeline order:
 
-1. Export new labels since the watermark (`GET /api/labels/export`).
+1. Count new labels since the watermark; when they exceed 50, take a
+   full pull of `GET /api/labels/export` and prune the blob cache
+   (§2.1).
 2. Build the dataset (§2): canonicalize at the pinned
    `taxonomy_version`, expand to (clip, name) pairs, attach gap-masked
    pose-format sequences, sample background negatives.
-3. Split deterministically by `user_id` (PR #17).
+3. Split deterministically by `source_id` (§2.6).
 4. Train the challenger on the train split, initializing from the
    current champion (`init_checkpoint` — the standing fine-tune path;
    from-scratch training is the exception: architecture change or
@@ -239,6 +256,13 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   R2, and referenced from the model manifest (`holdout_report_r2_key`).
   It is recorded for every nightly candidate; the promotion decision
   itself is the validation-metric gate (§8).
+- **Proposed (not yet implemented): anonymity evidence.** Every device
+  receives the model, so treating it as anonymous needs evidence
+  (`BACKEND_DESIGN.md` §9 Q8, EDPB Opinion 28/2024). The holdout report
+  gains a membership-inference check: can the model's outputs tell
+  training sources from holdout sources better than chance? Release
+  checks also confirm that no pose sequences ship inside the model
+  artifact.
 
 ### 6.3 Fixture regression gate (anti-poisoning)
 
@@ -261,15 +285,14 @@ estimation is MoveNet's job, and fine-tuning it is off the table
 
 On fixture regression (master plan §6), in order:
 
-1. **Discord alert** via webhook with: the metrics delta (challenger vs
-   champion fixture scores), the affected `source_id`s ingested that
-   day, and the responsible `user_id`s (attribution from
-   `sources.user_id` — the "basic level of identification" for bad
-   data).
+1. **Discord alert** via webhook with the metrics delta (challenger vs
+   champion fixture scores) and the affected `source_id`s ingested that
+   day. **Never account IDs:** a Discord message outlives the farm's
+   30-day attribution window (`BACKEND_DESIGN.md` §8).
 2. **Quarantine that day's ingested sources:** one `data_quarantine`
    row per source ingested since the last watermark —
-   `(source_id, user_id, reason, metrics JSONB snapshot,
-   quarantined_at)`. "That day's ingested data" means sources with
+   `(source_id, reason, metrics JSONB snapshot, quarantined_at)`, with
+   no `user_id`. "That day's ingested data" means sources with
    `created_at` after the previous successful watermark.
 3. **Training exclusion:** the export excludes sources with an
    unresolved quarantine row (`resolution IS NULL`) or
@@ -278,9 +301,12 @@ On fixture regression (master plan §6), in order:
    validation metrics.
 5. **Review workflow:** the maintainer reviews the quarantine queue and
    marks each row **released** (good data — re-included next night) or
-   **purged** (bad data — excluded permanently). Repeated purges
-   against one user feed the `users.is_blocked` / reputation decision,
-   which remains a manual call.
+   **purged** (bad data — excluded permanently). To find who uploaded a
+   purged source, the maintainer reads the farm's `source_attribution`,
+   which links a source to the account that last wrote it until 30
+   days after that write. Repeated purges traced to one account feed
+   the `users.is_blocked` decision, which remains a manual call. Once a
+   source is past the window, nobody can tell who uploaded it.
 6. The next nightly run retries with the quarantine applied. The loop
    cannot promote poisoned data even when validation metrics look fine,
    because the fixture gate (§6.3) runs **before** the promotion gate.
@@ -342,3 +368,5 @@ On fixture regression (master plan §6), in order:
    measurement before it can gate anything.
 5. Promotion metric for the production architecture (§8) — segment
    composite vs window accuracy.
+6. Membership-inference check (§6.2) — which attack, and what
+   advantage over chance counts as passing.
