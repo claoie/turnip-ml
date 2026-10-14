@@ -87,10 +87,13 @@ ROWS = [
 class FakeExport:
     """Paginated export; cursors are opaque strings; records requests."""
 
-    def __init__(self, rows=ROWS, page_size=2, null_on_last_page=False):
+    def __init__(self, rows=ROWS, page_size=2, null_on_last_page=False, taxonomy=None):
         self.rows = list(rows)
         self.page_size = page_size
         self.null_on_last_page = null_on_last_page
+        # None: the mappings for the versions present on each page (the
+        # contract as written); a list: that whole table on every page.
+        self.taxonomy = taxonomy
         self.requests = []
 
     def __call__(self, url, headers):
@@ -104,11 +107,11 @@ class FakeExport:
         if exhausted and self.null_on_last_page:
             next_cursor = None
         versions = {r["taxonomy_version"] for r in page}
-        return {
-            "rows": page,
-            "taxonomy": [t for t in TAXONOMY if t["taxonomy_version"] in versions],
-            "next_cursor": next_cursor,
-        }
+        if self.taxonomy is None:
+            taxonomy = [t for t in TAXONOMY if t["taxonomy_version"] in versions]
+        else:
+            taxonomy = self.taxonomy
+        return {"rows": page, "taxonomy": taxonomy, "next_cursor": next_cursor}
 
 
 class FakeBlobs:
@@ -230,6 +233,21 @@ class BuildTest(FetchTestCase):
             encoding="utf-8"
         )
         self.assertEqual(log, "1\tmystery flip\n")
+
+    def test_pin_is_the_farms_current_taxonomy_version(self):
+        # A curation-only bump: version 3 maps a raw string no label was
+        # confirmed under at v3. It applies to every label at the next run.
+        curated = [
+            *TAXONOMY,
+            {"raw": "mystery flip", "canonical": "mystery", "taxonomy_version": 3},
+        ]
+        stats = self.build(FakeExport(taxonomy=curated))
+        self.assertEqual(stats["taxonomy_version"], 3)
+        self.assertEqual(stats["unmapped_tokens"], 0)
+        self.assertEqual(self.sample(SRC_C)["tricks"][0]["name"], "mystery")
+        # The contract as written ships only the versions present in rows,
+        # so the pin falls back to the greatest version among them.
+        self.assertEqual(self.build(out="per-page")["taxonomy_version"], 2)
 
     def test_byte_identical_across_page_sizes(self):
         self.build(FakeExport(page_size=1), out="p1")
@@ -502,7 +520,9 @@ class MainTest(FetchTestCase):
             ["count", "--out-state", str(state)], transport=export
         )
         self.assertEqual(code, EXIT_OK)
-        self.assertEqual(json.loads(self.stdout.getvalue()), {"new_labels": 6})
+        self.assertEqual(
+            json.loads(self.stdout.getvalue()), {"new_labels": 6, "changed_sources": 3}
+        )
         self.assertEqual(json.loads(state.read_text()), {"watermark": "cur-5"})
 
         export.rows.append(row(SRC_C, 6, "hook", 20, 30))
@@ -514,8 +534,36 @@ class MainTest(FetchTestCase):
             transport=export,
         )
         self.assertEqual(code, EXIT_OK)
-        self.assertEqual(json.loads(self.stdout.getvalue()), {"new_labels": 1})
+        self.assertEqual(
+            json.loads(self.stdout.getvalue()), {"new_labels": 1, "changed_sources": 1}
+        )
         self.assertEqual(json.loads(newer.read_text()), {"watermark": "cur-6"})
+
+    def test_count_lists_the_changed_sources(self):
+        export = FakeExport(page_size=4)
+        export.rows.append(row(SRC_C, 6, "hook", 20, 30))
+        state = self.root / "state.json"
+        state.write_text('{"watermark": "cur-3"}')
+        sources = self.root / "run" / "ingested.json"
+        argv = ["count", "--state", str(state), "--out-state", str(self.root / "o")]
+        code = fetch_dataset.main([*argv, "--out-sources", str(sources)], export)
+        self.assertEqual(code, EXIT_OK)
+        # Rows 4..6 changed: SRC_A's clip 2 (relabel of an old source), SRC_B's
+        # clip 4 and SRC_C's new clip; one id each, sorted.
+        self.assertEqual(json.loads(sources.read_text()), [SRC_A, SRC_B, SRC_C])
+        self.assertEqual(
+            json.loads(self.stdout.getvalue()), {"new_labels": 3, "changed_sources": 3}
+        )
+        self.assertNotIn(SRC_A, self.stdout.getvalue())
+
+    def test_count_with_nothing_new_lists_no_sources(self):
+        state = self.root / "state.json"
+        state.write_text('{"watermark": "cur-5"}')
+        sources = self.root / "ingested.json"
+        argv = ["count", "--state", str(state), "--out-state", str(self.root / "o")]
+        code = fetch_dataset.main([*argv, "--out-sources", str(sources)], FakeExport())
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(json.loads(sources.read_text()), [])
 
     def test_count_with_nothing_new_keeps_the_watermark(self):
         state = self.root / "state.json"
@@ -526,7 +574,9 @@ class MainTest(FetchTestCase):
             transport=FakeExport(),
         )
         self.assertEqual(code, EXIT_OK)
-        self.assertEqual(json.loads(self.stdout.getvalue()), {"new_labels": 0})
+        self.assertEqual(
+            json.loads(self.stdout.getvalue()), {"new_labels": 0, "changed_sources": 0}
+        )
         self.assertEqual(json.loads(out.read_text()), {"watermark": "cur-5"})
 
     def test_malformed_state_file(self):

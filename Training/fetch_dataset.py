@@ -3,13 +3,18 @@
 
 Subcommands
 -----------
-count --out-state FILE [--state FILE]
+count --out-state FILE [--state FILE] [--out-sources FILE]
     Pages `GET /api/labels/export?since=<watermark>` and prints
-    {"new_labels": N}: the label rows changed since the watermark in
-    --state (omit --state on the very first run to count everything). The
-    newest cursor seen is written to --out-state as {"watermark": ...};
-    the pipeline stores it only after the whole run succeeds, so the
-    watermark always means "last successful export".
+    {"new_labels": N, "changed_sources": M}: the label rows changed since
+    the watermark in --state (omit --state on the very first run to count
+    everything), and the sources they belong to. The newest cursor seen is
+    written to --out-state as {"watermark": ...}; the pipeline stores it
+    only after the whole run succeeds, so the watermark always means "last
+    successful export". --out-sources writes the changed source ids as a
+    sorted JSON array: the fixture gate's --ingested list. Taken after the
+    dataset pull, it covers every new row the challenger trained on, and
+    it includes old sources whose labels were edited (a relabel can poison
+    as well as a new upload).
 
 build --out DIR --cache DIR
     Full pull of the export (never incremental: deletions, purges,
@@ -37,7 +42,9 @@ build --out DIR --cache DIR
       unmapped_labels.log       "<count>\t<token>" per unmapped label token,
                                 the taxonomy curation queue
     Raw labels are canonicalized at one pinned taxonomy version: the
-    greatest taxonomy_version among the exported rows (see canonicalize.py).
+    farm's current one, i.e. the greatest taxonomy_version in the export's
+    taxonomy or rows, so a curation-only bump applies to every label at the
+    next run (see canonicalize.py for the per-raw resolution).
     A label that canonicalizes to no name at all (only parentheticals or
     delimiters) contributes nothing; a clip left without names is dropped.
 
@@ -436,7 +443,12 @@ def build_dataset(pull: ExportPull, blobs: BlobCache, out_dir: Path) -> dict[str
         raise FetchError("the export is empty: nothing to train on")
     if out_dir.exists():
         raise FetchError(f"{out_dir} already exists; use a fresh directory per run")
-    pinned = max(row.taxonomy_version for row in pull.rows)
+    # The farm's current version: the greatest in the taxonomy (or rows),
+    # so curation applies without waiting for labels at the new version.
+    pinned = max(
+        [row.taxonomy_version for row in pull.rows]
+        + [version for _, _, version in pull.taxonomy]
+    )
     try:
         taxonomy = Taxonomy(pull.taxonomy, pinned)
     except TaxonomyError as e:
@@ -553,12 +565,16 @@ def read_state(path: Path) -> str | None:
     return watermark
 
 
-def write_state(path: Path, watermark: str | None) -> None:
+def write_json_file(path: Path, data: Any) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _write_atomic(path, _dump({"watermark": watermark}).encode("utf-8"))
+        _write_atomic(path, _dump(data).encode("utf-8"))
     except OSError as e:
-        raise FetchError(f"cannot write state file {path}: {e}") from e
+        raise FetchError(f"cannot write {path}: {e}") from e
+
+
+def write_state(path: Path, watermark: str | None) -> None:
+    write_json_file(path, {"watermark": watermark})
 
 
 def client_from_env(transport: Transport | None) -> ExportClient:
@@ -578,6 +594,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     count.add_argument(
         "--out-state", type=Path, required=True, help="where to write the new watermark"
     )
+    count.add_argument(
+        "--out-sources",
+        type=Path,
+        help="where to write the changed source ids (the fixture gate's --ingested)",
+    )
     build = sub.add_parser("build", help="full pull into a fresh dataset directory")
     build.add_argument("--out", type=Path, required=True, help="dataset directory")
     build.add_argument("--cache", type=Path, required=True, help="pose-blob cache")
@@ -595,8 +616,14 @@ def main(
         if args.command == "count":
             since = read_state(args.state) if args.state else None
             pull = client.pull(since)
+            changed = sorted({row.source_id for row in pull.rows})
             write_state(args.out_state, pull.cursor)
-            result: dict[str, Any] = {"new_labels": len(pull.rows)}
+            if args.out_sources:
+                write_json_file(args.out_sources, changed)
+            result: dict[str, Any] = {
+                "new_labels": len(pull.rows),
+                "changed_sources": len(changed),
+            }
         else:
             blobs = BlobCache(args.cache, blob_getter or r2_getter_from_env())
             result = build_dataset(client.pull(), blobs, args.out)
