@@ -31,9 +31,10 @@ what those PRs implement, it says so explicitly.
 
 - **Change detection.** The nightly job first pulls
   `GET /api/labels/export?since=<watermark>` and proceeds only when the
-  new label rows exceed 50 (master plan §6). The watermark is the last
-  successful export timestamp, stored in the training workspace (not
-  in the farm).
+  new label rows exceed 50 (master plan §6). The watermark is the
+  export cursor (the farm's opaque `next_cursor`) of the last successful
+  run, stored in the training workspace (not in the farm). It advances
+  only when a run completes.
 - **Dataset pull.** The dataset itself is always built from a **full
   pull** (no `since`). The export carries no deletions
   (`BACKEND_DESIGN.md` §6): a source deleted by its owner, by account
@@ -54,14 +55,26 @@ Applied **at dataset build time**, pinned to a single `taxonomy_version`
 for the whole training run. The farm preserves raw free-text strings
 forever; training consumes canonical names via `label_taxonomy`.
 
+- **The pin is the farm's current version:** the greatest
+  `taxonomy_version` in the taxonomy the export ships, not the greatest
+  among the label rows. A curation-only bump (new mappings, no new
+  labels yet) therefore applies to every label at the next run.
+- **Versions are append-only:** a bump adds only new or changed
+  mappings, so each raw string resolves to its mapping with the greatest
+  `taxonomy_version` ≤ the pin (the farm's `(raw, taxonomy_version DESC)`
+  lookup). The export must therefore ship the whole table, not only the
+  versions present in its rows (`BACKEND_DESIGN.md` §7.3).
+
 Deterministic pipeline per label string:
 
 1. Normalize: lowercase, trim, collapse internal whitespace.
-2. Split combo strings on `-`, `/`, `+`, `,`, and strip parentheticals
-   like `(combo)` — e.g. `"hook - scoot - gainer - cartfull (combo)"`
-   becomes `[hook, scoot, gainer, cartfull]` on one window.
-3. Look up each token in `label_taxonomy` at the pinned
-   `taxonomy_version` → canonical name.
+2. Strip parentheticals like `(combo)`.
+3. Look the whole label up first (as typed, then without
+   parentheticals). On a miss, split it on `-`, `/`, `+`, `,` and look up
+   each token — e.g. `"hook - scoot - gainer - cartfull (combo)"` becomes
+   `[hook, scoot, gainer, cartfull]` on one window. Whole-label lookup
+   comes first so a mapped name that contains a delimiter (`b-twist`) is
+   not split.
 4. **Judgment call:** tokens with no mapping keep their normalized form
    as the canonical name and are appended to a curation queue
    (`unmapped_labels.log`) for later taxonomy work. Rationale: failing
@@ -198,6 +211,9 @@ Nightly pipeline order:
    taxonomy major bump, decided by the maintainer). Val split for model
    selection; holdout never loaded.
 5. Fixture regression gate (§6.3) — challenger vs champion on fixtures.
+   Its quarantine candidates (§7) come from a second
+   `since=<watermark>` pull, taken after step 1's full pull; on
+   completion the watermark advances to that pull's newest cursor.
 6. Holdout evaluation (§6.2) — report written next to the artifact.
 7. Promotion gate (§8) — champion/challenger on the validation metric.
 8. Publish (§9, `MODEL_CONTRACT.md`).
@@ -286,14 +302,26 @@ estimation is MoveNet's job, and fine-tuning it is off the table
 On fixture regression (master plan §6), in order:
 
 1. **Discord alert** via webhook with the metrics delta (challenger vs
-   champion fixture scores) and the affected `source_id`s ingested that
-   day. **Never account IDs:** a Discord message outlives the farm's
+   champion fixture scores) and the affected `source_id`s (step 2). **Never account IDs:** a Discord message outlives the farm's
    30-day attribution window (`BACKEND_DESIGN.md` §8).
-2. **Quarantine that day's ingested sources:** one `data_quarantine`
-   row per source ingested since the last watermark —
+2. **Quarantine the sources changed since the watermark:** one
+   `data_quarantine` row per source —
    `(source_id, reason, metrics JSONB snapshot, quarantined_at)`, with
-   no `user_id`. "That day's ingested data" means sources with
-   `created_at` after the previous successful watermark.
+   no `user_id`.
+   - **Which sources:** every source with a label row changed since the
+     previous successful watermark. That is new uploads and relabels of
+     old sources alike (a relabel can poison as well as an upload), and
+     the same rows the trigger counts (§2.1). It is not "sources with
+     `created_at` after the watermark", which would miss relabels.
+   - **How the list is built:** a `since=<watermark>` pull taken after
+     the dataset pull, so the list covers every new row the challenger
+     trained on. A source that changes between the two pulls is
+     over-quarantined, which is harmless.
+   - **How it reaches the farm:** the pipeline sends the source ids
+     explicitly, so the alert and the quarantine list are the same. The
+     farm inserts one row per id and skips sources already under an
+     open quarantine. The farm does not pick sources by time window: it
+     does not know the pipeline's watermark.
 3. **Training exclusion:** the export excludes sources with an
    unresolved quarantine row (`resolution IS NULL`) or
    `resolution='purged'`; `resolution='released'` rows are re-included.
