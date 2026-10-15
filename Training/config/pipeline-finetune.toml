@@ -1,0 +1,22 @@
+# Training pipeline config: fine-tune the current champion, which the
+# pipeline places in data/champion/ (Training/pipeline.sh). Identical to
+# pipeline.toml except init_checkpoint; keep them in step
+# (Training/tests/test_pipeline_configs.py checks it).
+seed = 0
+
+compute = "cpu"
+
+# Fixed by Training/pipeline.sh: the dataset it was given and its run dir.
+split_path = "data/run/split.json"
+samples_dir = "data/dataset/samples"
+out_dir = "data/run/challenger"
+
+# Hyperparameters: the full-run values from config/full.toml.
+window_frames = 16
+window_stride = 8
+
+learning_rate = 0.1
+epochs = 500
+l2 = 0.0001
+
+init_checkpoint = "data/champion/model.npz"

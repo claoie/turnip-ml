@@ -1,0 +1,225 @@
+# Training pipeline: the nightly trick-model run (docs/TRAINING_DESIGN.md §5).
+#
+# The only workflow that touches real data or secrets, so it never runs on
+# pull_request: only on the nightly schedule (from main) or by dispatch.
+#
+# Modes (dispatch input `source`; the schedule always runs `farm`):
+#   synthetic  rehearses the chain on the committed smoke fixture. No
+#              secrets; its run directory is uploaded as an artifact
+#              (synthetic data only).
+#   farm       the real run, from the `training` Environment: count label
+#              rows changed since the stored watermark (skip at 50 or
+#              fewer unless `force`), full pull + pose blobs, the changed-
+#              source list, then the shared chain. Logs and artifacts of
+#              this public repository are public, so nothing per-sample is
+#              printed or uploaded as an artifact: the run directory goes
+#              to the private R2 bucket. The watermark advances only at
+#              the end of a successful run.
+#
+# Both modes then run Training/pipeline.sh: split -> train (fine-tune the
+# champion unless `from_scratch`) -> predict holdout -> evaluate holdout.
+# Explicit stops: the fixture gate needs the fixture runner (#27), so
+# promotion and publishing (#16) don't run yet; no champion changes.
+#
+# No actions/cache anywhere: pull_request runs can read caches written on
+# main, so nothing derived from contributed data may go into one.
+name: Training pipeline
+
+on:
+  schedule:
+    - cron: '17 3 * * *' # nightly, 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'synthetic (rehearsal on the smoke fixture) or farm (real data)'
+        type: choice
+        options: [synthetic, farm]
+        default: synthetic
+      force:
+        description: 'farm: run even with 50 or fewer new label rows'
+        type: boolean
+        default: false
+      from_scratch:
+        description: 'train from scratch instead of fine-tuning the champion'
+        type: boolean
+        default: false
+  # TEMPORARY: lets this branch run the synthetic mode before the file is on
+  # main (workflow_dispatch needs it there). Removed before review.
+  push:
+    branches: [feat/training-workflow]
+
+permissions:
+  contents: read
+
+# One run at a time, and never cancel one: a run may already have written
+# to R2 when the next is queued.
+concurrency:
+  group: training-pipeline
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  synthetic:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.source == 'synthetic')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install training dependencies
+        run: pip install -r Training/requirements.txt
+
+      # source-c (smoke-007/008) pinned to holdout; with 50/25/25 targets
+      # the seeded split puts source-a in train and source-b in val.
+      - name: Synthetic dataset (the committed smoke fixture)
+        run: |
+          python Training/make_smoke_fixture.py --out data/dataset --seed 0
+          echo smoke-008 > data/holdout_ids.txt
+
+      - name: Split, train, predict and evaluate
+        env:
+          HOLDOUT_IDS: data/holdout_ids.txt
+          SPLIT_RATIOS: '0.5 0.25 0.25'
+          FROM_SCRATCH: ${{ inputs.from_scratch || false }}
+        run: Training/pipeline.sh
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: synthetic-run
+          path: data/run
+          retention-days: 7
+
+  farm:
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.source == 'farm')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: training
+    env:
+      TURNIP_FARM_URL: ${{ vars.TURNIP_FARM_URL }}
+      TURNIP_PIPELINE_KEY: ${{ secrets.TURNIP_PIPELINE_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      # The aws CLI (preinstalled on the runner) reads R2 state with the
+      # same credentials. R2 rejects the CLI's newer default checksums on
+      # some versions; "when_required" works with or without that.
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      FORCE: ${{ inputs.force || false }}
+    steps:
+      - name: Check configuration
+        id: config
+        run: |
+          if [ -z "$TURNIP_FARM_URL" ]; then
+            echo "::notice::The training Environment is not configured (vars.TURNIP_FARM_URL is empty); nothing to do."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.config.outputs.configured == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - if: steps.config.outputs.configured == 'true'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - if: steps.config.outputs.configured == 'true'
+        name: Install training dependencies
+        run: pip install -r Training/requirements.txt
+
+      # training/state/export_state.json  the watermark (never printed: the
+      #                                   cursor may embed raw label text)
+      # training/champion/model.npz       the fine-tune base, if any
+      # training/holdout_ids.txt          admin-pinned holdout, if any
+      - if: steps.config.outputs.configured == 'true'
+        name: Restore training state from R2
+        run: |
+          r2() { aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" s3 "$@"; }
+          base="s3://${R2_BUCKET}/training"
+          # Fails the job on bad credentials, so "not found" below is real.
+          r2 ls "s3://${R2_BUCKET}/" > /dev/null
+          mkdir -p data/state data/champion data/run
+          restore() {  # restore <key under training/> <local path>
+            if r2 ls "$base/$1" > /dev/null; then
+              r2 cp --only-show-errors "$base/$1" "$2"
+              echo "restored training/$1"
+            else
+              echo "no training/$1 yet"
+            fi
+          }
+          restore state/export_state.json data/state/export_state.json
+          restore champion/model.npz data/champion/model.npz
+          restore holdout_ids.txt data/holdout_ids.txt
+
+      - if: steps.config.outputs.configured == 'true'
+        name: Count label rows changed since the watermark
+        id: count
+        run: |
+          state=()
+          [ -f data/state/export_state.json ] && state=(--state data/state/export_state.json)
+          python Training/fetch_dataset.py count "${state[@]}" \
+            --out-state data/state/count_state.json > data/count.json
+          new=$(python -c 'import json; print(json.load(open("data/count.json"))["new_labels"])')
+          echo "new label rows since the watermark: $new"
+          if [ "$new" -le 50 ] && [ "$FORCE" != "true" ]; then
+            echo "::notice::$new new label rows (50 or fewer): skipping this run."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.count.outputs.run == 'true'
+        name: Pull the dataset (full pull, pruned blob cache)
+        run: |
+          python Training/fetch_dataset.py build --out data/dataset --cache data/blob-cache
+
+      # Taken after the dataset pull, so it covers every new row the
+      # challenger trains on (TRAINING_DESIGN.md §7); the fixture gate's
+      # --ingested once #27 lands. Its cursor becomes the new watermark.
+      - if: steps.count.outputs.run == 'true'
+        name: List the sources changed since the watermark
+        run: |
+          state=()
+          [ -f data/state/export_state.json ] && state=(--state data/state/export_state.json)
+          python Training/fetch_dataset.py count "${state[@]}" \
+            --out-state data/state/new_state.json --out-sources data/run/ingested.json
+
+      - if: steps.count.outputs.run == 'true'
+        name: Split, train, predict and evaluate
+        env:
+          FROM_SCRATCH: ${{ inputs.from_scratch || false }}
+        run: |
+          if [ -f data/holdout_ids.txt ]; then export HOLDOUT_IDS=data/holdout_ids.txt; fi
+          Training/pipeline.sh
+
+      - if: steps.count.outputs.run == 'true'
+        name: Record the run in R2
+        run: |
+          aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+            s3 cp --recursive --only-show-errors data/run \
+            "s3://${R2_BUCKET}/training/runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
+          echo "recorded training/runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
+
+      - if: steps.count.outputs.run == 'true'
+        name: Advance the watermark
+        run: |
+          aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+            s3 cp --only-show-errors data/state/new_state.json \
+            "s3://${R2_BUCKET}/training/state/export_state.json"
+          echo "watermark advanced"

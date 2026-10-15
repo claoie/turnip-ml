@@ -84,30 +84,46 @@ fails the run.
 
 ## Full run
 
-Real training runs on the droplet during MVP; the GPU worker comes later.
-The seam is one variable — `compute` in the config:
+Real training runs on GitHub Actions: `.github/workflows/training-pipeline.yml`,
+nightly at 03:17 UTC or by dispatch, on CPU runners for now (#24 tracks a
+GPU worker). The compute seam stays one variable, `compute` in the config,
+read in exactly one place (`train.py::_select_backend`):
 
 ```toml
-compute = "cpu"   # droplet / smoke
+compute = "cpu"   # Actions CPU runner / smoke
 compute = "gpu"   # GPU worker (cupy-backed); fails closed without it
 ```
 
-`compute` is read in exactly one place (`train.py::_select_backend`).
+The workflow has two modes:
 
-1. Export labeled samples from turnip-farm (`GET /api/labels/export`),
-   one JSON sample per file in `data/` (git-ignored; see `train.py`
-   docstring for the sample format — JSON here, TKP1 binary in the real
-   pipeline).
-2. Copy `Training/config/full.toml` to `Training/config/full.local.toml`
-   (git-ignored scratch) and point `split_path` / `samples_dir` at the
-   export; choose hyperparams there, not on the CLI.
-3. `python Training/split_dataset.py --in data/manifest.jsonl
-   --out data/split.json --seed 0`
-4. `python Training/train.py --config Training/config/full.local.toml`
-5. To fine-tune the current champion instead of training from scratch, set
-   `init_checkpoint = "runs/<champion>/model.npz"`.
-6. `metrics.json` feeds the promotion gate (turnip-ml#15: champion /
-   challenger promotion on >=1% val improvement).
+- **`farm`** (the schedule, or dispatch with `source=farm`) runs from the
+  `training` Environment, which holds `vars.TURNIP_FARM_URL` and the secrets
+  `TURNIP_PIPELINE_KEY`, `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
+  `R2_SECRET_ACCESS_KEY` and `R2_BUCKET`. Until `TURNIP_FARM_URL` is set it
+  does nothing. Otherwise:
+  1. restores the watermark, champion and pinned holdout ids from
+     `training/` in R2;
+  2. `fetch_dataset.py count`: skips the run at 50 or fewer new label rows
+     (dispatch `force` overrides);
+  3. `fetch_dataset.py build`: full pull into `data/dataset`;
+  4. `fetch_dataset.py count --out-sources`: the changed-source list;
+  5. `pipeline.sh` (below);
+  6. records `data/run` under `training/runs/<run id>/` in R2, then
+     advances the watermark.
+- **`synthetic`** (dispatch default) rehearses the same chain on the smoke
+  fixture, with no secrets, and uploads its run directory as an artifact.
+
+`Training/pipeline.sh` is the shared chain: `split_dataset.py` →
+`train.py` (`config/pipeline-finetune.toml` when a champion was restored,
+else `config/pipeline.toml`; dispatch `from_scratch` forces the latter) →
+`predict.py` on holdout → `evaluate.py`. It stops before the fixture gate,
+which needs the fixture runner (#27); promotion and publishing (#16) come
+after the gate, so a run changes no champion yet.
+
+Nothing per-sample reaches the log or an artifact in `farm` mode: this
+repository's logs and artifacts are public. Run it locally the same way:
+put a dataset in `data/dataset/` (`fetch_dataset.py build`, or
+`make_smoke_fixture.py --out data/dataset`) and run `Training/pipeline.sh`.
 
 Swapping the smoke model for the real architecture (temporal conv net over
 the keypoint sequence) is a `build_dataset`/`train_classifier`-level change

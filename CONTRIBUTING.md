@@ -31,8 +31,14 @@ This file is the pointer doc; the READMEs under each directory are the source of
    or videos in git. Any helper that downloads external bytes must verify
    hashes and fail loudly on mismatch — never silently pass.
 
-4. **No secrets, ever.** CI runs on fork PRs, where secrets are invisible.
-   Do not add anything that needs a secret to CI.
+4. **No secrets in PR CI.** CI runs on fork PRs, where secrets are invisible:
+   nothing triggered by `pull_request` may need a secret. The one workflow
+   with secrets is the training pipeline
+   (`.github/workflows/training-pipeline.yml`), which runs only on its
+   nightly schedule or by dispatch, never on `pull_request`, and takes its
+   secrets from the protected `training` Environment. Its logs and artifacts
+   are public like every other run's, so it prints counts and aggregate
+   metrics only.
 
 ## Pull requests
 
@@ -59,3 +65,7 @@ Closes hoiekim/turnip-ml#<N>
 ## CI on your PR
 
 - `python-checks` runs ruff + mypy on PRs touching Python files.
+- `training-smoke` runs the `Training/` unit tests and a smoke training run
+  on PRs touching `Training/**`.
+- The training pipeline never runs on PRs; see `Training/README.md`
+  ("Full run").
