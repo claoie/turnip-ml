@@ -3,3 +3,7 @@
 # in CI must not drift with dependency releases. numpy matches the
 # PoseAccuracy pin so the repo has a single numpy version.
 numpy==2.5.3
+# R2 (S3-compatible) access for fetch_dataset.py build. botocore is pinned
+# with it so installs stay reproducible.
+boto3==1.43.104
+botocore==1.43.104

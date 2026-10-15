@@ -629,6 +629,41 @@ class MainTest(FetchTestCase):
         ):
             fetch_dataset.r2_getter_from_env()
 
+    @unittest.skipUnless(importlib.util.find_spec("boto3"), "boto3 not installed")
+    def test_r2_getter_reads_the_bucket_and_hides_error_details(self):
+        from botocore.exceptions import ClientError
+
+        env = {
+            "R2_ACCOUNT_ID": "acct",
+            "R2_ACCESS_KEY_ID": "key-id",
+            "R2_SECRET_ACCESS_KEY": "SECRET",
+            "R2_BUCKET": "poses-bucket",
+        }
+        client = mock.MagicMock()
+        client.get_object.return_value = {"Body": io.BytesIO(BLOBS[SRC_A])}
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch("boto3.client", return_value=client) as make_client,
+        ):
+            get = fetch_dataset.r2_getter_from_env()
+            self.assertEqual(get(f"poses/{SRC_A}.tkp1.gz"), BLOBS[SRC_A])
+            client.get_object.side_effect = ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "SECRET detail"}},
+                "GetObject",
+            )
+            with self.assertRaisesRegex(FetchError, "ClientError") as ctx:
+                get(f"poses/{SRC_B}.tkp1.gz")
+        self.assertNotIn("SECRET", str(ctx.exception))
+        kwargs = make_client.call_args.kwargs
+        self.assertEqual(make_client.call_args.args, ("s3",))
+        self.assertEqual(
+            kwargs["endpoint_url"], "https://acct.r2.cloudflarestorage.com"
+        )
+        self.assertEqual(kwargs["region_name"], "auto")
+        client.get_object.assert_called_with(
+            Bucket="poses-bucket", Key=f"poses/{SRC_B}.tkp1.gz"
+        )
+
     @unittest.skipIf(importlib.util.find_spec("boto3"), "boto3 is installed")
     def test_r2_getter_requires_boto3(self):
         with (
