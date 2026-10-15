@@ -43,10 +43,6 @@ on:
         description: 'train from scratch instead of fine-tuning the champion'
         type: boolean
         default: false
-  # TEMPORARY: lets this branch run the synthetic mode before the file is on
-  # main (workflow_dispatch needs it there). Removed before review.
-  push:
-    branches: [feat/training-workflow]
 
 permissions:
   contents: read
@@ -62,9 +58,7 @@ env:
 
 jobs:
   synthetic:
-    if: >-
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && inputs.source == 'synthetic')
+    if: github.event_name == 'workflow_dispatch' && inputs.source == 'synthetic'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
