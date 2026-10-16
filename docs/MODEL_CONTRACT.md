@@ -197,15 +197,14 @@ space from there.
 3. **Merge:** merge segments with identical `trick_names` separated by
    fewer than 5 frames (0.5 s) into one segment spanning the union.
    (Judgment call: covers flicker at trick boundaries.)
-4. **Pre-fill only confident names.** A name with
-   `name_score ≥ 0.5` becomes a pre-filled chip, `origin: model`
-   (`BACKEND_DESIGN.md` §1.2.18); a name below that is not filled in
-   and may only rank higher among the editor's typed-ahead suggestions
-   (picking it there is `origin: vocabulary`). A segment whose names
-   all fall below the bar is still proposed, as a window with no names.
-   (Judgment call: 0.5, the segment threshold's default, until holdout
-   calibration says otherwise. Fewer, surer pre-fills leave less to
-   rubber-stamp.)
+4. **Pre-fill only confident names.** A name with `name_score ≥ 0.5`
+   becomes a pre-filled chip, `origin: model` (`BACKEND_DESIGN.md`
+   §1.2.18); a name below that is not filled in and may only rank higher
+   among the naming screen's typed-ahead suggestions (picking it there
+   is `origin: vocabulary`). A segment whose names all fall below the
+   bar is still proposed, as a window with no names. (Judgment call:
+   0.5, the segment threshold's default, until holdout calibration says
+   otherwise. Fewer, surer pre-fills leave less to rubber-stamp.)
 5. **Blind sample.** At creation, each model-proposed clip is drawn
    into the blind sample with probability 0.1, once, and the draw is
    persisted with the clip: a blind clip gets its window but no
@@ -225,10 +224,10 @@ space from there.
    `suggestions_withheld`, with the clip if it is contributed (`POST
    /api/clips`). Names below the pre-fill bar are not recorded: they
    were never offered as an answer, only ranked.
-7. The surviving segments feed the clip editor as proposals — windows
-   plus names — and the user confirms or edits them per the confirmed
-   contribution flow. Proposals are never contributed without explicit
-   user confirmation.
+7. The surviving segments feed the app as proposals — windows to the
+   clip list, names to the naming step after it — and the user confirms
+   or edits them per the confirmed contribution flow. Proposals are
+   never contributed without explicit user confirmation.
 
 ### 3.4 Preprocessing checklist (client)
 
