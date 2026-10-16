@@ -24,6 +24,11 @@ what those PRs implement, it says so explicitly.
   §1.2.17).
 - The export excludes quarantined sources (master plan §4) and presents
   one **(source, clip, canonical trick name)** row per label — see §2.2.
+- Each row also carries the label's provenance (`BACKEND_DESIGN.md`
+  §1.2.18): its `origin` (`typed` | `vocabulary` | `model`), and the
+  clip's `proposal_model_version`, `suggested_names` and
+  `suggestions_withheld`. Training uses them to measure and limit the
+  model learning from its own suggestions (§6.4).
 
 ## 2. Dataset construction
 
@@ -42,9 +47,9 @@ what those PRs implement, it says so explicitly.
   label set is replaced, simply stop appearing. A dataset accumulated
   from incremental pulls would keep training on deleted data.
 - **Row contents.** Each row carries the pose-blob R2 reference and its
-  digest, the clip window, the raw label string, and the
-  `taxonomy_version` in effect at label time. There is no account
-  identifier.
+  digest, the clip window, the raw label string, the
+  `taxonomy_version` in effect at label time, and the provenance fields
+  (§1). There is no account identifier.
 - **Blob cache.** Pose blobs may be cached locally, keyed by `r2_key`
   and verified against `blob_sha256`. After each full pull, every
   cached blob whose source is absent from the pull is deleted.
@@ -126,21 +131,55 @@ through `label_taxonomy` at the pinned `taxonomy_version` (above).
 ### 2.6 Splits (aligns with PR #17)
 
 - Grouped by `source_id`, target 80/10/10 train/val/holdout: all clips
-  of one source land in one split. The export carries no account
-  identifier (§1), so one person's different videos can land in
-  different splits, which can flatter validation scores slightly. The
-  admin-curated holdout is the check on that. (PR #17 groups by
-  `user_id`; it needs to group by `source_id`.)
+  of one source land in one split. (PR #17 groups by `user_id`; it
+  needs to group by `source_id`.)
+- **Person leakage is a measured risk.** The export carries no account
+  identifier (§1), so one person's different videos can land in both
+  train and val. With few contributors this is not a rounding error:
+  one prolific contributor can be a large share of both splits, the
+  model is rewarded for learning that person, and val is what the
+  promotion gate reads (§8). Three measures (master plan §6, decided
+  2026-10-15):
+  - The admin-curated holdout is built from footage of people outside
+    the contributor pool — the maintainer and volunteers recorded for
+    the purpose, who agree not to contribute through the app. With no
+    account on contributions this is an agreement, not a check the
+    pipeline can run.
+  - Every run reports `val − holdout` for the promotion metric and
+    segment F1 in `holdout_report.json` and the nightly summary.
+  - A gap above 0.05 absolute on three consecutive promoted runs is
+    flagged in the Discord summary and reopens how splits group
+    sources — e.g. a per-install contributor tag used only to group
+    splits, which links one person's sources to each other but not to
+    an account. It does not by itself reopen unlinking (master plan §1).
+    *(Judgment call on both numbers.)*
 - Deterministic: seeded RNG, sorted ids, byte-identical `split.json`
   (PR #17's `split_dataset.py` is the implementation).
 - Admin-curated holdout pinning: a pinned sample id pulls its whole
   source into holdout — the poisoning-defense anchor. The holdout set
-  stays admin-curated (master plan §6).
+  stays admin-curated (master plan §6), composed as above.
 - The holdout split is **never loaded for training** — enforced at load
   time by the training script (PR #18), not by convention.
 - The dataset manifest (sample ids, split assignment, taxonomy_version,
   export watermark, split seed) is written next to the dataset; a
   training run is reproducible from the manifest alone.
+
+### 2.7 Class balance
+
+The app's Profile rewards naming clips per trick (master plan §5.6), so
+contributions will crowd toward the tricks most people do — gainers,
+backflips — and a long tail of rarer ones will stay thin.
+
+- **Judgment call:** sample training windows with weight
+  ∝ 1/√(count of the canonical name) rather than uniformly, so a
+  frequent name does not drown the rest while a rare name with a
+  handful of examples is not repeated into memorization. A combo
+  window takes the weight of its rarest name. The scheme is a config
+  constant; the per-name counts it reads are this run's train-split
+  counts — the same numbers the run later publishes as `train_count`
+  in `name_metrics` (§6.1).
+- Background negatives (§2.5) are sampled separately and keep their
+  own ratio.
 
 ## 3. Task definition
 
@@ -176,7 +215,10 @@ architecture.
   boundary refinement. Either emits candidate segments with scores.
 - **Per-segment classification head:** multi-label classifier over the
   canonical vocabulary — sigmoid per class, not softmax, because combos
-  carry multiple names.
+  carry multiple names. Those per-class sigmoids are the output
+  contract's `name_scores` (`MODEL_CONTRACT.md` §3.2), which the app
+  thresholds before pre-filling a name, so their calibration matters
+  as much as their ranking.
 - **Rationale:** tricks are temporal patterns in joint trajectories;
   frame-wise classifiers (the §4.1 baseline) cannot model duration or
   boundaries. The encoder → proposal → classification split mirrors the
@@ -247,9 +289,18 @@ artifact:
 - **Name accuracy given detection** — of the detected segments, how many
   names are right.
 - **Per-name precision/recall** — exposes weak vocabulary entries and
-  guides taxonomy curation.
+  guides taxonomy curation. Published with each promoted model as
+  `name_metrics` (`MODEL_CONTRACT.md` §1): per canonical name,
+  `precision`, `recall`, `holdout_count`, and `train_count` (that
+  name's training examples). It is what the app shows users as "the
+  model now knows this trick this well", so a name with fewer than 5
+  holdout examples publishes its counts with `null` precision and
+  recall rather than a number that small a sample can't support.
+  *(Judgment call on 5.)*
 - **Background false-positive count** — spurious segments fired in
   unlabeled regions.
+- **By origin** — name accuracy and segment F1 split by label `origin`
+  and by blind vs. not (§6.4), reported, not gated.
 
 Additionally recommended for the champion/challenger comparison:
 **mAP at tIoU ∈ {0.3, 0.5, 0.7}** as the segment-quality summary. The
@@ -272,6 +323,10 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   R2, and referenced from the model manifest (`holdout_report_r2_key`).
   It is recorded for every nightly candidate; the promotion decision
   itself is the validation-metric gate (§8).
+- The report carries the `val − holdout` gap that measures person
+  leakage (§2.6). The holdout's people are outside the contributor
+  pool, so a model that learned individuals rather than tricks shows
+  up as a gap here.
 - **Proposed (not yet implemented): anonymity evidence.** Every device
   receives the model, so treating it as anonymous needs evidence
   (`BACKEND_DESIGN.md` §9 Q8, EDPB Opinion 28/2024). The holdout report
@@ -296,6 +351,50 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   triggers the quarantine flow (§7) and skips promotion. No human
   override exists in the nightly path; the maintainer can re-run with
   an explicit override flag, which is logged.
+
+### 6.4 Provenance and rubber-stamping
+
+Once the model pre-fills names (`MODEL_CONTRACT.md` §3.3), keeping its
+suggestion is the cheapest way to name a clip, and the app's Profile
+rewards naming clips. A model trained on names it suggested itself
+learns its own mistakes back. Label provenance (§1) makes that
+measurable:
+
+- **Keep rate** — on model-proposed clips that were not blind, the
+  share of `suggested_names` (the names the model pre-filled) that the
+  user kept: labels with `origin: model` ÷ `suggested_names`.
+- **Blind agreement** — on blind clips (`suggestions_withheld`), the
+  share of `suggested_names` (the names the model would have
+  pre-filled) that the user gave anyway, without seeing them.
+- **Rubber-stamp gap** = keep rate − blind agreement, per proposing
+  model version. Users who judge each suggestion keep it about as
+  often as they would have named it unprompted; a large positive gap
+  means suggestions are being kept that would not have been given.
+
+All three are computed over the export, so over contributed clips
+only, and reported in the nightly summary next to the §6.1 metrics by
+origin. A contributed clip always carries at least one name, so a clip
+whose suggestions were all removed still appears, through the name the
+user gave instead. What the measures cannot see is clips never
+contributed, and users may contribute the clips they are surest of —
+read the keep rate as a lower bound on how much rubber-stamping the
+app's naming as a whole sees. How they are used:
+
+- **Down-weighting.** Training weights labels with `origin: model` on
+  non-blind clips by a config constant, default 1.0. When the gap
+  stays above 0.1 the maintainer lowers it; the change is a reviewed
+  config change, never automatic. *(Judgment call on 0.1.)*
+- **Independent evaluation.** Blind clips in the val split are scored
+  separately: the model's name accuracy against names given without
+  its influence, comparable across model versions.
+- **No penalty for blindness.** The app counts a blind clip exactly
+  like any other everywhere, the Profile included
+  (`turnip-ios/docs/PROFILE_DESIGN.md` §6), so users have no reason to
+  treat the blind sample differently, and the sample stays unbiased.
+
+Provenance is client-reported and unverifiable, like the names
+themselves; a client that lies about it is a poisoning case, which the
+fixture gate (§6.3) remains the defense against.
 
 ## 7. Quarantine mechanics (anti-poisoning)
 
@@ -338,6 +437,13 @@ On fixture regression (master plan §6), in order:
 6. The next nightly run retries with the quarantine applied. The loop
    cannot promote poisoned data even when validation metrics look fine,
    because the fixture gate (§6.3) runs **before** the promotion gate.
+
+**Volume spikes.** The Profile makes contribution volume spiky — a new
+release, a popular achievement — and a regression on a spike night
+quarantines every source changed that night, not only the bad ones.
+Accepted for now: the review releases the good sources, and the cost is
+a day's delay for them. Revisit if a spike night's queue is more than
+one review can clear.
 
 ## 8. Promotion (aligns with PR #20)
 
@@ -383,6 +489,12 @@ On fixture regression (master plan §6), in order:
   only) is a minor bump.
 - `taxonomy_version` itself is a monotonic int, bumped when canonical
   names are added or changed (master plan §2).
+- **What a promoted model publishes beyond its artifact:** its
+  `name_metrics` (§6.1) and `training_source_ids`, the `source_id`s of
+  its train split, both sent with `POST /api/models`. The farm turns
+  the list into each owner's `trained_in` (`BACKEND_DESIGN.md`
+  §1.2.20). The registry keeps both per version, so a rollback
+  re-sends the re-promoted champion's own list (§8).
 
 ## 10. Open questions
 
@@ -398,3 +510,11 @@ On fixture regression (master plan §6), in order:
    composite vs window accuracy.
 6. Membership-inference check (§6.2) — which attack, and what
    advantage over chance counts as passing.
+7. Person-leakage threshold (§2.6) — 0.05 absolute over three promoted
+   runs is a starting point.
+8. Class-balance scheme (§2.7) — 1/√count is a starting point.
+9. Down-weighting kept suggestions (§6.4) — the 0.1 rubber-stamp gap
+   that prompts it, and how far to lower the weight.
+10. Landed or bailed (master plan §9 Q4) — if clips gain an optional
+    outcome, whether a bail trains as its trick, as a separate class,
+    or not at all.
