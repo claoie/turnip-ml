@@ -7,13 +7,17 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 
-from Training import train
+# train.py imports its sibling evaluate.py by module name, as when run as a
+# script from Training/.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from Training import evaluate, train
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SMOKE_CONFIG = REPO_ROOT / "Training" / "config" / "smoke.toml"
@@ -142,12 +146,15 @@ class TrainTest(unittest.TestCase):
         self.assertEqual(self._run(config=p), 2)
 
     def test_combo_label_and_decode(self) -> None:
-        tricks = [
-            {"name": "gainer", "start_frame": 0, "end_frame": 16},
-            {"name": "corkscrew", "start_frame": 0, "end_frame": 16},
-        ]
-        self.assertEqual(train.label_for_window(tricks, 0, 8), "corkscrew+gainer")
-        self.assertEqual(train.label_for_window(tricks, 100, 108), "background")
+        segments = evaluate.ground_truth_segments(
+            [
+                {"name": "gainer", "start_frame": 0, "end_frame": 16},
+                {"name": "corkscrew", "start_frame": 0, "end_frame": 16},
+            ],
+            "test",
+        )
+        self.assertEqual(train.label_for_window(segments, 0, 8), "corkscrew+gainer")
+        self.assertEqual(train.label_for_window(segments, 100, 108), "background")
         prov = [
             ("s", 0, "corkscrew+gainer"),
             ("s", 8, "corkscrew+gainer"),
@@ -160,6 +167,47 @@ class TrainTest(unittest.TestCase):
         self.assertEqual(segs[0]["name"], "corkscrew+gainer")
         self.assertTrue(segs[0]["is_combo"])
         self.assertEqual((segs[0]["start_frame"], segs[0]["end_frame"]), (0, 16))
+
+    def test_window_label_counts_each_name_once(self) -> None:
+        # Two clips labeling overlapping spans "gainer": the window is
+        # "gainer", not "gainer+gainer".
+        segments = evaluate.ground_truth_segments(
+            [
+                {"clip_id": "c1", "name": "gainer", "start_frame": 0, "end_frame": 16},
+                {"clip_id": "c2", "name": "gainer", "start_frame": 2, "end_frame": 16},
+            ],
+            "test",
+        )
+        self.assertEqual(train.label_for_window(segments, 0, 8), "gainer")
+
+    def test_window_label_matches_evaluation_ground_truth(self) -> None:
+        # fetch_dataset's combo clip (one entry per name): the label train
+        # learns inside it is exactly the segment evaluate.py scores against.
+        tricks = [
+            {"clip_id": "c1", "name": n, "start_frame": 0, "end_frame": 16}
+            for n in ("gainer", "corkscrew")
+        ]
+        [(_, _, names)] = evaluate.ground_truth_segments(tricks, "test")
+        sample = {
+            "sample_id": "s",
+            "keypoints": np.zeros((16, 17, 3)),
+            "tricks": tricks,
+        }
+        _, labels, _ = train.build_dataset(np, [sample], 8, 8)
+        self.assertEqual(labels, ["+".join(sorted(names))] * 2)
+
+    def test_build_dataset_refuses_a_clip_split_across_windows(self) -> None:
+        tricks = [
+            {"clip_id": "c1", "name": "gainer", "start_frame": 0, "end_frame": 16},
+            {"clip_id": "c1", "name": "corkscrew", "start_frame": 0, "end_frame": 12},
+        ]
+        sample = {
+            "sample_id": "s",
+            "keypoints": np.zeros((16, 17, 3)),
+            "tricks": tricks,
+        }
+        with self.assertRaises(ValueError):
+            train.build_dataset(np, [sample], 8, 8)
 
 
 if __name__ == "__main__":

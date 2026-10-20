@@ -62,7 +62,10 @@ python Training/train.py --config Training/config/smoke.toml
   covering at least half of it, else `background`. A segment carrying N
   names labels the window `"a+b"` (sorted) — `is_combo` is derived from the
   `"+"`, per the model output contract (master plan): source-frame
-  coordinates, one segment with N names.
+  coordinates, one segment with N names. Segments come from
+  `evaluate.ground_truth_segments` (one per distinct window, with every
+  name labeled on it), the same ground truth the holdout evaluation
+  scores against.
 - **Model (smoke).** Softmax linear classifier over per-joint mean position
   + mean speed, trained with full-batch gradient descent (seeded). The
   architecture is deliberately tiny: the smoke test proves the pipeline

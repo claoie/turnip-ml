@@ -18,23 +18,33 @@ Inputs
 --samples-dir   directory of per-sample JSON files ("<sample_id>.json")
                 carrying the ground-truth "tricks" list:
                 [{"name": str, "start_frame": int, "end_frame": int,
-                  "clip_id": str?}].
-                Entries sharing a clip_id are one segment carrying the
-                union of their names (see "Ground truth" below).
+                  "clip_id": str?, "is_combo": bool?}].
+                clip_id may be absent; when present it must be a non-empty
+                string (null is refused). Entries on one window are one
+                segment carrying all their names (see "Ground truth").
 --out           report path. Defaults to "holdout_report.json" next to the
                 predictions file (i.e. next to the model artifact).
 --iou-threshold temporal-IoU threshold for a detection. Default 0.5.
 
 Ground truth
 ------------
-Training/fetch_dataset.py writes one "tricks" entry per (clip_id,
-canonical name), all on the clip's window, and train.py labels that
-window "a+b": a combo clip is one segment with N names (TRAINING_DESIGN.md
-§2.3). So entries sharing a clip_id are grouped into one ground-truth
-segment carrying the union of their names; they must agree on
-start_frame/end_frame and must not repeat a name, else the sample is
-refused. Entries without a clip_id (the committed smoke fixture,
-hand-written data) are one segment each.
+ground_truth_segments() turns a sample's "tricks" into segments, and
+train.py labels its windows from the same segments, so what the model
+learns and what it is scored against cannot drift apart. The rule: one
+segment per distinct (start_frame, end_frame) window, carrying every name
+labeled on it. Training/fetch_dataset.py writes one entry per (clip_id,
+canonical name), all on the clip's window, so a combo clip is one segment
+with N names (TRAINING_DESIGN.md §2.3), and so are two clips labeled on
+the same window, which train.py labels "a+b" too. A name repeated on a
+window counts once.
+
+clip_id only adds checks: one clip's entries must share a window and must
+not repeat a name, and a clip belongs to one holdout sample. An is_combo
+flag describes the merged segment, not its own entry.
+
+Reports carry scoring_version (SCORING_VERSION). 2 is this window rule;
+reports without the field scored one segment per entry, which split
+combo clips into single-name segments that could never name-match.
 
 Metrics
 -------
@@ -73,8 +83,9 @@ Split discipline (fail closed)
 - A holdout sample with no entry in the predictions file is legal and
   means "the model predicted nothing for this sample".
 - Malformed segments, contradictory is_combo flags, a clip whose entries
-  disagree on its window or repeat a name, or missing sample files are
-  errors, never silently skipped.
+  disagree on its window or repeat a name, a clip in two holdout samples,
+  or missing sample files are errors, never silently skipped. Error
+  messages name the sample file and entry index, never the clip_id.
 
 Determinism contract
 --------------------
@@ -95,6 +106,9 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 SPLITS = ("train", "val", "holdout")
+# The ground-truth rule the report was scored with (module docstring,
+# "Ground truth"); bump it whenever the same inputs would score differently.
+SCORING_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +136,13 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def normalize_names(seg: dict[str, Any], where: str) -> frozenset[str]:
+def normalize_names(
+    seg: dict[str, Any], where: str, check_combo: bool = True
+) -> frozenset[str]:
     """Ground-truth and prediction segments may carry "name" ("a+b") or
-    "names" (["a", "b"]); both normalize to the same frozenset."""
+    "names" (["a", "b"]); both normalize to the same frozenset.
+    check_combo=False leaves is_combo to the caller (ground truth checks it
+    against the merged segment)."""
     if "name" in seg and "names" in seg:
         _fail(f'{where}: segment has both "name" and "names"; use exactly one')
     if "names" in seg:
@@ -146,12 +164,19 @@ def normalize_names(seg: dict[str, Any], where: str) -> frozenset[str]:
         names = frozenset(parts)
     else:
         _fail(f'{where}: segment needs "name" or "names"')
-    if "is_combo" in seg and bool(seg["is_combo"]) != (len(names) > 1):
-        _fail(f"{where}: is_combo={seg['is_combo']} contradicts names={sorted(names)}")
+    if check_combo and "is_combo" in seg:
+        _check_combo(seg["is_combo"], names, where)
     return names
 
 
-def parse_segment(seg: Any, where: str) -> tuple[int, int, frozenset[str]]:
+def _check_combo(flag: Any, names: frozenset[str], where: str) -> None:
+    if bool(flag) != (len(names) > 1):
+        _fail(f"{where}: is_combo={flag} contradicts names={sorted(names)}")
+
+
+def parse_segment(
+    seg: Any, where: str, check_combo: bool = True
+) -> tuple[int, int, frozenset[str]]:
     if not isinstance(seg, dict):
         _fail(f"{where}: segment must be an object, got {type(seg).__name__}")
     start, end = seg.get("start_frame"), seg.get("end_frame")
@@ -164,7 +189,7 @@ def parse_segment(seg: Any, where: str) -> tuple[int, int, frozenset[str]]:
         _fail(f"{where}: start_frame/end_frame must be ints")
     if start < 0 or end <= start:
         _fail(f"{where}: need 0 <= start_frame < end_frame, got {start}/{end}")
-    return start, end, normalize_names(seg, where)
+    return start, end, normalize_names(seg, where, check_combo)
 
 
 def load_predictions(path: Path) -> dict[str, list[tuple[int, int, frozenset[str]]]]:
@@ -196,6 +221,7 @@ def load_ground_truth(
     samples_dir: Path, holdout_ids: list[str]
 ) -> dict[str, list[tuple[int, int, frozenset[str]]]]:
     gt: dict[str, list[tuple[int, int, frozenset[str]]]] = {}
+    clip_owner: dict[str, str] = {}
     for sid in holdout_ids:
         sample_path = samples_dir / f"{sid}.json"
         if not sample_path.is_file():
@@ -205,36 +231,44 @@ def load_ground_truth(
         if not isinstance(tricks, list):
             _fail(f"{sample_path}: missing 'tricks' list")
         gt[sid] = ground_truth_segments(tricks, str(sample_path))
+        # Validated above: every entry is an object, every clip_id a string.
+        for clip_id in {t["clip_id"] for t in tricks if "clip_id" in t}:
+            if clip_owner.setdefault(clip_id, sid) != sid:
+                _fail(f"{sample_path}: shares a clip with another holdout sample")
     return gt
 
 
 def ground_truth_segments(
     tricks: list[Any], where: str
 ) -> list[tuple[int, int, frozenset[str]]]:
-    """One segment per clip: entries sharing a clip_id merge into one segment
-    with the union of their names (a combo clip, as train.py labels it);
-    entries without a clip_id are a segment each."""
-    segments: list[tuple[int, int, frozenset[str]]] = []
-    clips: dict[str, tuple[int, int, frozenset[str]]] = {}
+    """A sample's "tricks" as ground-truth segments, sorted: one per distinct
+    window, carrying every name labeled on it (module docstring, "Ground
+    truth"). train.py labels its windows from these same segments."""
+    windows: dict[tuple[int, int], set[str]] = {}
+    clips: dict[str, tuple[int, tuple[int, int], set[str]]] = {}
+    combo_flags: list[tuple[str, tuple[int, int], Any]] = []
     for i, t in enumerate(tricks):
         entry = f"{where} trick #{i}"
-        start, end, names = parse_segment(t, entry)
-        if "clip_id" not in t:
-            segments.append((start, end, names))
-            continue
-        clip_id = t["clip_id"]
-        if not isinstance(clip_id, str) or not clip_id:
-            _fail(f'{entry}: "clip_id" must be a non-empty string')
-        if clip_id not in clips:
-            clips[clip_id] = (start, end, names)
-            continue
-        clip_start, clip_end, clip_names = clips[clip_id]
-        if (clip_start, clip_end) != (start, end):
-            _fail(f"{entry}: entries for clip {clip_id!r} disagree on its window")
-        if clip_names & names:
-            _fail(f"{entry}: clip {clip_id!r} repeats {sorted(clip_names & names)}")
-        clips[clip_id] = (start, end, clip_names | names)
-    return segments + [clips[clip_id] for clip_id in sorted(clips)]
+        start, end, names = parse_segment(t, entry, check_combo=False)
+        window = (start, end)
+        if "clip_id" in t:
+            clip_id = t["clip_id"]
+            if not isinstance(clip_id, str) or not clip_id:
+                _fail(f'{entry}: "clip_id" must be a non-empty string')
+            first, clip_window, clip_names = clips.setdefault(
+                clip_id, (i, window, set())
+            )
+            if clip_window != window:
+                _fail(f"{entry}: same clip as trick #{first} but another window")
+            if clip_names & names:
+                _fail(f"{entry}: repeats a name of its clip (trick #{first})")
+            clip_names |= names
+        windows.setdefault(window, set()).update(names)
+        if "is_combo" in t:
+            combo_flags.append((entry, window, t["is_combo"]))
+    for entry, window, flag in combo_flags:
+        _check_combo(flag, frozenset(windows[window]), entry)
+    return [(s, e, frozenset(windows[s, e])) for s, e in sorted(windows)]
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +427,7 @@ def compute_metrics(
         "n_unmatched_predictions": total_pred - n_matched_pred,
         "per_name": per_name_out,
         "per_sample": per_sample,
+        "scoring_version": SCORING_VERSION,
     }
 
 

@@ -509,6 +509,9 @@ def _write_dataset(
             if not names:
                 clips_dropped += 1
                 continue
+            # One entry per (clip, name): a combo clip is several entries on
+            # one window. Read them through evaluate.ground_truth_segments,
+            # which merges each window into one multi-name segment.
             tricks.extend(
                 {"clip_id": clip_id, "name": n, "start_frame": start, "end_frame": end}
                 for n in sorted(names)

@@ -26,8 +26,12 @@ Artifacts in the out dir:
 Sample JSON format (one file per sample in samples_dir):
   {"sample_id": ..., "fps": 10,
    "keypoints": [[[x, y, score] * 17] * n_frames],  # MoveNet-17 order
-   "tricks": [{"name": ..., "start_frame": ..., "end_frame": ...}]}
-Multi-name segments label the window "a+b" (sorted); is_combo is derived.
+   "tricks": [{"name": ..., "start_frame": ..., "end_frame": ...,
+               "clip_id": ...?}]}
+The tricks become segments through evaluate.ground_truth_segments, the
+rule the holdout evaluation scores against: one segment per distinct
+window with every name labeled on it. Multi-name segments label the
+window "a+b" (sorted); is_combo is derived.
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ except ModuleNotFoundError:  # Python < 3.11; CI pins 3.12
     sys.stderr.write("train.py needs Python 3.11+ (tomllib)\n")
     raise SystemExit(2)
 
+import evaluate
 import numpy as np
 import numpy.typing as npt
 
@@ -195,11 +200,7 @@ def load_samples(
         tricks = rec.get("tricks", [])
         if not isinstance(tricks, list):
             raise TypeError(f"sample {sid!r}: tricks must be a list")
-        for t in tricks:
-            if not {"name", "start_frame", "end_frame"} <= set(t):
-                raise ValueError(f"sample {sid!r}: trick needs name/start/end: {t!r}")
-            if not t["start_frame"] < t["end_frame"]:
-                raise ValueError(f"sample {sid!r}: trick has empty span: {t!r}")
+        evaluate.ground_truth_segments(tricks, f"sample {sid!r}")  # fail closed
         by_id[sid] = rec
     missing_files = sorted(set(split) - set(by_id))
     if missing_files:
@@ -220,20 +221,27 @@ def load_samples(
 # ---------------------------------------------------------------------------
 
 
-def label_for_window(tricks: list[dict[str, Any]], start: int, end: int) -> str:
-    """Label for a window: trick name(s) covering >= half of it, else background.
+def label_for_window(
+    segments: list[tuple[int, int, frozenset[str]]], start: int, end: int
+) -> str:
+    """Label for a window: the names of every segment covering >= half of it,
+    else background.
 
-    Center-frame labeling mislabels edge windows (the window is mostly outside
-    the segment while its center is just inside, or vice versa); majority
-    overlap keeps the label consistent with what the window's features show.
-    A segment carrying N names labels the window "a+b" (sorted) — is_combo is
-    derived from the "+" downstream, per the model output contract.
+    segments are evaluate.ground_truth_segments() of the sample's tricks, the
+    segments the holdout evaluation scores against. Center-frame labeling
+    mislabels edge windows (the window is mostly outside the segment while
+    its center is just inside, or vice versa); majority overlap keeps the
+    label consistent with what the window's features show. N names label the
+    window "a+b" (sorted, each name once) — is_combo is derived from the "+"
+    downstream, per the model output contract.
     """
     names = sorted(
-        t["name"]
-        for t in tricks
-        if max(0, min(t["end_frame"], end) - max(t["start_frame"], start))
-        >= (end - start) / 2
+        {
+            name
+            for seg_start, seg_end, seg_names in segments
+            if max(0, min(seg_end, end) - max(seg_start, start)) >= (end - start) / 2
+            for name in seg_names
+        }
     )
     return "+".join(names) if names else BACKGROUND
 
@@ -271,9 +279,12 @@ def build_dataset(
     for s in samples:
         kps: npt.NDArray[np.float64] = s["keypoints"]
         n = kps.shape[0]
+        segments = evaluate.ground_truth_segments(
+            s.get("tricks", []), f"sample {s['sample_id']!r}"
+        )
         for start in range(0, n - window_frames + 1, window_stride):
             end = start + window_frames
-            label = label_for_window(s.get("tricks", []), start, end)
+            label = label_for_window(segments, start, end)
             feats.append(featurize_window(xp, kps[start:end]))
             labels.append(label)
             prov.append((s["sample_id"], start, label))
