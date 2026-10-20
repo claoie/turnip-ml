@@ -390,7 +390,8 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   the gate guards every promotion after it. *(Judgment call: an
   automatic first champion would be the one promotion nothing checks.)*
 - **Empty set:** until the maintainer adds fixtures, the gate and
-  promotion don't run; the pipeline says so and changes no champion.
+  promotion don't run, and a bootstrap is refused (the first champion
+  needs fixture scores); the pipeline says so and changes no champion.
 - **Regression policy (judgment call):** regression iff
   `challenger_fixture_score < champion_fixture_score − 0.01` (absolute,
   on the composite fixture score, the mean of the two). Any regression

@@ -40,7 +40,8 @@
 #   FIXTURE_POSES  its pose blobs (default data/fixture-poses)
 #   INGESTED       JSON array of source ids (default data/run/ingested.json)
 #   BOOTSTRAP_CHAMPION  "true" with no champion: promote this challenger
-#                  as the first champion (refused when one exists)
+#                  as the first champion (refused when one exists or the
+#                  fixture set is empty)
 #
 # Outputs besides data/run/challenger/ (fixture_scores.json included):
 #   outcome.json          what ran and what it decided (the workflow reads it)
@@ -75,6 +76,11 @@ die() {
 }
 
 # Refuse an inconsistent start before spending a training run on it.
+n_fixtures=$(python -c 'import json, sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8"))["fixtures"]))' "$FIXTURES")
+if [ "$BOOTSTRAP" = "true" ] && [ "$n_fixtures" -eq 0 ]; then
+  die "BOOTSTRAP_CHAMPION=true, but $FIXTURES has no fixtures: the first champion needs fixture scores; add fixtures first"
+fi
 has_champion=false
 if [ -f "$CHAMPION/model.npz" ]; then
   has_champion=true
@@ -152,8 +158,6 @@ gate=not-run
 promotion=not-run
 rescored=false
 champion_scores=""
-n_fixtures=$(python -c 'import json, sys
-print(len(json.load(open(sys.argv[1], encoding="utf-8"))["fixtures"]))' "$FIXTURES")
 
 if [ "$n_fixtures" -eq 0 ]; then
   STOP="Fixture gate and promotion: not run. The trick-labeled fixture set \

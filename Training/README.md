@@ -148,7 +148,8 @@ explicit stops, each named in the job summary:
 - no champion yet: nothing to compare against, so nothing is promoted
   unless the maintainer dispatches `bootstrap_champion` (with `force` when
   there are 50 or fewer new label rows), which makes that run's challenger
-  the first champion;
+  the first champion. Bootstrap records the champion's fixture scores, so
+  it is refused while the fixture set is empty;
 - a fixture regression: promotion is skipped;
 - publishing (#16) is not implemented, so a promoted champion becomes the
   next fine-tune base and gate baseline, but reaches no device yet.

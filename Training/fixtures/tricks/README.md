@@ -93,6 +93,10 @@ core-vocabulary trick, the known combos, and some background
 
 6. Commit `fixtures.json` (never the blob) in a PR.
 
+The first champion needs fixtures: a `bootstrap_champion` dispatch
+records its fixture scores, so it is refused while this set is empty.
+Add fixtures first, then bootstrap.
+
 Any change to the set changes its `fixture_set` digest. The next nightly
 run then re-scores the champion on the new set once and stores those
 scores with it, so the gate always compares scores from the same set.

@@ -190,6 +190,15 @@ class StopsTest(PipelineTestCase):
             result = self.pipeline(INGESTED="data/missing.json")
             self.assertEqual(result.returncode, 2)
             self.assertIn("changed-source list", result.stderr)
+        with self.subTest("bootstrap without fixtures"):
+            (self.root / "data" / "empty.json").write_text('{"fixtures": []}')
+            shutil.rmtree(self.champion)
+            result = self.pipeline(
+                BOOTSTRAP_CHAMPION="true", FIXTURES="data/empty.json"
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("add fixtures first", result.stderr)
+            self.seed_champion()
         with self.subTest("champion without metrics"):
             (self.champion / "metrics.json").unlink()
             result = self.pipeline()
