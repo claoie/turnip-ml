@@ -4,8 +4,8 @@ gate -> promotion gate, and the explicit stops.
 Hermetic: each test runs the real script in a temporary copy of
 Training/ (train.py resolves its config paths against the directory it
 lives in, so a symlink would write into the real repository's data/), on
-the synthetic smoke dataset and a synthetic fixture set. No network, no
-secrets.
+the synthetic smoke dataset and a synthetic fixture set, with an
+environment built from scratch. No network, no secrets.
 Run with:  python -m unittest discover -s Training/tests -t .
 """
 
@@ -21,91 +21,91 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent.parent
 SOURCE_A = "a" * 64
 SOURCE_B = "b" * 64
+# What a test run inherits from the caller; every pipeline knob
+# (FROM_SCRATCH, BOOTSTRAP_CHAMPION, ...) is set by the test or not at all.
+INHERITED_ENV = ("HOME", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT")
+FULL_SLOT = ["champion.json", "fixture_scores.json", "metrics.json", "model.npz"]
+
+# Built once for the module (see setUpModule).
+BIN: Path
+TEMPLATE: Path
+
+
+def run_pipeline(cwd, **env):
+    full_env = {k: os.environ[k] for k in INHERITED_ENV if k in os.environ}
+    full_env.update(
+        PATH=f"{BIN}{os.pathsep}{os.environ.get('PATH', '')}",
+        HOLDOUT_IDS="data/holdout_ids.txt",
+        SPLIT_RATIOS="0.5 0.25 0.25",
+        FIXTURES="data/fixtures/fixtures.json",
+        FIXTURE_POSES="data/fixtures/poses",
+        INGESTED="data/ingested.json",
+        REGISTRY="data/registry.json",
+        GITHUB_STEP_SUMMARY=str(Path(cwd) / "summary.md"),
+    )
+    full_env.update(env)
+    return subprocess.run(
+        ["bash", "Training/pipeline.sh"],
+        cwd=cwd,
+        env=full_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def setUpModule():
+    global BIN, TEMPLATE
+    tmp = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(tmp.cleanup)
+    base = Path(tmp.name)
+    # `python` on PATH is this interpreter, as in CI after setup-python.
+    # A wrapper, not a symlink: a symlinked venv interpreter outside its
+    # venv no longer finds the venv's packages.
+    BIN = base / "bin"
+    BIN.mkdir()
+    wrapper = BIN / "python"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    wrapper.chmod(0o755)
+    # The template every test copies: Training/, the smoke dataset, a
+    # synthetic fixture set, pinned holdout ids, and a seed champion
+    # bootstrapped once from them.
+    TEMPLATE = base / "template"
+    shutil.copytree(
+        REPO / "Training",
+        TEMPLATE / "Training",
+        ignore=shutil.ignore_patterns("__pycache__", "registry.json"),
+    )
+    for script, out in (
+        ("make_smoke_fixture.py", "data/dataset"),
+        ("make_synthetic_fixtures.py", "data/fixtures"),
+    ):
+        subprocess.run(
+            [sys.executable, f"Training/{script}", "--out", out],
+            cwd=TEMPLATE,
+            check=True,
+            capture_output=True,
+        )
+    (TEMPLATE / "data" / "holdout_ids.txt").write_text("smoke-008\n")
+    (TEMPLATE / "data" / "ingested.json").write_text("[]\n")
+    result = run_pipeline(TEMPLATE, BOOTSTRAP_CHAMPION="true")
+    if result.returncode != 0:
+        raise RuntimeError(f"bootstrap run failed:\n{result.stderr}")
+    shutil.move(TEMPLATE / "data" / "run", TEMPLATE / "data" / "bootstrap")
+    (TEMPLATE / "data" / "registry.json").unlink(missing_ok=True)
 
 
 class PipelineTestCase(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.tmp = tempfile.TemporaryDirectory()
-        base = Path(cls.tmp.name)
-        # `python` on PATH is this interpreter, as in CI after setup-python.
-        # A wrapper, not a symlink: a symlinked venv interpreter outside its
-        # venv no longer finds the venv's packages.
-        cls.bin = base / "bin"
-        cls.bin.mkdir()
-        wrapper = cls.bin / "python"
-        wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-        wrapper.chmod(0o755)
-        # The template every test copies: Training/, the smoke dataset, a
-        # synthetic fixture set, pinned holdout ids, and a seed champion
-        # bootstrapped once from them.
-        cls.template = base / "template"
-        shutil.copytree(
-            REPO / "Training",
-            cls.template / "Training",
-            ignore=shutil.ignore_patterns("__pycache__", "registry.json"),
-        )
-        cls.py(cls.template, "Training/make_smoke_fixture.py", "--out", "data/dataset")
-        cls.py(
-            cls.template,
-            "Training/make_synthetic_fixtures.py",
-            "--out",
-            "data/fixtures",
-        )
-        (cls.template / "data" / "holdout_ids.txt").write_text("smoke-008\n")
-        (cls.template / "data" / "ingested.json").write_text("[]\n")
-        result = cls.pipeline_in(cls.template, BOOTSTRAP_CHAMPION="true")
-        assert result.returncode == 0, result.stderr
-        shutil.move(cls.template / "data" / "run", cls.template / "data" / "bootstrap")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.tmp.cleanup()
-
-    @classmethod
-    def py(cls, cwd, *args):
-        subprocess.run(
-            [sys.executable, *args], cwd=cwd, check=True, capture_output=True
-        )
-
-    @classmethod
-    def pipeline_in(cls, cwd, **env):
-        full_env = {
-            k: v
-            for k, v in os.environ.items()
-            if not k.startswith(("GITHUB_", "TURNIP_"))
-        }
-        full_env.update(
-            PATH=f"{cls.bin}{os.pathsep}{os.environ.get('PATH', '')}",
-            HOLDOUT_IDS="data/holdout_ids.txt",
-            SPLIT_RATIOS="0.5 0.25 0.25",
-            FIXTURES="data/fixtures/fixtures.json",
-            FIXTURE_POSES="data/fixtures/poses",
-            INGESTED="data/ingested.json",
-            GITHUB_STEP_SUMMARY=str(Path(cwd) / "summary.md"),
-        )
-        full_env.update(env)
-        return subprocess.run(
-            ["bash", "Training/pipeline.sh"],
-            cwd=cwd,
-            env=full_env,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
     def setUp(self):
-        self.case = tempfile.TemporaryDirectory()
-        self.root = Path(self.case.name) / "repo"
-        shutil.copytree(self.template, self.root, symlinks=True)
+        case = tempfile.TemporaryDirectory()
+        self.addCleanup(case.cleanup)
+        self.root = Path(case.name) / "repo"
+        shutil.copytree(TEMPLATE, self.root, symlinks=True)
         self.run_dir = self.root / "data" / "run"
         self.champion = self.root / "data" / "champion"
 
-    def tearDown(self):
-        self.case.cleanup()
-
     def pipeline(self, **env):
-        result = self.pipeline_in(self.root, **env)
+        result = run_pipeline(self.root, **env)
         # Public-log rule: no sample (= source) id reaches stdout or stderr.
         self.assertNotIn("smoke-0", result.stdout + result.stderr)
         self.assertNotIn(SOURCE_A, result.stdout + result.stderr)
@@ -122,6 +122,11 @@ class PipelineTestCase(unittest.TestCase):
     def outcome(self):
         return self.load(self.run_dir / "outcome.json")
 
+    def write(self, name, data):
+        path = self.root / "data" / name
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+        return f"data/{name}"
+
     def seed_champion(self, **overrides):
         """The bootstrapped champion; overrides edit its recorded files."""
         shutil.copytree(
@@ -135,18 +140,40 @@ class PipelineTestCase(unittest.TestCase):
         update = self.run_dir / "champion_update"
         return sorted(p.name for p in update.iterdir()) if update.exists() else []
 
+    def assert_slot_verifies(self):
+        """The staged slot passes the workflow's store-time check."""
+        update = self.run_dir / "champion_update"
+        pointer = self.root / "data" / "pointer.json"
+        for args in (
+            ["pointer", "--manifest", update / "champion.json"]
+            + ["--version", "test-1", "--out", pointer],
+            ["verify", "--pointer", pointer, "--dir", update],
+        ):
+            subprocess.run(
+                [sys.executable, "Training/champion_slot.py", *map(str, args)],
+                cwd=self.root,
+                check=True,
+                capture_output=True,
+            )
+
+
+def outcome(gate, promotion, rescored=False, scoreable=True):
+    return {
+        "champion_rescored": rescored,
+        "fixture_gate": gate,
+        "fixtures_scoreable": scoreable,
+        "promotion": promotion,
+    }
+
 
 class StopsTest(PipelineTestCase):
     def test_bootstrap_stages_the_first_champion_with_its_scores(self):
         bootstrap = self.root / "data" / "bootstrap"
         self.assertEqual(
-            self.load(bootstrap / "outcome.json")["promotion"], "bootstrap"
+            self.load(bootstrap / "outcome.json"), outcome("not-run", "bootstrap")
         )
         update = bootstrap / "champion_update"
-        self.assertEqual(
-            sorted(p.name for p in update.iterdir()),
-            ["fixture_scores.json", "metrics.json", "model.npz"],
-        )
+        self.assertEqual(sorted(p.name for p in update.iterdir()), FULL_SLOT)
         self.assertEqual(
             (update / "fixture_scores.json").read_bytes(),
             (bootstrap / "challenger" / "fixture_scores.json").read_bytes(),
@@ -154,15 +181,7 @@ class StopsTest(PipelineTestCase):
 
     def test_no_champion_scores_the_challenger_and_stops(self):
         result = self.ok()
-        self.assertEqual(
-            self.outcome(),
-            {
-                "champion_rescored": False,
-                "fixture_gate": "not-run",
-                "n_fixtures": 5,
-                "promotion": "not-run",
-            },
-        )
+        self.assertEqual(self.outcome(), outcome("not-run", "not-run"))
         self.assertTrue((self.run_dir / "challenger" / "fixture_scores.json").exists())
         self.assertEqual(self.update_files(), [])
         self.assertIn("no champion yet", result.stdout)
@@ -170,15 +189,40 @@ class StopsTest(PipelineTestCase):
         summary = (self.root / "summary.md").read_text()
         self.assertIn("Challenger fixture scores", summary)
 
-    def test_empty_fixture_set_stops_before_scoring(self):
-        empty = self.root / "data" / "empty.json"
-        empty.write_text('{"fixtures": []}\n')
-        self.seed_champion()
-        result = self.ok(FIXTURES=str(empty))
-        self.assertEqual(self.outcome()["fixture_gate"], "not-run")
-        self.assertEqual(self.outcome()["n_fixtures"], 0)
+    def test_nothing_to_score_stops_before_scoring(self):
+        background = {
+            "fixtures": [
+                {**f, "segments": []}
+                for f in self.load(self.root / "data/fixtures/fixtures.json")[
+                    "fixtures"
+                ]
+            ]
+        }
+        for case, data in (
+            ("empty", '{"fixtures": []}\n'),
+            ("background only", background),
+        ):
+            with self.subTest(case):
+                fixtures = self.write("unscoreable.json", data)
+                self.seed_champion()
+                # Nothing to gate, so no changed-source list is needed.
+                result = self.ok(FIXTURES=fixtures, INGESTED="data/missing.json")
+                self.assertEqual(
+                    self.outcome(), outcome("not-run", "not-run", scoreable=False)
+                )
+                self.assertFalse(
+                    (self.run_dir / "challenger" / "fixture_scores.json").exists()
+                )
+                self.assertIn("nothing to score yet", result.stdout)
+                shutil.rmtree(self.champion)
+
+    def test_stale_challenger_scores_are_not_reported(self):
+        self.ok()  # scores the challenger on the synthetic set
+        self.ok(FIXTURES=self.write("empty.json", '{"fixtures": []}'))
         self.assertFalse((self.run_dir / "challenger" / "fixture_scores.json").exists())
-        self.assertIn("has no fixtures yet", result.stdout)
+        summary = (self.root / "summary.md").read_text()
+        last_run = summary.rsplit("## Training pipeline run", 1)[1]
+        self.assertNotIn("Challenger fixture scores", last_run)
 
     def test_inconsistent_starts_fail_fast(self):
         self.seed_champion()
@@ -190,20 +234,18 @@ class StopsTest(PipelineTestCase):
             result = self.pipeline(INGESTED="data/missing.json")
             self.assertEqual(result.returncode, 2)
             self.assertIn("changed-source list", result.stderr)
+        with self.subTest("malformed fixture set"):
+            result = self.pipeline(FIXTURES=self.write("bad.json", '{"fixtures": {}}'))
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("malformed", result.stderr)
         with self.subTest("bootstrap without fixtures"):
-            (self.root / "data" / "empty.json").write_text('{"fixtures": []}')
             shutil.rmtree(self.champion)
             result = self.pipeline(
-                BOOTSTRAP_CHAMPION="true", FIXTURES="data/empty.json"
+                BOOTSTRAP_CHAMPION="true",
+                FIXTURES=self.write("empty.json", '{"fixtures": []}'),
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("add fixtures first", result.stderr)
-            self.seed_champion()
-        with self.subTest("champion without metrics"):
-            (self.champion / "metrics.json").unlink()
-            result = self.pipeline()
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("no metrics.json", result.stderr)
         self.assertFalse(self.run_dir.exists())  # refused before training
 
 
@@ -211,17 +253,9 @@ class GatesTest(PipelineTestCase):
     def test_pass_then_archive_against_recorded_scores(self):
         self.seed_champion()
         self.ok()
-        self.assertEqual(
-            self.outcome(),
-            {
-                "champion_rescored": False,
-                "fixture_gate": "pass",
-                "n_fixtures": 5,
-                "promotion": "archive",
-            },
-        )
+        self.assertEqual(self.outcome(), outcome("pass", "archive"))
         self.assertEqual(self.update_files(), [])
-        registry = self.load(self.run_dir / "registry.json")
+        registry = self.load(self.root / "data" / "registry.json")
         self.assertEqual(
             [r.get("gate") for r in registry], ["fixture-regression", None]
         )
@@ -230,16 +264,22 @@ class GatesTest(PipelineTestCase):
         self.assertIn("Champion fixture scores (recorded)", summary)
         self.assertIn("Fixture gate: pass", summary)
 
+    def test_registry_accumulates_across_runs(self):
+        self.seed_champion()
+        self.ok()
+        self.ok()
+        registry = self.load(self.root / "data" / "registry.json")
+        self.assertEqual(
+            [r["decision"] for r in registry], ["pass", "archive", "pass", "archive"]
+        )
+
     def test_regression_skips_promotion_and_quarantines(self):
         self.seed_champion(
             **{"fixture_scores.json": {"segment_iou": 1.0, "name_accuracy": 1.0}}
         )
-        (self.root / "data" / "ingested.json").write_text(
-            json.dumps([SOURCE_B, SOURCE_A])
-        )
+        self.write("ingested.json", [SOURCE_B, SOURCE_A])
         result = self.ok()
-        self.assertEqual(self.outcome()["fixture_gate"], "regression")
-        self.assertEqual(self.outcome()["promotion"], "not-run")
+        self.assertEqual(self.outcome(), outcome("regression", "not-run"))
         self.assertFalse((self.run_dir / "promotion.json").exists())
         self.assertEqual(self.update_files(), [])
         quarantine = self.load(self.run_dir / "fixture_gate" / "quarantine.json")
@@ -255,16 +295,9 @@ class GatesTest(PipelineTestCase):
                 "metrics.json": {"val_accuracy": 0.5},
             }
         )
-        self.ok()
-        self.assertEqual(
-            self.outcome(),
-            {
-                "champion_rescored": True,
-                "fixture_gate": "pass",
-                "n_fixtures": 5,
-                "promotion": "promote",
-            },
-        )
+        result = self.ok()
+        self.assertEqual(self.outcome(), outcome("pass", "promote", rescored=True))
+        self.assertIn("another fixture set", result.stderr)
         # The champion's scores on the current set equal its bootstrap ones.
         bootstrap_scores = (
             self.root / "data" / "bootstrap" / "challenger" / "fixture_scores.json"
@@ -274,26 +307,43 @@ class GatesTest(PipelineTestCase):
             bootstrap_scores.read_bytes(),
         )
         # Promotion stages the challenger, its fixture scores recorded.
-        self.assertEqual(
-            self.update_files(), ["fixture_scores.json", "metrics.json", "model.npz"]
-        )
+        self.assertEqual(self.update_files(), FULL_SLOT)
         update = self.run_dir / "champion_update"
         challenger = self.run_dir / "challenger"
         for name in ("fixture_scores.json", "metrics.json", "model.npz"):
             self.assertEqual(
                 (update / name).read_bytes(), (challenger / name).read_bytes(), name
             )
+        self.assert_slot_verifies()
 
     def test_missing_scores_rescore_without_promotion(self):
         self.seed_champion()
         (self.champion / "fixture_scores.json").unlink()
         result = self.ok()
-        self.assertTrue(self.outcome()["champion_rescored"])
-        self.assertEqual(self.outcome()["promotion"], "archive")
-        # Only the re-scored scores are staged for the champion slot.
-        self.assertEqual(self.update_files(), ["fixture_scores.json"])
-        self.assertIn("none recorded", result.stderr)
+        self.assertEqual(self.outcome(), outcome("pass", "archive", rescored=True))
+        # The whole slot is staged: the champion as it is, new scores.
+        self.assertEqual(self.update_files(), FULL_SLOT)
+        update = self.run_dir / "champion_update"
+        for name in ("metrics.json", "model.npz"):
+            self.assertEqual(
+                (update / name).read_bytes(), (self.champion / name).read_bytes()
+            )
+        self.assertEqual(
+            (update / "fixture_scores.json").read_bytes(),
+            (self.run_dir / "champion" / "fixture_scores.json").read_bytes(),
+        )
+        self.assert_slot_verifies()
+        self.assertIn("no fixture scores recorded", result.stderr)
         self.assertIn("re-scored", result.stdout)
+
+    def test_champion_without_metrics_runs_the_gate_only(self):
+        self.seed_champion()
+        (self.champion / "metrics.json").unlink()
+        result = self.ok()
+        self.assertEqual(self.outcome(), outcome("pass", "not-run"))
+        self.assertFalse((self.run_dir / "promotion.json").exists())
+        self.assertIn("no metrics.json to compare against", result.stdout)
+        self.assertIn("No champion changed", result.stdout)
 
     def test_rerun_is_byte_identical(self):
         self.seed_champion()

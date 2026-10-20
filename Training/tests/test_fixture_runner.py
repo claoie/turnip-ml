@@ -24,9 +24,12 @@ import tkp1
 import train
 from fixture_runner import (
     EXIT_ERROR,
+    EXIT_NOTHING_TO_SCORE,
     EXIT_OK,
+    EXIT_OTHER_SET,
     Fixture,
     FixtureError,
+    NothingToScore,
     fixture_set_digest,
     load_fixture_set,
     score,
@@ -96,12 +99,44 @@ class LoadFixtureSetTest(TempDirTestCase):
         )
         self.assertEqual(load_fixture_set(path)[0].segments, ())
 
-    def test_real_set_is_valid_json_and_starts_empty(self):
-        # The maintainer's set ships empty; the runner refuses to score it
-        # (pipeline.sh stops before the gate instead).
-        self.assertEqual(json.loads(REAL_SET.read_text()), {"fixtures": []})
-        with self.assertRaisesRegex(FixtureError, "empty"):
-            load_fixture_set(REAL_SET)
+    def test_real_set_is_well_formed(self):
+        # Whatever the maintainer's set holds (it ships empty), it parses;
+        # its pose blobs live in R2, so they are not checked here.
+        fixture_runner.read_fixture_set(REAL_SET)
+
+    def test_nothing_to_score(self):
+        for case, data in (
+            ("empty", {"fixtures": []}),
+            ("only background", {"fixtures": [fixture(segments=[])]}),
+        ):
+            with self.subTest(case=case):
+                path = self.write_set(data)
+                fixture_runner.read_fixture_set(path)  # well-formed
+                with self.assertRaises(NothingToScore):
+                    load_fixture_set(path)
+
+    def test_duplicated_keys_fail_closed(self):
+        for case, text in (
+            (
+                "fixture key",
+                '{"fixtures": [{"id": "f1", "id": "f2", "pose_sha256": "'
+                + SHA_A
+                + '", "segments": []}]}',
+            ),
+            (
+                "segment key",
+                '{"fixtures": [{"id": "f1", "pose_sha256": "'
+                + SHA_A
+                + '", "segments": [{"start_frame": 0, "end_frame": 4, '
+                '"names": ["hook"], "names": ["gainer"]}]}]}',
+            ),
+            ("top-level key", '{"fixtures": [], "fixtures": []}'),
+        ):
+            with (
+                self.subTest(case=case),
+                self.assertRaisesRegex(FixtureError, "duplicated keys"),
+            ):
+                load_fixture_set(self.write_set(text))
 
     def test_malformed_sets_fail_closed(self):
         bad = {
@@ -371,6 +406,7 @@ class RunnerEndToEndTest(TempDirTestCase):
     def run_runner(self, model, out, fixtures=None):
         return fixture_runner.main(
             [
+                "score",
                 "--model",
                 str(model),
                 "--fixtures",
@@ -487,18 +523,87 @@ class RunnerEndToEndTest(TempDirTestCase):
 
     def test_errors_exit_2_and_write_nothing(self):
         out = self.root / "scores.json"
+        not_a_zip = self.root / "corrupt.npz"
+        not_a_zip.write_bytes(b"PK\x03\x04 not really a zip")
+        bare_npy = self.root / "array.npz"
+        with open(bare_npy, "wb") as fh:
+            np.save(fh, np.zeros(3))
+        truncated = self.root / "truncated.npz"
+        truncated.write_bytes(self.model.read_bytes()[:-200])
+        empty = self.write_set({"fixtures": []}, "empty.json")
         cases = {
             "missing model": (self.root / "none.npz", self.fixtures),
-            "empty set": (self.model, REAL_SET),
+            "not a zip": (not_a_zip, self.fixtures),
+            "bare .npy": (bare_npy, self.fixtures),
+            "truncated npz": (truncated, self.fixtures),
+            "empty set": (self.model, empty),
         }
         for case, (model, fixtures) in cases.items():
             with self.subTest(case=case):
                 self.assertEqual(self.run_runner(model, out, fixtures), EXIT_ERROR)
                 self.assertFalse(out.exists())
-        corrupt = self.root / "corrupt.npz"
-        corrupt.write_bytes(b"PK\x03\x04 not really a zip")
-        self.assertEqual(self.run_runner(corrupt, out), EXIT_ERROR)
+
+    def test_pose_shorter_than_the_window_is_refused(self):
+        window = int(train.load_checkpoint(self.model)["window_frames"])
+        blob = tkp1.encode_gz([[[0.5, 0.5, 0.9]] * 17] * (window - 1))
+        sha = hashlib.sha256(blob).hexdigest()
+        (self.poses / f"{sha}.tkp1.gz").write_bytes(blob)
+        data = json.loads(self.fixtures.read_text())
+        data["fixtures"].append({"id": "too-short", "pose_sha256": sha, "segments": []})
+        out = self.root / "scores.json"
+        code = self.run_runner(self.model, out, self.write_set(data, "short.json"))
+        self.assertEqual(code, EXIT_ERROR)
+        self.assertIn(f"{window}-frame window", self.stderr.getvalue())
         self.assertFalse(out.exists())
+
+    def test_check(self):
+        background = json.loads(self.fixtures.read_text())
+        for f in background["fixtures"]:
+            f["segments"] = []
+        cases = {
+            "scoreable": (self.fixtures, EXIT_OK),
+            "empty": (
+                self.write_set({"fixtures": []}, "e.json"),
+                EXIT_NOTHING_TO_SCORE,
+            ),
+            "background only": (
+                self.write_set(background, "bg.json"),
+                EXIT_NOTHING_TO_SCORE,
+            ),
+            "malformed": (self.write_set({"fixtures": {}}, "m.json"), EXIT_ERROR),
+        }
+        for case, (fixtures, code) in cases.items():
+            with self.subTest(case=case):
+                argv = ["check", "--fixtures", str(fixtures)]
+                self.assertEqual(fixture_runner.main(argv), code)
+
+    def test_compare(self):
+        scores = self.root / "scores.json"
+        self.run_runner(self.model, scores)
+        other = json.loads(scores.read_text())
+        other["fixture_set"] = "f" * 64
+        unreadable = self.root / "unreadable.json"
+        unreadable.write_text("{")
+        cases = {
+            "same set": (self.fixtures, scores, EXIT_OK),
+            "none recorded": (self.fixtures, self.root / "none.json", EXIT_OTHER_SET),
+            "another set": (
+                self.fixtures,
+                self.write_set(other, "other.json"),
+                EXIT_OTHER_SET,
+            ),
+            "unreadable": (self.fixtures, unreadable, EXIT_OTHER_SET),
+            "malformed set": (
+                self.write_set({"fixtures": {}}, "m.json"),
+                scores,
+                EXIT_ERROR,
+            ),
+        }
+        for case, (fixtures, recorded, code) in cases.items():
+            with self.subTest(case=case):
+                argv = ["compare", "--fixtures", str(fixtures)]
+                argv += ["--scores", str(recorded)]
+                self.assertEqual(fixture_runner.main(argv), code)
 
     def test_stdout_carries_aggregates_only(self):
         self.run_runner(self.model, self.root / "scores.json")

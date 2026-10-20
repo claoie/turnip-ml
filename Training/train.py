@@ -39,6 +39,8 @@ import json
 import shutil
 import sys
 import types
+import zipfile
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -394,10 +396,16 @@ def predict(
 
 
 def load_checkpoint(path: Path) -> dict[str, Any]:
+    """The checkpoint's arrays. Any unreadable or corrupt file is a
+    ValueError, never another exception type."""
     try:
         z = np.load(path, allow_pickle=False)
-    except OSError as e:
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile) as e:
         raise ValueError(f"cannot read checkpoint {path}: {e}") from e
+    # A bare .npy loads as an array, not an archive.
+    if not isinstance(z, np.lib.npyio.NpzFile):
+        # ValueError, not TypeError: callers treat every bad file alike.
+        raise ValueError(f"checkpoint {path} is not an .npz archive")  # noqa: TRY004
     need = {
         "W",
         "b",
@@ -409,7 +417,11 @@ def load_checkpoint(path: Path) -> dict[str, Any]:
     }
     if not need <= set(z.files):
         raise ValueError(f"checkpoint {path} missing keys: {need - set(z.files)}")
-    return {k: z[k] for k in z.files}
+    try:
+        return {k: z[k] for k in z.files}
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile, zlib.error) as e:
+        # Members are only decompressed here: a corrupt one fails late.
+        raise ValueError(f"cannot read checkpoint {path}: {e}") from e
 
 
 # ---------------------------------------------------------------------------

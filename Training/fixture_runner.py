@@ -5,11 +5,26 @@ Writes the fixture regression gate's input (Training/fixture_gate.py,
 docs/TRAINING_DESIGN.md §6.3): the model from Training/train.py, run over
 every fixture exactly as predict.py runs it over holdout samples (the
 model math is train.py's, imported, not duplicated), scored against the
-fixtures' labeled segments.
+fixtures' labeled segments. It is also the one place that decides whether
+a fixture set can be scored and whether recorded scores belong to it, so
+Training/pipeline.sh asks it instead of reading the set itself.
+
+Subcommands
+-----------
+score --model M --fixtures F --poses DIR --out FILE
+    Score model.npz M on the set F and write the score file.
+check --fixtures F
+    Exit 0 when F can be scored, 3 when it has nothing to score (no
+    fixtures, or no labeled segment), 2 when it is malformed. Poses are
+    not read.
+compare --fixtures F --scores FILE
+    Exit 0 when the score file FILE was taken on the set F (and scoring
+    rule) as it is now, 3 when it was not (missing, unreadable, or another
+    fixture_set; the reason goes to stderr), 2 when F is malformed or has
+    nothing to score.
 
 Inputs
 ------
---model     model.npz from Training/train.py.
 --fixtures  the fixture set's fixtures.json. The real one is
             Training/fixtures/tricks/fixtures.json, labeled by the
             maintainer (see its README); tests and the pipeline's synthetic
@@ -17,7 +32,6 @@ Inputs
 --poses     directory of the fixtures' pose blobs, content-addressed as
             <pose_sha256>.tkp1.gz. Never in git: the farm job restores them
             from R2 (training/fixtures/poses/).
---out       score file path (JSON).
 
 Fixture set (fixtures.json)
 ---------------------------
@@ -35,8 +49,10 @@ Fixture set (fixtures.json)
   several names. Segments of one fixture do not overlap. A fixture may
   have no segments: a background-only fixture, where anything the model
   fires is a false positive.
-Unknown or missing keys fail closed. The set needs at least one labeled
-segment.
+Unknown, missing or duplicated keys fail closed. Scoring needs at least
+one labeled segment, and every pose at least as long as the model's
+window (a shorter one is invisible to the model, so it would only count
+as a miss).
 
 Output
 ------
@@ -65,9 +81,10 @@ at temporal IoU >= 0.5, the evaluator's detection threshold.
 Determinism: same model + fixtures + poses -> byte-identical score file
 (sorted keys, scores rounded to 6 decimals, no timestamps).
 
-Fail closed: a malformed fixture set, an empty one, a pose blob that is
-missing, does not match its pose_sha256 or does not decode, a segment
-past its pose, or an unreadable model are errors (exit 2), never a score.
+Fail closed: a malformed fixture set, one with nothing to score, a pose
+blob that is missing, does not match its pose_sha256 or does not decode,
+a segment past its pose, a pose shorter than the model's window, or an
+unreadable model are errors (exit 2), never a score.
 
 Privacy: stdout carries the digest, counts and the two scores only.
 """
@@ -75,13 +92,11 @@ Privacy: stdout carries the digest, counts and the two scores only.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import itertools
 import json
 import re
 import sys
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
@@ -93,9 +108,13 @@ import predict
 import tkp1
 import train
 from canonicalize import normalize
+from fetch_dataset import HEX64_RE, _is_int
+from fixture_gate import GateError, write_text_atomic
 
 EXIT_OK = 0
 EXIT_ERROR = 2
+EXIT_NOTHING_TO_SCORE = 3  # check
+EXIT_OTHER_SET = 3  # compare
 
 DETECTION_IOU = 0.5
 # Hashed into fixture_set: scores taken under another rule are not
@@ -103,7 +122,6 @@ DETECTION_IOU = 0.5
 SCORING = {"version": 1, "detection_iou": DETECTION_IOU}
 
 FIXTURE_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
-HEX64_RE = re.compile(r"[0-9a-f]{64}")
 FIXTURE_KEYS = frozenset({"id", "pose_sha256", "segments"})
 SEGMENT_KEYS = frozenset({"start_frame", "end_frame", "names"})
 
@@ -112,6 +130,10 @@ Segment = tuple[int, int, frozenset[str]]
 
 class FixtureError(Exception):
     """A fixture set, pose or model the runner refuses to score."""
+
+
+class NothingToScore(FixtureError):
+    """A well-formed fixture set with no labeled segment to score."""
 
 
 @dataclass(frozen=True)
@@ -125,10 +147,6 @@ def _fail(msg: str) -> NoReturn:
     raise FixtureError(msg)
 
 
-def _is_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
 def segment_key(seg: Segment) -> tuple[int, int, list[str]]:
     # frozensets only order by inclusion; sort names for a total order.
     return seg[0], seg[1], sorted(seg[2])
@@ -137,6 +155,16 @@ def segment_key(seg: Segment) -> tuple[int, int, list[str]]:
 # ---------------------------------------------------------------------------
 # Fixture set
 # ---------------------------------------------------------------------------
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    # json.load keeps the last of duplicated keys; in a hand-edited file
+    # that silently drops labels.
+    keys = [k for k, _ in pairs]
+    duplicated = sorted({k for k in keys if keys.count(k) > 1})
+    if duplicated:
+        raise ValueError(f"duplicated keys {duplicated}")
+    return dict(pairs)
 
 
 def _parse_segment(seg: Any, where: str) -> Segment:
@@ -191,11 +219,11 @@ def _parse_fixture(entry: Any, where: str) -> Fixture:
     return Fixture(fixture_id, pose_sha256, tuple(segments))
 
 
-def load_fixture_set(path: Path) -> list[Fixture]:
-    """The validated fixture set, sorted by id."""
+def read_fixture_set(path: Path) -> list[Fixture]:
+    """The validated fixture set, sorted by id; it may be empty."""
     try:
         with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
+            data = json.load(fh, object_pairs_hook=_unique_keys)
     except (OSError, ValueError, RecursionError) as e:
         _fail(f"cannot read fixture set {path}: {e}")
     if not isinstance(data, dict) or set(data) != {"fixtures"}:
@@ -210,14 +238,22 @@ def load_fixture_set(path: Path) -> list[Fixture]:
     duplicates = sorted({i for i in ids if ids.count(i) > 1})
     if duplicates:
         _fail(f"{path}: duplicate fixture ids {duplicates}")
+    return sorted(fixtures, key=lambda f: f.id)
+
+
+def load_fixture_set(path: Path) -> list[Fixture]:
+    """The validated fixture set; NothingToScore unless it has a label."""
+    fixtures = read_fixture_set(path)
     if not fixtures:
-        _fail(
+        raise NothingToScore(
             f"{path}: the fixture set is empty; the maintainer adds fixtures "
             "(Training/fixtures/tricks/README.md)"
         )
     if not any(f.segments for f in fixtures):
-        _fail(f"{path}: no fixture has a labeled segment; nothing to score")
-    return sorted(fixtures, key=lambda f: f.id)
+        raise NothingToScore(
+            f"{path}: no fixture has a labeled segment; nothing to score"
+        )
+    return fixtures
 
 
 def fixture_set_digest(fixtures: list[Fixture]) -> str:
@@ -238,6 +274,22 @@ def fixture_set_digest(fixtures: list[Fixture]) -> str:
     }
     text = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def compare(fixtures_path: Path, scores_path: Path) -> str | None:
+    """None when the score file was taken on the set as it is now (and
+    under the current scoring rule); otherwise why not."""
+    digest = fixture_set_digest(load_fixture_set(fixtures_path))
+    try:
+        with open(scores_path, encoding="utf-8") as fh:
+            recorded = json.load(fh)
+    except FileNotFoundError:
+        return "no fixture scores recorded"
+    except (OSError, ValueError, RecursionError) as e:
+        return f"recorded fixture scores unreadable ({type(e).__name__})"
+    if not isinstance(recorded, dict) or recorded.get("fixture_set") != digest:
+        return "recorded fixture scores were taken on another fixture set"
+    return None
 
 
 def load_pose(poses_dir: Path, fixture: Fixture) -> npt.NDArray[np.float64]:
@@ -277,12 +329,23 @@ def load_pose(poses_dir: Path, fixture: Fixture) -> npt.NDArray[np.float64]:
 def predict_fixtures(
     model_path: Path, fixtures: list[Fixture], poses_dir: Path
 ) -> dict[str, list[Segment]]:
-    samples = [
+    samples: list[dict[str, Any]] = [
         {"sample_id": f.id, "keypoints": load_pose(poses_dir, f), "tricks": []}
         for f in fixtures
     ]
     try:
         ckpt = train.load_checkpoint(model_path)
+    except ValueError as e:
+        _fail(str(e))
+    window = int(ckpt["window_frames"])
+    short = [s["sample_id"] for s in samples if s["keypoints"].shape[0] < window]
+    if short:
+        # predict.py skips them, so they would only ever count as misses.
+        _fail(
+            f"fixtures {short} are shorter than the model's {window}-frame "
+            "window, so the model cannot see them"
+        )
+    try:
         raw = predict.predict_samples(ckpt, samples)
         return {
             sid: [
@@ -291,8 +354,9 @@ def predict_fixtures(
             ]
             for sid, segs in raw.items()
         }
-    except (ValueError, TypeError, KeyError, EOFError, zipfile.BadZipFile) as e:
-        # A corrupt npz surfaces as any of these from np.load or the math.
+    except (ValueError, TypeError, KeyError, IndexError) as e:
+        # A checkpoint that loads but does not fit together (shapes,
+        # class list) fails in the model math.
         _fail(f"cannot run model {model_path}: {e}")
 
 
@@ -313,7 +377,8 @@ def score(
             iou_sum += iou
             if labeled[li][2] == predicted[pi][2]:
                 n_named += 1
-    # load_fixture_set guarantees n_labeled >= 1, so neither is 0/0.
+    if not n_labeled:
+        raise NothingToScore("no labeled segment; nothing to score")
     return {
         "segment_iou": iou_sum / (n_labeled + n_predicted - n_matched),
         "name_accuracy": n_named / n_labeled,
@@ -343,31 +408,49 @@ def run(
     return score_file_text(digest, scores), {"fixture_set": digest, **scores}
 
 
-def write_text_atomic(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(text, encoding="utf-8")
-        tmp.replace(path)
-    except OSError as e:
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
-        _fail(f"cannot write {path}: {e}")
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="command", required=True)
+    s = sub.add_parser("score", help="score a model and write the score file")
+    s.add_argument("--model", required=True, type=Path, help="model.npz")
+    s.add_argument("--fixtures", required=True, type=Path, help="fixtures.json")
+    s.add_argument(
+        "--poses", required=True, type=Path, help="dir of <pose_sha256>.tkp1.gz"
+    )
+    s.add_argument("--out", required=True, type=Path, help="score file path")
+    c = sub.add_parser("check", help="exit 0 if the set can be scored, else 3")
+    c.add_argument("--fixtures", required=True, type=Path, help="fixtures.json")
+    m = sub.add_parser("compare", help="exit 0 if scores belong to the set, else 3")
+    m.add_argument("--fixtures", required=True, type=Path, help="fixtures.json")
+    m.add_argument("--scores", required=True, type=Path, help="score file")
+    return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--model", required=True, type=Path, help="model.npz")
-    p.add_argument("--fixtures", required=True, type=Path, help="fixtures.json")
-    p.add_argument(
-        "--poses", required=True, type=Path, help="dir of <pose_sha256>.tkp1.gz"
-    )
-    p.add_argument("--out", required=True, type=Path, help="score file path")
-    args = p.parse_args(argv)
+    args = parse_args(argv if argv is not None else sys.argv[1:])
     try:
+        if args.command == "check":
+            fixtures = load_fixture_set(args.fixtures)
+            n_labeled = sum(len(f.segments) for f in fixtures)
+            print(f"{len(fixtures)} fixtures, {n_labeled} labeled segments")
+            return EXIT_OK
+        if args.command == "compare":
+            why_not = compare(args.fixtures, args.scores)
+            if why_not is not None:
+                print(f"fixture_runner: {why_not}", file=sys.stderr)
+                return EXIT_OTHER_SET
+            return EXIT_OK
         text, result = run(args.model, args.fixtures, args.poses)
         write_text_atomic(args.out, text)
-    except FixtureError as e:
+    except NothingToScore as e:
+        print(f"fixture_runner: nothing to score: {e}", file=sys.stderr)
+        return EXIT_NOTHING_TO_SCORE if args.command == "check" else EXIT_ERROR
+    except (FixtureError, GateError) as e:
         print(f"fixture_runner: error: {e}", file=sys.stderr)
         return EXIT_ERROR
     print(

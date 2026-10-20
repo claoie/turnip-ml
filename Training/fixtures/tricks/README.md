@@ -8,8 +8,8 @@ against the champion with (`Training/fixture_gate.py`).
 **The labels here are the maintainer's.** Nobody else adds, edits or
 "fixes" a label in `fixtures.json`, and no label is ever inferred from
 footage or copied from the farm export (CONTRIBUTING rule 1). The set
-ships empty. Until it has fixtures, the pipeline runs no fixture gate,
-promotes nothing, and says so in its job summary.
+ships empty. Until it has a fixture with a labeled segment, the pipeline
+runs no fixture gate, promotes nothing, and says so in its job summary.
 
 ## Layout
 
@@ -56,7 +56,12 @@ promotes nothing, and says so in its job summary.
   fixture must not overlap. An empty list makes a background fixture:
   anything the model detects there counts against it.
 
-Any other key, or a missing one, fails closed. Aim to cover every
+Any other key, or a missing or duplicated one, fails closed. Every pose
+must be at least as long as the model's window (16 frames, 1.6 s, for
+the pipeline model): a shorter one is invisible to the model, so the
+runner refuses to score it. Check the file with
+`python Training/fixture_runner.py check --fixtures Training/fixtures/tricks/fixtures.json`.
+Aim to cover every
 core-vocabulary trick, the known combos, and some background
 (standing, setup, walking between tricks).
 
@@ -86,7 +91,7 @@ core-vocabulary trick, the known combos, and some background
 5. Check that it scores, against any model:
 
    ```sh
-   python Training/fixture_runner.py --model data/champion/model.npz \
+   python Training/fixture_runner.py score --model data/champion/model.npz \
      --fixtures Training/fixtures/tricks/fixtures.json \
      --poses data/fixture-poses --out data/fixture_scores.json
    ```
@@ -94,8 +99,8 @@ core-vocabulary trick, the known combos, and some background
 6. Commit `fixtures.json` (never the blob) in a PR.
 
 The first champion needs fixtures: a `bootstrap_champion` dispatch
-records its fixture scores, so it is refused while this set is empty.
-Add fixtures first, then bootstrap.
+records its fixture scores, so it is refused while this set has nothing
+to score. Add fixtures first, then bootstrap.
 
 Any change to the set changes its `fixture_set` digest. The next nightly
 run then re-scores the champion on the new set once and stores those

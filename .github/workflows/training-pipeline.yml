@@ -17,7 +17,8 @@
 #              this public repository are public, so nothing per-sample is
 #              printed or uploaded as an artifact: the run directory goes
 #              to the private R2 bucket. A promoted champion (or a
-#              re-scored one) is stored back to R2. The watermark advances
+#              re-scored one) is stored back to R2 as a new version, and
+#              the gates' decision log with it. The watermark advances
 #              only at the end of a successful run without a fixture
 #              regression.
 #
@@ -78,6 +79,7 @@ jobs:
       FIXTURES: data/fixtures/fixtures.json
       FIXTURE_POSES: data/fixtures/poses
       INGESTED: data/ingested.json
+      REGISTRY: data/registry.json
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -105,8 +107,18 @@ jobs:
         run: |
           Training/pipeline.sh
           mv data/run data/run-bootstrap
+
+      # The farm job's store and restore, minus R2: a pointer for the
+      # staged slot, then the champion verified against it.
+      - name: 'Store and restore that champion'
+        run: |
+          python Training/champion_slot.py pointer \
+            --manifest data/run-bootstrap/champion_update/champion.json \
+            --version synthetic-bootstrap --out data/champion-pointer.json
           mkdir -p data/champion
           cp data/run-bootstrap/champion_update/* data/champion/
+          python Training/champion_slot.py verify \
+            --pointer data/champion-pointer.json --dir data/champion
 
       - name: 'Second run: fixture gate and promotion against that champion'
         run: Training/pipeline.sh
@@ -117,6 +129,7 @@ jobs:
           path: |
             data/run-bootstrap
             data/run
+            data/registry.json
           retention-days: 7
 
   farm:
@@ -170,9 +183,13 @@ jobs:
 
       # training/state/export_state.json  the watermark (never printed: the
       #                                   cursor may embed raw label text)
-      # training/champion/model.npz       the champion, if any: fine-tune
-      #   .../metrics.json                base, promotion baseline and
-      #   .../fixture_scores.json         recorded fixture scores
+      # training/champion/current.json    the champion pointer, if any:
+      #                                   its version and file hashes
+      #   .../versions/<version>/         model.npz (fine-tune base),
+      #                                   metrics.json (promotion baseline),
+      #                                   fixture_scores.json (fixture gate
+      #                                   baseline); verified on restore
+      # training/registry.json            the gates' decision log
       # training/holdout_ids.txt          admin-pinned holdout, if any
       # training/fixtures/poses/          the fixture set's pose blobs
       #                                   (verified by the fixture runner)
@@ -193,9 +210,24 @@ jobs:
             fi
           }
           restore state/export_state.json data/state/export_state.json
-          restore champion/model.npz data/champion/model.npz
-          restore champion/metrics.json data/champion/metrics.json
-          restore champion/fixture_scores.json data/champion/fixture_scores.json
+          if r2 ls "$base/champion/current.json" > /dev/null; then
+            r2 cp --only-show-errors "$base/champion/current.json" data/champion-pointer.json
+            version=$(python Training/champion_slot.py version data/champion-pointer.json)
+            r2 cp --recursive --only-show-errors "$base/champion/versions/$version/" data/champion/
+            python Training/champion_slot.py verify \
+              --pointer data/champion-pointer.json --dir data/champion
+            echo "restored champion version $version"
+          elif r2 ls "$base/champion/model.npz" > /dev/null; then
+            # Placed by hand before champions were versioned: no hashes to
+            # check. The next promotion or re-score stores a versioned one.
+            echo "::warning::Unversioned champion (training/champion/model.npz): restored without hash verification."
+            restore champion/model.npz data/champion/model.npz
+            restore champion/metrics.json data/champion/metrics.json
+            restore champion/fixture_scores.json data/champion/fixture_scores.json
+          else
+            echo "no champion yet"
+          fi
+          restore registry.json data/registry.json
           restore holdout_ids.txt data/holdout_ids.txt
           if r2 ls "$base/fixtures/poses/" > /dev/null; then
             r2 cp --recursive --only-show-errors "$base/fixtures/poses/" data/fixture-poses/
@@ -241,6 +273,7 @@ jobs:
         env:
           FROM_SCRATCH: ${{ inputs.from_scratch || false }}
           BOOTSTRAP_CHAMPION: ${{ inputs.bootstrap_champion || false }}
+          REGISTRY: data/registry.json
         run: |
           if [ -f data/holdout_ids.txt ]; then export HOLDOUT_IDS=data/holdout_ids.txt; fi
           Training/pipeline.sh
@@ -253,25 +286,36 @@ jobs:
             "s3://${R2_BUCKET}/training/runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
           echo "recorded training/runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
 
-      # What pipeline.sh staged: model.npz, metrics.json and
-      # fixture_scores.json on promotion or bootstrap, fixture_scores.json
-      # alone after a re-score. Model first, scores last: an upload that
-      # fails partway leaves the old, lower bar, never a false regression.
+      # What pipeline.sh staged: the whole slot (a promoted challenger, or
+      # the champion with re-scored fixture scores), with its manifest. It
+      # goes to a new version first; the pointer, written last, makes it
+      # the champion. An upload that fails partway changes nothing.
       - if: steps.count.outputs.run == 'true'
         name: Store the champion update in R2
         run: |
+          r2() { aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" s3 "$@"; }
+          base="s3://${R2_BUCKET}/training/champion"
           update=data/run/champion_update
           if [ ! -d "$update" ]; then
             echo "champion unchanged"
             exit 0
           fi
-          for f in model.npz metrics.json fixture_scores.json; do
-            if [ -f "$update/$f" ]; then
-              aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
-                s3 cp --only-show-errors "$update/$f" "s3://${R2_BUCKET}/training/champion/$f"
-              echo "stored training/champion/$f"
-            fi
-          done
+          version="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python Training/champion_slot.py pointer --manifest "$update/champion.json" \
+            --version "$version" --out data/champion-next.json
+          python Training/champion_slot.py verify --pointer data/champion-next.json --dir "$update"
+          r2 cp --recursive --only-show-errors "$update" "$base/versions/$version/"
+          r2 cp --only-show-errors data/champion-next.json "$base/current.json"
+          echo "stored champion version $version"
+
+      - if: steps.count.outputs.run == 'true'
+        name: Store the decision log in R2
+        run: |
+          if [ -f data/registry.json ]; then
+            aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+              s3 cp --only-show-errors data/registry.json "s3://${R2_BUCKET}/training/registry.json"
+            echo "stored training/registry.json"
+          fi
 
       # Held on a fixture regression: nothing sends quarantine.json to the
       # farm yet, so tonight's suspect sources are still in the export, and

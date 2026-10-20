@@ -378,20 +378,27 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   compare segment IoU + name accuracy against the champion's recorded
   fixture scores (`Training/fixture_gate.py`).
 - **Recorded champion scores:** a challenger's fixture scores are
-  stored with it when it is promoted (`training/champion/`, next to its
-  model and metrics), so the nightly job never re-runs the champion.
-  When they are missing or carry another `fixture_set` (the set or the
+  stored with it when it is promoted, next to its model and metrics, so
+  the nightly job never re-runs the champion. Each champion is a version
+  in the private bucket (`training/champion/versions/<version>/`), made
+  current by a pointer written last (`training/champion/current.json`)
+  that carries every file's SHA-256. A failed upload therefore leaves
+  the old champion whole, and every restore is hash-verified. When the
+  scores are missing or carry another `fixture_set` (the set or the
   scoring rule changed), the pipeline re-scores the champion once and
-  stores the new scores in their place.
+  stores it again as a new version with the new scores.
 - **First champion:** with no champion there is nothing to compare
   against, and the nightly path never promotes ungated: the run records
   the challenger's fixture scores and stops. The maintainer seeds the
   first champion explicitly (pipeline dispatch `bootstrap_champion`);
   the gate guards every promotion after it. *(Judgment call: an
   automatic first champion would be the one promotion nothing checks.)*
-- **Empty set:** until the maintainer adds fixtures, the gate and
-  promotion don't run, and a bootstrap is refused (the first champion
-  needs fixture scores); the pipeline says so and changes no champion.
+- **Nothing to score:** until the set has a fixture with a labeled
+  segment, the gate and promotion don't run, and a bootstrap is refused
+  (the first champion needs fixture scores); the pipeline says so and
+  changes no champion. The fixture runner is the one judge of this
+  (`fixture_runner.py check`). A fixture shorter than the model's window
+  is refused rather than scored: the model cannot see it.
 - **Regression policy (judgment call):** regression iff
   `challenger_fixture_score < champion_fixture_score − 0.01` (absolute,
   on the composite fixture score, the mean of the two). Any regression
@@ -510,8 +517,9 @@ one review can clear.
   the metric appropriate to the active architecture.
 - Exit codes: 0 = promote, 3 = archive, 2 = input error (fail closed).
   Each decision is appended to the model registry (local
-  `Training/registry.json`; the farm's `models` table once
-  `POST /api/models` exists).
+  `Training/registry.json`; the nightly job keeps it in the private
+  bucket as `training/registry.json`, next to every champion version;
+  the farm's `models` table once `POST /api/models` exists).
 - **Gate order:** fixture regression (§6.3) → holdout evaluation
   (§6.2, recorded) → promotion gate. A candidate that regresses on
   fixtures never reaches champion/challenger comparison.

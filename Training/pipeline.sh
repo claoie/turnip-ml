@@ -4,11 +4,12 @@
 # Run from the repository root once the dataset is in place:
 #
 #   data/dataset/samples/*.json, data/dataset/manifest.jsonl   (required)
-#   data/champion/model.npz, metrics.json   the current champion, if any
+#   data/champion/model.npz                 the current champion, if any
+#   data/champion/metrics.json              its val metrics (promotion)
 #   data/champion/fixture_scores.json       its recorded fixture scores
 #   $FIXTURE_POSES/<sha256>.tkp1.gz         the fixture set's pose blobs
 #   $INGESTED       sources changed since the watermark: the fixture
-#                   gate's quarantine candidates (needed with a champion)
+#                   gate's quarantine candidates (needed once the gate runs)
 #
 # Steps: split -> train (fine-tune the champion unless FROM_SCRATCH=true)
 # -> predict holdout -> evaluate holdout -> score the challenger on the
@@ -22,12 +23,15 @@
 # once and the new scores are staged to be kept instead.
 #
 # Explicit stops:
-#   - the fixture set has no fixtures yet: no gate, no promotion;
+#   - the fixture set has nothing to score yet (no fixture with a labeled
+#     segment): no gate, no promotion;
 #   - no champion yet (first run): the gates have nothing to compare
 #     against, so nothing is promoted unless BOOTSTRAP_CHAMPION=true, the
 #     maintainer's explicit choice to make this challenger the first
 #     champion (§6.3: the nightly path never promotes ungated);
 #   - a fixture regression: promotion is skipped, quarantine.json written;
+#   - a champion without metrics.json: the fixture gate runs, the
+#     promotion gate has nothing to compare and does not;
 #   - publishing (#16) does not exist yet: a promoted champion is staged
 #     in data/run/champion_update/ for the workflow to store, not published.
 #
@@ -39,19 +43,22 @@
 #   FIXTURES       fixture set (default Training/fixtures/tricks/fixtures.json)
 #   FIXTURE_POSES  its pose blobs (default data/fixture-poses)
 #   INGESTED       JSON array of source ids (default data/run/ingested.json)
+#   REGISTRY       decision log both gates append to (default
+#                  Training/registry.json; the farm job keeps it in R2)
 #   BOOTSTRAP_CHAMPION  "true" with no champion: promote this challenger
 #                  as the first champion (refused when one exists or the
-#                  fixture set is empty)
+#                  fixture set has nothing to score)
 #
 # Outputs besides data/run/challenger/ (fixture_scores.json included):
 #   outcome.json          what ran and what it decided (the workflow reads it)
 #   fixture_gate/         the gate's decision.json and quarantine.json
 #   promotion.json        the promotion gate's decision
-#   registry.json         both gates' decision records
 #   champion/             the champion's re-scored fixture scores, if any
-#   champion_update/      what the champion slot becomes: model.npz,
-#                         metrics.json, fixture_scores.json on promotion;
-#                         fixture_scores.json alone after a re-score
+#   champion_update/      the whole champion slot as it should become, with
+#                         champion.json (champion_slot.py manifest): the
+#                         challenger's model, metrics and fixture scores on
+#                         promotion, the champion's own files with its new
+#                         fixture scores after a re-score
 #
 # Privacy: stdout and the job summary carry counts and aggregate metrics
 # only. Per-sample outputs (split, predictions, the report's per-sample
@@ -64,6 +71,7 @@ CHAMPION=data/champion
 FIXTURES=${FIXTURES:-Training/fixtures/tricks/fixtures.json}
 FIXTURE_POSES=${FIXTURE_POSES:-data/fixture-poses}
 INGESTED=${INGESTED:-$RUN/ingested.json}
+REGISTRY=${REGISTRY:-Training/registry.json}
 BOOTSTRAP=${BOOTSTRAP_CHAMPION:-false}
 read -r TRAIN_RATIO VAL_RATIO HOLDOUT_RATIO <<<"${SPLIT_RATIOS:-0.8 0.1 0.1}"
 SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
@@ -75,26 +83,35 @@ die() {
   exit 2
 }
 
-# Refuse an inconsistent start before spending a training run on it.
-n_fixtures=$(python -c 'import json, sys
-print(len(json.load(open(sys.argv[1], encoding="utf-8"))["fixtures"]))' "$FIXTURES")
-if [ "$BOOTSTRAP" = "true" ] && [ "$n_fixtures" -eq 0 ]; then
-  die "BOOTSTRAP_CHAMPION=true, but $FIXTURES has no fixtures: the first champion needs fixture scores; add fixtures first"
-fi
+# Refuse an inconsistent start before spending a training run on it. The
+# fixture runner alone decides whether the set can be scored.
+scoreable=true
+status=0
+python Training/fixture_runner.py check --fixtures "$FIXTURES" || status=$?
+case $status in
+  0) ;;
+  3) scoreable=false ;;
+  *) die "the fixture set $FIXTURES is malformed (fixture_runner check: exit $status)" ;;
+esac
 has_champion=false
 if [ -f "$CHAMPION/model.npz" ]; then
   has_champion=true
-  [ -f "$CHAMPION/metrics.json" ] ||
-    die "$CHAMPION/model.npz has no metrics.json: promotion cannot compare"
-  [ "$BOOTSTRAP" != "true" ] ||
+fi
+if [ "$BOOTSTRAP" = "true" ]; then
+  [ "$has_champion" = false ] ||
     die "BOOTSTRAP_CHAMPION=true, but a champion exists; bootstrap only seeds the first one"
-  [ -f "$INGESTED" ] ||
-    die "the fixture gate needs the changed-source list at $INGESTED"
+  [ "$scoreable" = true ] ||
+    die "BOOTSTRAP_CHAMPION=true, but $FIXTURES has nothing to score: the first champion needs fixture scores; add fixtures first"
+fi
+if [ "$has_champion" = true ] && [ "$scoreable" = true ] && [ ! -f "$INGESTED" ]; then
+  die "the fixture gate needs the changed-source list at $INGESTED"
 fi
 
 mkdir -p "$RUN"
-# A fresh slate for this run's decisions (a local data/run is reused).
-rm -rf "$UPDATE" "$GATE_OUT" "$RUN/champion" "$RUN/promotion.json" "$RUN/outcome.json"
+# A fresh slate for this run's decisions (a local data/run is reused, and
+# train.py leaves files it doesn't write in the challenger directory).
+rm -rf "$UPDATE" "$GATE_OUT" "$RUN/champion" "$RUN/promotion.json" \
+  "$RUN/outcome.json" "$RUN/challenger/fixture_scores.json"
 
 split_args=(
   --in "$DATASET/manifest.jsonl" --out "$RUN/split.json" --seed 0
@@ -123,35 +140,23 @@ python Training/evaluate.py \
   --out "$RUN/challenger/holdout_report.json"
 
 score_fixtures() { # score_fixtures <model.npz> <out scores>
-  python Training/fixture_runner.py --model "$1" --fixtures "$FIXTURES" \
+  python Training/fixture_runner.py score --model "$1" --fixtures "$FIXTURES" \
     --poses "$FIXTURE_POSES" --out "$2"
 }
 
-# Exit 0 iff the recorded scores exist and were taken on the same fixture
-# set (and scoring rule) as the current ones; says why not otherwise.
-same_fixture_set() { # same_fixture_set <recorded> <current>
-  python - "$1" "$2" <<'EOF'
-import json
-import sys
-
-recorded, current = sys.argv[1], sys.argv[2]
-try:
-    with open(recorded, encoding="utf-8") as fh:
-        before = json.load(fh)["fixture_set"]
-except FileNotFoundError:
-    sys.exit("champion fixture scores: none recorded")
-except (OSError, ValueError, KeyError, TypeError) as e:
-    sys.exit(f"champion fixture scores: unreadable ({type(e).__name__})")
-with open(current, encoding="utf-8") as fh:
-    if json.load(fh)["fixture_set"] != before:
-        sys.exit("champion fixture scores: taken on another fixture set")
-EOF
-}
-
-stage_champion() { # the challenger, with its fixture scores, as the champion
+stage_challenger() { # the challenger, with its fixture scores, as the champion
   mkdir -p "$UPDATE"
   cp "$RUN/challenger/model.npz" "$RUN/challenger/metrics.json" \
     "$RUN/challenger/fixture_scores.json" "$UPDATE/"
+}
+
+stage_rescored_champion() { # the champion as it is, with its new scores
+  mkdir -p "$UPDATE"
+  cp "$CHAMPION/model.npz" "$UPDATE/"
+  if [ -f "$CHAMPION/metrics.json" ]; then
+    cp "$CHAMPION/metrics.json" "$UPDATE/"
+  fi
+  cp "$RUN/champion/fixture_scores.json" "$UPDATE/fixture_scores.json"
 }
 
 gate=not-run
@@ -159,14 +164,14 @@ promotion=not-run
 rescored=false
 champion_scores=""
 
-if [ "$n_fixtures" -eq 0 ]; then
+if [ "$scoreable" = false ]; then
   STOP="Fixture gate and promotion: not run. The trick-labeled fixture set \
-($FIXTURES) has no fixtures yet; the maintainer adds them \
-(Training/fixtures/tricks/README.md)."
+($FIXTURES) has nothing to score yet (no fixture with a labeled segment); \
+the maintainer adds fixtures (Training/fixtures/tricks/README.md)."
 else
   score_fixtures "$RUN/challenger/model.npz" "$RUN/challenger/fixture_scores.json"
   if [ "$has_champion" = false ] && [ "$BOOTSTRAP" = "true" ]; then
-    stage_champion
+    stage_challenger
     promotion=bootstrap
     STOP="Fixture gate and promotion: not run (bootstrap). There was no \
 champion; BOOTSTRAP_CHAMPION made this challenger the first one, staged \
@@ -178,14 +183,20 @@ run. A maintainer dispatch with bootstrap_champion makes a run's \
 challenger the first champion."
   else
     champion_scores=$CHAMPION/fixture_scores.json
-    if ! same_fixture_set "$champion_scores" "$RUN/challenger/fixture_scores.json"; then
-      echo "re-scoring the champion on the current fixture set"
-      champion_scores=$RUN/champion/fixture_scores.json
-      score_fixtures "$CHAMPION/model.npz" "$champion_scores"
-      mkdir -p "$UPDATE"
-      cp "$champion_scores" "$UPDATE/fixture_scores.json"
-      rescored=true
-    fi
+    status=0
+    python Training/fixture_runner.py compare --fixtures "$FIXTURES" \
+      --scores "$champion_scores" || status=$?
+    case $status in
+      0) ;;
+      3)
+        echo "re-scoring the champion on the current fixture set"
+        champion_scores=$RUN/champion/fixture_scores.json
+        score_fixtures "$CHAMPION/model.npz" "$champion_scores"
+        stage_rescored_champion
+        rescored=true
+        ;;
+      *) die "cannot compare the champion's fixture scores (exit $status)" ;;
+    esac
 
     # Decision records go to files, not the log: promote.py's embeds both
     # metrics.json files, val segments (per-sample) included.
@@ -194,7 +205,7 @@ challenger the first champion."
     python Training/fixture_gate.py --champion "$champion_scores" \
       --challenger "$RUN/challenger/fixture_scores.json" \
       --ingested "$INGESTED" --out "$GATE_OUT" \
-      --registry "$RUN/registry.json" >"$GATE_OUT/decision.json" || status=$?
+      --registry "$REGISTRY" >"$GATE_OUT/decision.json" || status=$?
     case $status in
       0) gate=pass ;;
       3) gate=regression ;;
@@ -202,11 +213,11 @@ challenger the first champion."
     esac
     echo "fixture gate: $gate"
 
-    if [ "$gate" = pass ]; then
+    if [ "$gate" = pass ] && [ -f "$CHAMPION/metrics.json" ]; then
       status=0
       python Training/promote.py --champion "$CHAMPION/metrics.json" \
         --challenger "$RUN/challenger/metrics.json" \
-        --registry "$RUN/registry.json" >"$RUN/promotion.json" || status=$?
+        --registry "$REGISTRY" >"$RUN/promotion.json" || status=$?
       case $status in
         0) promotion=promote ;;
         3) promotion=archive ;;
@@ -221,11 +232,15 @@ challenger the first champion."
 $GATE_OUT/quarantine.json lists the changed sources. Nothing sends it to \
 the farm yet." ;;
       pass/promote)
-        stage_champion
+        stage_challenger
         STOP="Fixture gate: pass. Promotion: promote; the challenger is \
 staged with its fixture scores as the champion in $UPDATE." ;;
       pass/archive)
         STOP="Fixture gate: pass. Promotion: archive; the champion stays." ;;
+      pass/not-run)
+        STOP="Fixture gate: pass. Promotion: not run; the champion has no \
+metrics.json to compare against. Store its val metrics with it \
+(training/champion/) to let the promotion gate decide." ;;
     esac
   fi
 fi
@@ -240,16 +255,19 @@ set; its new fixture scores are staged in $UPDATE."
     ;;
 esac
 STOP="$STOP Publishing (#16): not run."
+if [ -d "$UPDATE" ]; then
+  python Training/champion_slot.py manifest "$UPDATE"
+fi
 echo "$STOP"
 
 python - "$RUN" "$config" "$STOP" "$gate" "$promotion" "$rescored" \
-  "$n_fixtures" "$champion_scores" >>"$SUMMARY" <<'EOF'
+  "$scoreable" "$champion_scores" >>"$SUMMARY" <<'EOF'
 import json
 import sys
 from pathlib import Path
 
 run = Path(sys.argv[1])
-config, stop, gate, promotion, rescored, n_fixtures, champion_scores = sys.argv[2:]
+config, stop, gate, promotion, rescored, scoreable, champion_scores = sys.argv[2:]
 
 
 def load(path):
@@ -261,7 +279,7 @@ outcome = {
     "fixture_gate": gate,
     "promotion": promotion,
     "champion_rescored": rescored == "true",
-    "n_fixtures": int(n_fixtures),
+    "fixtures_scoreable": scoreable == "true",
 }
 (run / "outcome.json").write_text(
     json.dumps(outcome, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -296,7 +314,7 @@ def scores_line(label, path):
 challenger_scores = run / "challenger" / "fixture_scores.json"
 if challenger_scores.exists():
     s = scores_line("Challenger fixture scores", challenger_scores)
-    print(f"- Fixture set: {n_fixtures} fixtures, `{s['fixture_set']}`")
+    print(f"- Fixture set: `{s['fixture_set']}`")
 if champion_scores:
     how = "re-scored on this fixture set" if rescored == "true" else "recorded"
     scores_line(f"Champion fixture scores ({how})", champion_scores)
