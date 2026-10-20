@@ -1,6 +1,8 @@
 # Training smoke test: every PR touching the training pipeline runs the
-# champion training script end-to-end on the tiny synthetic fixture plus the
-# Training/ unit tests (turnip-ml#13).
+# champion training script end-to-end on the tiny synthetic fixture, the
+# Core ML export of the resulting model (turnip-ml#16), and the Training/
+# unit tests (turnip-ml#13), the publish tests among them against a fake
+# farm and R2.
 #
 # Deliberately ubuntu-only and Python-only, mirroring pose-accuracy.yml: it
 # must not duplicate the Xcode build, and it must work on fork PRs (plain
@@ -37,10 +39,14 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: Training/requirements.txt
+          cache-dependency-path: |
+            Training/requirements.txt
+            Training/requirements-export.txt
 
-      - name: Install training dependencies
-        run: pip install -r Training/requirements.txt
+      # The export set includes requirements.txt, plus coremltools so the
+      # export runs here and its unit tests are not skipped.
+      - name: Install training + export dependencies
+        run: pip install -r Training/requirements-export.txt
 
       # End-to-end smoke: the script must run on the fixture and reach 100%
       # val accuracy (the fixture is separable by construction — anything
@@ -58,6 +64,17 @@ jobs:
           print(f"smoke OK: val_accuracy={m['val_accuracy']}, "
                 f"loss {m['train_loss_initial']:.4f} -> {m['train_loss_final']:.4f}")
           EOF
+
+      # The Core ML export must run on this runner (Ubuntu) and be
+      # byte-reproducible: two exports of the smoke model, compared.
+      - name: Export the smoke model to Core ML (twice, byte-identical)
+        run: |
+          for i in 1 2; do
+            python Training/export_coreml.py \
+              --model "$RUNNER_TEMP/smoke-run/model.npz" \
+              --out "$RUNNER_TEMP/export-$i.mlpackage.zip"
+          done
+          cmp "$RUNNER_TEMP/export-1.mlpackage.zip" "$RUNNER_TEMP/export-2.mlpackage.zip"
 
       - name: Training unit tests
         run: python -m unittest discover -s Training/tests -t .

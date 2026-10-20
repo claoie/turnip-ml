@@ -231,10 +231,15 @@ architecture.
 
 ### 4.3 Post-training conversion
 
-`coremltools` → Core ML (`.mlmodelc`), uploaded to R2; `POST
-/api/models` publishes the champion with its manifest (see
-`MODEL_CONTRACT.md`). Conversion is a pipeline step, not a manual
-action.
+`coremltools` → a Core ML ML Program package (`.mlpackage`, fp16),
+zipped byte-reproducibly and uploaded to R2; `POST /api/models`
+publishes the champion with its manifest (see `MODEL_CONTRACT.md` §2).
+Conversion is a pipeline step, not a manual action
+(`Training/export_coreml.py`, run by `Training/publish_model.py` after
+promotion). The client compiles the package on device: compiling to
+`.mlmodelc` needs macOS, and the pipeline runs on Ubuntu. The §4.1
+baseline exports as a window classifier whose per-window probabilities
+the client decodes into segments (`MODEL_CONTRACT.md` §3.2.1).
 
 ## 5. Training loop
 
@@ -296,7 +301,8 @@ artifact:
   model now knows this trick this well", so a name with fewer than 5
   holdout examples publishes its counts with `null` precision and
   recall rather than a number that small a sample can't support.
-  *(Judgment call on 5.)*
+  *(Judgment call on 5.)* `Training/name_metrics.py` writes it as
+  `name_metrics.json` next to the holdout report.
 - **Background false-positive count** — spurious segments fired in
   unlabeled regions.
 - **By origin** — name accuracy and segment F1 split by label `origin`

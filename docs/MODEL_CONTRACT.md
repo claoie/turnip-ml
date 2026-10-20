@@ -24,7 +24,7 @@ finds every field:
   "version": "trick-v1.3",            // models.version (trick-v<major>.<minor>)
   "model_type": "trick-detection",    // models.model_type
   "taxonomy_version": 7,              // models.taxonomy_version
-  "r2_key": "models/trick-v1.3.mlmodelc.zip",
+  "r2_key": "models/trick-v1.3.mlpackage.zip",
                                       // models.r2_key
   "url": "<presigned R2 GET, 15-minute expiry>",
                                       // derived at serve time from models.r2_key
@@ -36,11 +36,22 @@ finds every field:
     "format_version": 1,
     "sample_rate_hz": 10.0,           // canonical input rate the model expects
     "keypoint_count": 17,
-    "features": ["x", "y", "confidence", "gap_indicator"]
+    "features": ["x", "y", "confidence", "gap_indicator"],
+    "input_name": "pose",             // the Core ML input feature
+    "shape": ["T", 52],
+    "min_frames": 16,                 // shorter sequences have no window
+    "max_frames": 144000              // TKP1's 4-hour bound
   },
-  "output_desc": {                    // models.output_desc (JSONB)
+  "output_desc": {                    // models.output_desc (JSONB), §3.2.1
     "coordinates": "source-frame",    // absolute indices into the canonical 10 Hz sequence
-    "fields": ["start_frame", "end_frame", "score", "trick_names", "name_scores", "is_combo"]
+    "kind": "window_classifier",
+    "output_name": "window_probs",    // the Core ML output feature, [N, C]
+    "shape": ["N", 4],
+    "window_frames": 16,
+    "window_stride": 8,
+    "classes": ["background", "cork", "cork+gainer", "gainer"],
+    "background_class": "background",
+    "combo_separator": "+"
   },
   "vocabulary": [                     // assembled from label_taxonomy
     {"canonical": "cork", "aliases": ["cork 720", "corkscrew"]},
@@ -48,9 +59,8 @@ finds every field:
     "..."
   ],
   "val_metrics": {                    // models.val_metrics (JSONB)
-    "segment_f1": 0.81,
-    "detection_rate_iou05": 0.88,
-    "name_accuracy_given_detection": 0.93
+    "val_accuracy": 0.91,             // the promotion metric (TRAINING_DESIGN.md §8)
+    "n_val_windows": 5120
   },
   "name_metrics": {                   // models.name_metrics (JSONB)
     "cork":   {"precision": 0.88, "recall": 0.79, "holdout_count": 24, "train_count": 310},
@@ -100,6 +110,14 @@ Notes:
   examples). A name with too few holdout examples to score carries its
   counts and `null` precision and recall rather than a misleading
   number.
+- `input_desc` and `output_desc` describe the exported Core ML model's
+  features; the pipeline writes them from the model it exports
+  (`Training/export_coreml.py`). The §4.1 baseline's `output_desc` is a
+  window classifier's (§3.2.1); the production model's will describe its
+  segment outputs (§3.2).
+- `val_metrics` carries the active architecture's promotion metric, for
+  the baseline `val_accuracy` over `n_val_windows` windows. Holdout
+  metrics are in the report behind `holdout_report_r2_key`.
 - `promoted_at` is RFC 3339 UTC. All sizes are bytes; the checksum is
   over the exact zip bytes the client downloads.
 - `min_client_version` NULL means the update applies to all client
@@ -108,16 +126,25 @@ Notes:
 ## 2. Publishing flow
 
 1. The nightly pipeline promotes a challenger (TRAINING_DESIGN.md §8).
-2. Export: `coremltools` → Core ML `.mlmodelc`, zipped; compute
-   `sha256` + `byte_size` over the zip.
-3. Upload the artifact and the holdout report to R2
-   (`models/trick-v<...>.mlmodelc.zip`).
-4. `POST /api/models` (service-key scoped): inserts the `models` row —
+2. Export (`Training/export_coreml.py`): `coremltools` → a Core ML ML
+   Program package (`.mlpackage`, fp16 weights and compute), zipped
+   byte-reproducibly; `sha256` + `byte_size` are over the zip. The zip
+   holds one directory, `TrickDetector.mlpackage/`. It is not
+   a compiled `.mlmodelc`: compiling needs macOS (`coremlcompiler`) and
+   the pipeline runs on Ubuntu, so the client compiles the package on
+   device (§4).
+3. Upload the artifact to `models/trick-v<...>.mlpackage.zip` and the
+   holdout report to `models/trick-v<...>.holdout_report.json` in R2.
+   Each object is read back and its sha256 checked. A key that already
+   holds other bytes is never overwritten.
+4. `POST /api/models` (service-key scoped; `Training/publish_model.py`,
+   which runs steps 2–4 after promotion): inserts the `models` row —
    `version`, `model_type`, `taxonomy_version`, `r2_key`, `sha256` (NOT
    NULL, 64-char hex of the artifact bytes), `byte_size`,
    `min_client_version`, `input_desc`, `output_desc`, `val_metrics`
    JSONB, `name_metrics` JSONB, `holdout_report_r2_key`,
-   `training_run_id`, and `promoted_at = now()` — plus
+   `training_run_id`, and `promoted_at = now()` (`model_type` and
+   `promoted_at` are the farm's; the request omits them) — plus
    `training_source_ids`, the sources the model trained on, which the
    farm records in `model_training_sources` so each owner can see their
    contribution went in (`BACKEND_DESIGN.md` §1.2.20). The current model
@@ -179,6 +206,30 @@ coordinates**:
   the names it actually pre-fills (§3.3), which can be fewer.
 - Combo MVP: one segment with N names — no sub-segmentation of
   individual tricks.
+
+#### 3.2.1 Baseline output (the window classifier)
+
+The model the pipeline ships today is the §4.1 baseline of
+`TRAINING_DESIGN.md`, a windowed softmax classifier. A Core ML graph
+cannot emit §3.2's variable-length segment list from it, so it returns
+per-window class probabilities, and the client decodes them into §3.2
+segments. The manifest's `output_desc` carries what decoding needs
+(§1).
+
+- Output `window_probs`: float32 `[N, C]`, `N = (T − window_frames) ÷
+  window_stride + 1` (integer division). Row `i` is the softmax over
+  `classes` for the window covering frames
+  `[i · window_stride, i · window_stride + window_frames)`.
+- Each window takes its highest-probability class. Consecutive windows
+  with the same class, other than `background_class`, merge into one
+  segment from the first window's start frame to the last window's end
+  frame. This is the decoding training scores (`Training/train.py`,
+  `decode_segments`).
+- `trick_names` is the class split on `combo_separator`: a combo is one
+  class (`"cork+gainer"`). `is_combo` is `trick_names.length > 1`.
+- **Judgment call:** `score` is the mean, over the merged windows, of
+  the winning class's probability. Every entry of `name_scores` is that
+  same `score`, because a combo's names share one softmax class.
 
 Worked example: a 60 s source is 600 canonical frames. A returned
 segment `start_frame=120, end_frame=175` spans seconds 12.0–17.5 of the
@@ -251,10 +302,13 @@ space from there.
 - Download the artifact from the manifest's presigned `url`
   streamed to a temp file; verify `sha256` (and `byte_size`) **before**
   touching the active model.
-- **Atomic swap:** verify → move into place → activate on the next
-  inference call. Never half-replace the active model.
+- Unzip the verified artifact and compile the package
+  (`MLModel.compileModel(at:)`) into a temp location. A compile failure
+  is a load failure (below).
+- **Atomic swap:** verify → compile → move into place → activate on the
+  next inference call. Never half-replace the active model.
 - **Failure fallback:** any failure — network error, checksum mismatch,
-  Core ML load error — keeps the previous model active and retries on
+  Core ML compile or load error — keeps the previous model active and retries on
   the next poll. The client retains the previous artifact until the new
   one loads successfully; on load failure the temp file is discarded.
   (Judgment call: load-success is the acceptance check; no on-device
@@ -322,3 +376,7 @@ space from there.
 6. Blind-sample rate (§3.3) — 0.1 is a starting point; lower it once
    the rubber-stamping measure (`TRAINING_DESIGN.md` §6.4) is stable,
    raise it if that measure is too noisy to read.
+7. Package vs compiled artifact (§2) — the pipeline ships `.mlpackage`
+   for the client to compile, because compiling needs macOS. An export
+   job on a macOS runner could ship `.mlmodelc` and skip the on-device
+   compile.

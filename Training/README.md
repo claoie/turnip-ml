@@ -10,11 +10,19 @@ what this repo validates; see the root README for repo-wide conventions.
   `source_id` (turnip-ml#12). See its docstring for the full contract.
 - `train.py` — champion training / fine-tuning script (turnip-ml#13).
   Hermetic TOML config, deterministic, CI smoke-tested.
+- `name_metrics.py` — per-name holdout precision/recall plus holdout and
+  train counts, the manifest's `name_metrics` (turnip-ml#41).
+- `export_coreml.py` — exports a trained model to a byte-reproducible fp16
+  Core ML `.mlpackage` zip (turnip-ml#16).
+- `publish_model.py` — publishes a promoted champion: export, R2 upload
+  with read-back hash checks, `POST /api/models` (turnip-ml#16).
 - `make_smoke_fixture.py` — generates the tiny synthetic smoke fixture.
 - `config/smoke.toml` — smoke-test hyperparameters (used in CI).
 - `config/full.toml` — full-run template (droplet / GPU worker).
 - `fixtures/smoke/` — tiny synthetic fixture (see its README).
 - `requirements.txt` — pinned training dependencies.
+- `requirements-export.txt` — `requirements.txt` plus pinned `coremltools`
+  for the export.
 - `tests/` — unit tests (`python -m unittest discover -s Training/tests -t .`).
 
 ## Determinism contract
@@ -116,9 +124,41 @@ The workflow has two modes:
 `Training/pipeline.sh` is the shared chain: `split_dataset.py` →
 `train.py` (`config/pipeline-finetune.toml` when a champion was restored,
 else `config/pipeline.toml`; dispatch `from_scratch` forces the latter) →
-`predict.py` on holdout → `evaluate.py`. It stops before the fixture gate,
-which needs the fixture runner (#27); promotion and publishing (#16) come
-after the gate, so a run changes no champion yet.
+`predict.py` on holdout → `evaluate.py` → `name_metrics.py`. It stops
+before the fixture gate, which needs the fixture runner (#27), so nothing
+is promoted and a run changes no champion yet. Publishing
+(`publish_model.py`) is wired after promotion and runs only in `farm`
+mode (`PUBLISH=true`), so an ungated model is never published.
+
+## Publishing a champion
+
+```sh
+python Training/publish_model.py --run data/run --dataset data/dataset
+```
+
+`publish_model.py` reads the farm and R2 settings from the environment
+(the `farm` variables above, plus optional `TRAINING_RUN_ID` and
+`MIN_CLIENT_VERSION`) and, in this order:
+
+1. Builds the whole `POST /api/models` body first: the descriptors of the
+   exported model, `val_metrics`, `name_metrics.json`, the dataset's
+   pinned `taxonomy_version`, and `training_source_ids` (the train split's
+   sources). A dataset that isn't the farm's (64-hex source ids) is
+   refused before anything is uploaded, so `synthetic` mode can never
+   publish.
+2. Exports the champion with `export_coreml.py`. The pipeline runs on
+   Ubuntu, so the artifact is a `.mlpackage` zip the client compiles on
+   device, not a compiled `.mlmodelc` (`docs/MODEL_CONTRACT.md` §2).
+3. Picks the version: the minor bump of the farm's current model, or
+   `trick-v1.0` before the first; `--major` or `--version` override it.
+4. Uploads the artifact and the holdout report under `models/<version>.*`,
+   reads each back and checks its sha256. It never overwrites a key that
+   holds other bytes.
+5. Calls `POST /api/models` and records the request body and the farm's
+   answer in `data/run/challenger/` (`publish_request.json`,
+   `publish.json`).
+
+It prints the version, sizes and counts only.
 
 Nothing per-sample reaches the log or an artifact in `farm` mode: this
 repository's logs and artifacts are public. Run it locally the same way:

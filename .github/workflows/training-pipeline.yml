@@ -17,9 +17,10 @@
 #              the end of a successful run.
 #
 # Both modes then run Training/pipeline.sh: split -> train (fine-tune the
-# champion unless `from_scratch`) -> predict holdout -> evaluate holdout.
-# Explicit stops: the fixture gate needs the fixture runner (#27), so
-# promotion and publishing (#16) don't run yet; no champion changes.
+# champion unless `from_scratch`) -> predict holdout -> evaluate holdout ->
+# per-name metrics. Explicit stop: the fixture gate needs the fixture
+# runner (#27), so promotion doesn't run yet; no champion changes. Publish
+# (#16) is wired after promotion, and only the farm job may publish.
 #
 # No actions/cache anywhere: pull_request runs can read caches written on
 # main, so nothing derived from contributed data may go into one.
@@ -133,9 +134,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # The export set: training plus coremltools for the publish step.
       - if: steps.config.outputs.configured == 'true'
-        name: Install training dependencies
-        run: pip install -r Training/requirements.txt
+        name: Install training + export dependencies
+        run: pip install -r Training/requirements-export.txt
 
       # training/state/export_state.json  the watermark (never printed: the
       #                                   cursor may embed raw label text)
@@ -194,10 +196,15 @@ jobs:
           python Training/fetch_dataset.py count "${state[@]}" \
             --out-state data/state/new_state.json --out-sources data/run/ingested.json
 
+      # PUBLISH: a promoted champion is published (Training/publish_model.py,
+      # with the job's farm and R2 credentials); nothing is promoted until
+      # the fixture gate (#27) runs.
       - if: steps.count.outputs.run == 'true'
         name: Split, train, predict and evaluate
         env:
           FROM_SCRATCH: ${{ inputs.from_scratch || false }}
+          PUBLISH: 'true'
+          TRAINING_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           if [ -f data/holdout_ids.txt ]; then export HOLDOUT_IDS=data/holdout_ids.txt; fi
           Training/pipeline.sh
