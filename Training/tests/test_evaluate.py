@@ -215,6 +215,176 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(report["n_name_matches"], 1)
         self.assertEqual(report["precision"], 1.0)
 
+    # fetch_dataset.py's shape: one entry per (clip_id, canonical name), all
+    # on the clip's window.
+    CLIP_A = "0b6f1c3e-6a51-4f47-9d57-1f4f3c0a2b11"
+    CLIP_B = "7d2e9a40-3c18-4b6e-a2f5-8e0c51d94c22"
+
+    def _combo_clip(self) -> list[dict]:
+        return [
+            {"clip_id": self.CLIP_A, "name": n, "start_frame": 4, "end_frame": 20}
+            for n in ("cork", "gainer")
+        ]
+
+    def _assert_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            evaluate.main(
+                [
+                    "--predictions",
+                    str(self.pred_path),
+                    "--split",
+                    str(self.split_path),
+                    "--samples-dir",
+                    str(self.samples_dir),
+                    "--out",
+                    str(self.tmp / "report.json"),
+                ]
+            )
+
+    def test_combo_clip_is_one_segment_and_name_matches(self) -> None:
+        # train.py labels this window "cork+gainer"; predict.py emits it as
+        # names ["cork", "gainer"]. Both forms must name-match the clip.
+        self._sample("h1", self._combo_clip())
+        self._split({"h1": "holdout"})
+        for pred in (
+            {"names": ["cork", "gainer"], "is_combo": True},
+            {"name": "cork+gainer"},
+        ):
+            with self.subTest(pred=pred):
+                self._predictions({"h1": [{"start_frame": 4, "end_frame": 20, **pred}]})
+                report = self._run()
+                self.assertEqual(report["n_ground_truth_segments"], 1)
+                self.assertEqual(report["n_detections"], 1)
+                self.assertEqual(report["n_name_matches"], 1)
+                self.assertEqual(report["precision"], 1.0)
+                self.assertEqual(report["recall"], 1.0)
+                self.assertEqual(report["name_accuracy_given_detection"], 1.0)
+                self.assertEqual(report["n_unmatched_predictions"], 0)
+                for name in ("cork", "gainer"):
+                    self.assertEqual(report["per_name"][name]["support"], 1)
+                    self.assertEqual(report["per_name"][name]["true_positives"], 1)
+                    self.assertEqual(report["per_name"][name]["recall"], 1.0)
+
+    def test_combo_clip_needs_every_name(self) -> None:
+        # Naming one trick of a combo clip localizes it but is not a match.
+        self._sample("h1", self._combo_clip())
+        self._split({"h1": "holdout"})
+        self._predictions({"h1": [{"start_frame": 4, "end_frame": 20, "name": "cork"}]})
+        report = self._run()
+        self.assertEqual(report["n_ground_truth_segments"], 1)
+        self.assertEqual(report["n_detections"], 1)
+        self.assertEqual(report["n_name_matches"], 0)
+        self.assertEqual(report["per_name"]["cork"]["true_positives"], 0)
+        self.assertEqual(report["per_name"]["gainer"]["support"], 1)
+
+    def test_clips_group_by_clip_id_not_by_window(self) -> None:
+        # Two clips (one single, one combo) plus an entry without a clip_id:
+        # three segments, the combo's names merged and nothing else.
+        self._sample(
+            "h1",
+            [
+                *self._combo_clip(),
+                {
+                    "clip_id": self.CLIP_B,
+                    "name": "cork",
+                    "start_frame": 40,
+                    "end_frame": 50,
+                },
+                {"name": "kick", "start_frame": 60, "end_frame": 70},
+            ],
+        )
+        self._split({"h1": "holdout"})
+        self._predictions(
+            {
+                "h1": [
+                    {"start_frame": 4, "end_frame": 20, "names": ["cork", "gainer"]},
+                    {"start_frame": 40, "end_frame": 50, "name": "cork"},
+                    {"start_frame": 60, "end_frame": 70, "name": "kick"},
+                ]
+            }
+        )
+        report = self._run()
+        self.assertEqual(report["n_ground_truth_segments"], 3)
+        self.assertEqual(report["n_name_matches"], 3)
+        self.assertEqual(report["per_name"]["cork"]["support"], 2)
+        self.assertEqual(report["per_name"]["cork"]["true_positives"], 2)
+
+    def test_entries_without_clip_id_stay_separate_segments(self) -> None:
+        # Legacy shape (smoke fixture, older data): no clip_id means one
+        # segment per entry, even on a shared window.
+        self._sample(
+            "h1",
+            [
+                {"name": n, "start_frame": 4, "end_frame": 20}
+                for n in ("cork", "gainer")
+            ],
+        )
+        self._split({"h1": "holdout"})
+        self._predictions(
+            {"h1": [{"start_frame": 4, "end_frame": 20, "names": ["cork", "gainer"]}]}
+        )
+        report = self._run()
+        self.assertEqual(report["n_ground_truth_segments"], 2)
+        self.assertEqual(report["n_detections"], 1)
+        self.assertEqual(report["n_name_matches"], 0)
+
+    def test_clip_entries_disagreeing_on_window_rejected(self) -> None:
+        tricks = self._combo_clip()
+        tricks[1]["end_frame"] = 21
+        self._sample("h1", tricks)
+        self._split({"h1": "holdout"})
+        self._predictions({})
+        self._assert_refused()
+
+    def test_clip_repeating_a_name_rejected(self) -> None:
+        self._sample("h1", [*self._combo_clip(), self._combo_clip()[0]])
+        self._split({"h1": "holdout"})
+        self._predictions({})
+        self._assert_refused()
+
+    def test_bad_clip_id_rejected(self) -> None:
+        self._split({"h1": "holdout"})
+        self._predictions({})
+        for clip_id in ("", None, 7):
+            with self.subTest(clip_id=clip_id):
+                self._sample(
+                    "h1",
+                    [
+                        {
+                            "clip_id": clip_id,
+                            "name": "cork",
+                            "start_frame": 4,
+                            "end_frame": 20,
+                        }
+                    ],
+                )
+                self._assert_refused()
+
+    def test_combo_clip_report_is_byte_identical_and_order_free(self) -> None:
+        # Same clip entries in either file order -> the same report bytes.
+        self._split({"h1": "holdout"})
+        self._predictions(
+            {"h1": [{"start_frame": 4, "end_frame": 20, "names": ["cork", "gainer"]}]}
+        )
+        out = self.tmp / "report.json"
+        args = [
+            "--predictions",
+            str(self.pred_path),
+            "--split",
+            str(self.split_path),
+            "--samples-dir",
+            str(self.samples_dir),
+            "--out",
+            str(out),
+        ]
+        reports = []
+        for tricks in (self._combo_clip(), self._combo_clip()[::-1]):
+            self._sample("h1", tricks)
+            for _ in range(2):
+                self.assertEqual(evaluate.main(args), 0)
+                reports.append(out.read_bytes())
+        self.assertEqual(len(set(reports)), 1)
+
     def test_background_false_positive(self) -> None:
         self._basic_holdout()
         # Far from the GT segment: zero IoU -> hallucination.

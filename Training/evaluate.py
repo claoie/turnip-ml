@@ -17,10 +17,24 @@ Inputs
                 sample_id -> "train" | "val" | "holdout".
 --samples-dir   directory of per-sample JSON files ("<sample_id>.json")
                 carrying the ground-truth "tricks" list:
-                [{"name": str, "start_frame": int, "end_frame": int}].
+                [{"name": str, "start_frame": int, "end_frame": int,
+                  "clip_id": str?}].
+                Entries sharing a clip_id are one segment carrying the
+                union of their names (see "Ground truth" below).
 --out           report path. Defaults to "holdout_report.json" next to the
                 predictions file (i.e. next to the model artifact).
 --iou-threshold temporal-IoU threshold for a detection. Default 0.5.
+
+Ground truth
+------------
+Training/fetch_dataset.py writes one "tricks" entry per (clip_id,
+canonical name), all on the clip's window, and train.py labels that
+window "a+b": a combo clip is one segment with N names (TRAINING_DESIGN.md
+§2.3). So entries sharing a clip_id are grouped into one ground-truth
+segment carrying the union of their names; they must agree on
+start_frame/end_frame and must not repeat a name, else the sample is
+refused. Entries without a clip_id (the committed smoke fixture,
+hand-written data) are one segment each.
 
 Metrics
 -------
@@ -58,8 +72,9 @@ Split discipline (fail closed)
   evaluating anywhere but holdout is a methodology bug.
 - A holdout sample with no entry in the predictions file is legal and
   means "the model predicted nothing for this sample".
-- Malformed segments, contradictory is_combo flags, or missing sample
-  files are errors, never silently skipped.
+- Malformed segments, contradictory is_combo flags, a clip whose entries
+  disagree on its window or repeat a name, or missing sample files are
+  errors, never silently skipped.
 
 Determinism contract
 --------------------
@@ -189,10 +204,37 @@ def load_ground_truth(
         tricks = sample.get("tricks")
         if not isinstance(tricks, list):
             _fail(f"{sample_path}: missing 'tricks' list")
-        gt[sid] = [
-            parse_segment(t, f"{sample_path} trick #{i}") for i, t in enumerate(tricks)
-        ]
+        gt[sid] = ground_truth_segments(tricks, str(sample_path))
     return gt
+
+
+def ground_truth_segments(
+    tricks: list[Any], where: str
+) -> list[tuple[int, int, frozenset[str]]]:
+    """One segment per clip: entries sharing a clip_id merge into one segment
+    with the union of their names (a combo clip, as train.py labels it);
+    entries without a clip_id are a segment each."""
+    segments: list[tuple[int, int, frozenset[str]]] = []
+    clips: dict[str, tuple[int, int, frozenset[str]]] = {}
+    for i, t in enumerate(tricks):
+        entry = f"{where} trick #{i}"
+        start, end, names = parse_segment(t, entry)
+        if "clip_id" not in t:
+            segments.append((start, end, names))
+            continue
+        clip_id = t["clip_id"]
+        if not isinstance(clip_id, str) or not clip_id:
+            _fail(f'{entry}: "clip_id" must be a non-empty string')
+        if clip_id not in clips:
+            clips[clip_id] = (start, end, names)
+            continue
+        clip_start, clip_end, clip_names = clips[clip_id]
+        if (clip_start, clip_end) != (start, end):
+            _fail(f"{entry}: entries for clip {clip_id!r} disagree on its window")
+        if clip_names & names:
+            _fail(f"{entry}: clip {clip_id!r} repeats {sorted(clip_names & names)}")
+        clips[clip_id] = (start, end, clip_names | names)
+    return segments + [clips[clip_id] for clip_id in sorted(clips)]
 
 
 # ---------------------------------------------------------------------------
