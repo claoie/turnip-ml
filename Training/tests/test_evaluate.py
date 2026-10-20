@@ -396,5 +396,74 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+class MatchSegmentsTest(unittest.TestCase):
+    """Direct tests for evaluate.match_segments (greedy best-IoU matcher)."""
+
+    @staticmethod
+    def _seg(start: int, end: int) -> tuple[int, int, frozenset[str]]:
+        return (start, end, frozenset({"x"}))
+
+    def test_iou_exactly_at_threshold_is_inclusive(self) -> None:
+        # GT (0,10) vs pred (0,5): IoU = 5/10 = 0.5 exactly (representable).
+        # The code filters with `iou >= threshold`, so the boundary matches.
+        gt, pred = [self._seg(0, 10)], [self._seg(0, 5)]
+        matches, mg, mp = evaluate.match_segments(gt, pred, 0.5)
+        self.assertEqual(matches, [(0, 0, 0.5)])
+        self.assertEqual((mg, mp), ({0}, {0}))
+        # Just above the boundary the pair is dropped.
+        matches, mg, mp = evaluate.match_segments(gt, pred, 0.5000001)
+        self.assertEqual((matches, mg, mp), ([], set(), set()))
+
+    def test_tie_broken_by_gt_then_pred_index(self) -> None:
+        # One pred overlaps two identical GTs equally: lower gt_idx wins.
+        matches, mg, mp = evaluate.match_segments(
+            [self._seg(0, 10), self._seg(0, 10)], [self._seg(0, 10)], 0.5
+        )
+        self.assertEqual(matches, [(0, 0, 1.0)])
+        self.assertEqual((mg, mp), ({0}, {0}))
+        # One GT, two preds with equal IoU 0.5: lower pred_idx wins.
+        matches, mg, mp = evaluate.match_segments(
+            [self._seg(0, 10)], [self._seg(5, 10), self._seg(0, 5)], 0.5
+        )
+        self.assertEqual(matches, [(0, 0, 0.5)])
+        self.assertEqual((mg, mp), ({0}, {0}))
+
+    def test_greedy_pick_blocks_later_pair(self) -> None:
+        # pred0 (0,10) pairs with gt0 (IoU 1.0) and gt1 (IoU 0.6). Greedy
+        # takes the 1.0 pair first, so gt1 stays unmatched even though its
+        # pair clears the threshold.
+        matches, mg, mp = evaluate.match_segments(
+            [self._seg(0, 10), self._seg(0, 6)], [self._seg(0, 10)], 0.5
+        )
+        self.assertEqual(matches, [(0, 0, 1.0)])
+        self.assertEqual((mg, mp), ({0}, {0}))
+
+    def test_multi_pair_dedup_matches_each_side_once(self) -> None:
+        # Diagonal pairs are best; cross pairs (IoU 0.6) are skipped because
+        # both sides are already taken. Result is sorted by (gt, pred).
+        matches, mg, mp = evaluate.match_segments(
+            [self._seg(0, 10), self._seg(0, 6)],
+            [self._seg(0, 6), self._seg(0, 10)],
+            0.5,
+        )
+        self.assertEqual(matches, [(0, 1, 1.0), (1, 0, 1.0)])
+        self.assertEqual((mg, mp), ({0, 1}, {0, 1}))
+
+    def test_no_overlap(self) -> None:
+        # Disjoint and merely touching segments both have IoU 0.
+        matches, mg, mp = evaluate.match_segments(
+            [self._seg(0, 5)], [self._seg(5, 10), self._seg(20, 30)], 0.1
+        )
+        self.assertEqual((matches, mg, mp), ([], set(), set()))
+
+    def test_empty_inputs(self) -> None:
+        seg = [self._seg(0, 10)]
+        for gt, pred in (([], []), (seg, []), ([], seg)):
+            with self.subTest(gt=len(gt), pred=len(pred)):
+                self.assertEqual(
+                    evaluate.match_segments(gt, pred, 0.5), ([], set(), set())
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
