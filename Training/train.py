@@ -21,7 +21,8 @@ Usage:
 Artifacts in the out dir:
   config.toml   byte-exact snapshot of the effective config
   model.npz     weights (W, b), class list, feature stats, window params
-  metrics.json  sorted-key metrics incl. val accuracy and decoded segments
+  metrics.json  sorted-key metrics incl. val accuracy, decoded segments,
+                per-name train counts and the split's sha256
 
 Sample JSON format (one file per sample in samples_dir):
   {"sample_id": ..., "fps": 10,
@@ -213,6 +214,21 @@ def load_samples(
     if not val:
         raise ValueError("no val samples in the split — refusing to run unevaluated")
     return train, val
+
+
+def train_name_counts(train: list[dict[str, Any]]) -> dict[str, int]:
+    """Labeled segments per trick name over the train split, sorted by name.
+
+    A combo segment ("a+b") counts once for each of its names. These are
+    the per-name train counts of TRAINING_DESIGN.md §2.7, published as
+    `train_count` in the model's name_metrics (name_metrics.py).
+    """
+    counts: dict[str, int] = {}
+    for sample in train:
+        for trick in sample.get("tricks", []):
+            for name in {n for n in str(trick["name"]).split("+") if n}:
+                counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +444,11 @@ def run(config_path: Path, out_override: str | None) -> dict[str, Any]:
         path = Path(p)
         return path if path.is_absolute() else repo_root / path
 
-    split = load_split(resolve(cfg["split_path"]))
+    split_path = resolve(cfg["split_path"])
+    split = load_split(split_path)
+    split_sha = hashlib.sha256(split_path.read_bytes()).hexdigest()
     train_samples, val_samples = load_samples(resolve(cfg["samples_dir"]), split)
+    name_counts = train_name_counts(train_samples)
 
     W, S = cfg["window_frames"], cfg["window_stride"]
     Xtr_raw, ytr_labels, _ = build_dataset(xp, train_samples, W, S)
@@ -523,6 +542,8 @@ def run(config_path: Path, out_override: str | None) -> dict[str, Any]:
         "val_segments": segments,
         "config_sha256": config_sha,
         "init_checkpoint": cfg["init_checkpoint"] or None,
+        "split_sha256": split_sha,
+        "train_name_counts": name_counts,
     }
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2, sort_keys=True)

@@ -85,7 +85,10 @@ Deterministic pipeline per label string:
    (`unmapped_labels.log`) for later taxonomy work. Rationale: failing
    closed on unmapped names would starve early training when the
    vocabulary is still growing; the log feeds the taxonomy curation loop
-   (master plan §9, open question 1).
+   (master plan §9, open question 1). A model trained on an unmapped
+   name is not published, though: the manifest is public and the name
+   is a contributor's free text (`MODEL_CONTRACT.md` §1), so publishing
+   waits until the taxonomy maps it.
 
 Clip → Label shape (decided): the farm stores **one label row per
 `(clip_id, trick_name)`** (`BACKEND_DESIGN.md` §1.1) — one-to-many at
@@ -301,8 +304,11 @@ artifact:
   model now knows this trick this well", so a name with fewer than 5
   holdout examples publishes its counts with `null` precision and
   recall rather than a number that small a sample can't support.
-  *(Judgment call on 5.)* `Training/name_metrics.py` writes it as
-  `name_metrics.json` next to the holdout report.
+  *(Judgment call on 5.)* Precision is also `null` for a name the
+  model never predicted on the holdout (0 of 0 is undefined).
+  `Training/name_metrics.py` writes it as `name_metrics.json` next to
+  the holdout report, taking `train_count` from `train.py`'s
+  `metrics.json` (`train_name_counts`), the counts §2.7 trains with.
 - **Background false-positive count** — spurious segments fired in
   unlabeled regions.
 - **By origin** — name accuracy and segment F1 split by label `origin`

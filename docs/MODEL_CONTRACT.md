@@ -109,7 +109,13 @@ Notes:
   model, and which tricks it is still learning (few training
   examples). A name with too few holdout examples to score carries its
   counts and `null` precision and recall rather than a misleading
-  number.
+  number; `precision` is also `null` for a name the model never
+  predicted on the holdout (undefined, not 0%).
+- Every trick name the manifest carries (`name_metrics` keys,
+  `output_desc.classes`) is a curated canonical name at
+  `taxonomy_version`. The pipeline does not publish a model trained on
+  an unmapped label (`TRAINING_DESIGN.md` §2.2): that label is a
+  contributor's free text, and this manifest is public.
 - `input_desc` and `output_desc` describe the exported Core ML model's
   features; the pipeline writes them from the model it exports
   (`Training/export_coreml.py`). The §4.1 baseline's `output_desc` is a

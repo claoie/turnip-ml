@@ -20,6 +20,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -90,6 +91,18 @@ class LoadModelTest(SmokeModel):
             with self.subTest(name), self.assertRaises(export_coreml.ExportError):
                 export_coreml.load_model(self.write_model(**overrides))
 
+    def test_conversion_errors_are_export_errors(self) -> None:
+        # Whatever coremltools or a changed package layout raises is a
+        # failed export (exit 2), never a traceback.
+        for error in (ValueError("bad range"), KeyError("Manifest.json")):
+            with (
+                self.subTest(type(error).__name__),
+                mock.patch.object(export_coreml, "build_mlmodel", return_value=None),
+                mock.patch.object(export_coreml, "package_files", side_effect=error),
+                self.assertRaisesRegex(export_coreml.ExportError, "conversion failed"),
+            ):
+                export_coreml.export(self.model)
+
     def test_missing_coremltools_fails_closed(self) -> None:
         if HAVE_COREMLTOOLS:
             self.skipTest("coremltools is installed")
@@ -136,7 +149,7 @@ class ExportTest(SmokeModel):
         self.assertEqual(root["path"], "com.apple.CoreML/model.mlmodel")
 
     def test_spec_is_fp16_with_contract_io_and_no_timestamp(self) -> None:
-        from coremltools.proto import Model_pb2
+        from coremltools.proto import MIL_pb2, Model_pb2
 
         with zipfile.ZipFile(io.BytesIO(self.artifact)) as zf:
             raw = zf.read("TrickDetector.mlpackage/Data/com.apple.CoreML/model.mlmodel")
@@ -157,7 +170,53 @@ class ExportTest(SmokeModel):
         self.assertEqual((lo.lowerBound, lo.upperBound), (8, tkp1.MAX_FRAMES))
         self.assertEqual((ch.lowerBound, ch.upperBound), (52, 52))
         self.assertEqual([o.name for o in spec.description.output], ["window_probs"])
-        self.assertIn("fp16", str(spec.mlProgram))
+        # fp16 up to the window features; the classifier head in fp32.
+        dtypes = {
+            out.name: out.type.tensorType.dataType
+            for fn in spec.mlProgram.functions.values()
+            for block in fn.block_specializations.values()
+            for op in block.operations
+            if op.type != "const"
+            for out in op.outputs
+        }
+        fp16, fp32 = MIL_pb2.DataType.FLOAT16, MIL_pb2.DataType.FLOAT32
+        self.assertEqual(dtypes["avg_pool_0_cast_fp16"], fp16)
+        for name in export_coreml.FP32_OPS:
+            self.assertEqual(dtypes[name], fp32, name)
+
+    def test_windows_longer_than_the_default_length(self) -> None:
+        from coremltools.proto import Model_pb2
+
+        model = self.write_model(window_frames=np.int64(700))
+        with contextlib.redirect_stderr(io.StringIO()):
+            artifact = export_coreml.export(model)
+        with zipfile.ZipFile(io.BytesIO(artifact)) as zf:
+            raw = zf.read("TrickDetector.mlpackage/Data/com.apple.CoreML/model.mlmodel")
+        spec = Model_pb2.Model()
+        spec.ParseFromString(raw)
+        [inp] = spec.description.input
+        lo = inp.type.multiArrayType.shapeRange.sizeRanges[0]
+        self.assertEqual(lo.lowerBound, 700)
+        self.assertEqual(inp.type.multiArrayType.shape[0], 700)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Core ML runs on macOS only")
+    def test_tiny_feature_std_stays_finite(self) -> None:
+        # 0.1 / 1e-6 overflows fp16 (65504): the fp32 head must not.
+        import coremltools as ct
+
+        std = np.load(self.model)["feat_std"].copy()
+        std[0] = 1e-6
+        model = self.write_model(feat_std=std)
+        with tempfile.TemporaryDirectory() as tmp:
+            with contextlib.redirect_stderr(io.StringIO()):
+                artifact = export_coreml.export(model)
+            with zipfile.ZipFile(io.BytesIO(artifact)) as zf:
+                zf.extractall(tmp)
+            mlmodel = ct.models.MLModel(str(Path(tmp) / export_coreml.PACKAGE_NAME))
+            pose = np.full((32, 52), 0.9, dtype=np.float32)
+            got = mlmodel.predict({"pose": pose})["window_probs"]
+        self.assertTrue(np.all(np.isfinite(got)))
+        np.testing.assert_allclose(got.sum(axis=1), 1.0, atol=1e-3)
 
     @unittest.skipUnless(sys.platform == "darwin", "Core ML runs on macOS only")
     def test_predictions_match_the_numpy_model(self) -> None:

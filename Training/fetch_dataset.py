@@ -37,7 +37,8 @@ build --out DIR --cache DIR
       manifest.jsonl            {"sample_id", "source_id"} per sample, the
                                 split_dataset.py input (splits group by
                                 source)
-      dataset_manifest.json     pinned taxonomy_version, export cursor,
+      dataset_manifest.json     pinned taxonomy_version and its curated
+                                canonical names, export cursor,
                                 counts and sorted sample ids
       unmapped_labels.log       "<count>\t<token>" per unmapped label token,
                                 the taxonomy curation queue
@@ -93,7 +94,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import tkp1
 from canonicalize import Taxonomy, TaxonomyError
@@ -227,10 +228,41 @@ def parse_taxonomy(i: int, entry: Any) -> tuple[str, str, int]:
     return raw, canonical, version
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: it would carry the pipeline key to whatever
+    host the Location names. A 3xx then surfaces as an HTTPError."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        return None
+
+
+_FARM_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def farm_urlopen(request: urllib.request.Request, timeout: float) -> Any:
+    """urllib.request.urlopen for farm requests, never following redirects."""
+    return _FARM_OPENER.open(request, timeout=timeout)
+
+
+def farm_url_allowed(base_url: str) -> bool:
+    """https, or plain http to this machine only."""
+    parsed = urllib.parse.urlsplit(base_url)
+    local = parsed.scheme == "http" and parsed.hostname in LOCAL_HOSTS
+    return parsed.scheme == "https" or local
+
+
 def http_get_json(url: str, headers: dict[str, str]) -> Any:
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
+        with farm_urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
             body = response.read(MAX_PAGE_BYTES + 1)
     except urllib.error.HTTPError as e:
         raise FetchError(f"export request failed: HTTP {e.code}") from e
@@ -248,9 +280,7 @@ def http_get_json(url: str, headers: dict[str, str]) -> Any:
 
 class ExportClient:
     def __init__(self, base_url: str, key: str, transport: Transport | None = None):
-        parsed = urllib.parse.urlsplit(base_url)
-        local = parsed.scheme == "http" and parsed.hostname in LOCAL_HOSTS
-        if parsed.scheme != "https" and not local:
+        if not farm_url_allowed(base_url):
             raise FetchError(f"{FARM_URL_ENV} must be an https:// URL")
         if not key:
             raise FetchError(f"{PIPELINE_KEY_ENV} is empty")
@@ -372,15 +402,17 @@ class BlobCache:
         return pruned
 
 
-def r2_getter_from_env() -> BlobGetter:
+def r2_client_from_env(purpose: str) -> tuple[Any, str, tuple[type[Exception], ...]]:
+    """(boto3 S3 client for R2, bucket, the boto errors a call can raise)."""
     missing = [name for name in R2_ENV if not os.environ.get(name)]
     if missing:
         raise FetchError(f"missing environment: {', '.join(missing)}")
     try:
         import boto3
+        from botocore.config import Config
         from botocore.exceptions import BotoCoreError, ClientError
     except ImportError as e:
-        raise FetchError("build needs boto3 to read pose blobs from R2") from e
+        raise FetchError(f"{purpose} needs boto3 to reach R2") from e
     account, key_id, secret, bucket = (os.environ[name] for name in R2_ENV)
     client = boto3.client(
         "s3",
@@ -388,12 +420,23 @@ def r2_getter_from_env() -> BlobGetter:
         aws_access_key_id=key_id,
         aws_secret_access_key=secret,
         region_name="auto",
+        # R2 rejects the newer default request checksums on some versions;
+        # callers verify content against their own sha256.
+        config=Config(
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
     )
+    return client, bucket, (BotoCoreError, ClientError)
+
+
+def r2_getter_from_env() -> BlobGetter:
+    client, bucket, errors = r2_client_from_env("build (pose blobs)")
 
     def get(r2_key: str) -> bytes:
         try:
             body: bytes = client.get_object(Bucket=bucket, Key=r2_key)["Body"].read()
-        except (BotoCoreError, ClientError) as e:
+        except errors as e:
             raise FetchError(f"{r2_key}: R2 download failed: {type(e).__name__}") from e
         return body
 
@@ -535,7 +578,16 @@ def _write_dataset(
         "taxonomy_version": taxonomy.version,
         "unmapped_tokens": len(unmapped),
     }
-    manifest = {**stats, "export_cursor": pull.cursor, "sample_ids": sample_ids}
+    manifest = {
+        **stats,
+        # The curated names at the pin: what the farm's vocabulary for this
+        # taxonomy_version holds. Unmapped tokens train, but a model that
+        # names one is not published (publish_model.py): the manifest is
+        # public and the token is a contributor's free text.
+        "canonical_names": taxonomy.canonical_names,
+        "export_cursor": pull.cursor,
+        "sample_ids": sample_ids,
+    }
     (staging / "manifest.jsonl").write_text(
         "".join(_dump({"sample_id": s, "source_id": s}) for s in sample_ids),
         encoding="utf-8",

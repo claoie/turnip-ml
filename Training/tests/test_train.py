@@ -5,6 +5,7 @@ Run: python -m unittest discover -s Training/tests -t .
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import tempfile
@@ -17,6 +18,7 @@ from Training import train
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SMOKE_CONFIG = REPO_ROOT / "Training" / "config" / "smoke.toml"
+SMOKE = REPO_ROOT / "Training" / "fixtures" / "smoke"
 
 
 class TrainTest(unittest.TestCase):
@@ -49,6 +51,32 @@ class TrainTest(unittest.TestCase):
         for seg in m["val_segments"]:
             self.assertLess(seg["start_frame"], seg["end_frame"])
             self.assertEqual(seg["is_combo"], "+" in seg["name"])
+
+    def test_train_name_counts_cover_the_train_split_only(self) -> None:
+        self.assertEqual(self._run(), 0)
+        m = self._metrics()
+        split = json.loads((SMOKE / "split.json").read_text())
+        want: dict[str, int] = {}
+        for sid, part in split.items():
+            if part != "train":
+                continue
+            sample = json.loads((SMOKE / "samples" / f"{sid}.json").read_text())
+            for trick in sample["tricks"]:
+                for name in set(trick["name"].split("+")):
+                    want[name] = want.get(name, 0) + 1
+        self.assertEqual(m["train_name_counts"], want)
+        self.assertEqual(
+            m["split_sha256"],
+            hashlib.sha256((SMOKE / "split.json").read_bytes()).hexdigest(),
+        )
+
+    def test_combo_segments_count_for_each_name(self) -> None:
+        samples = [
+            {"tricks": [{"name": "cork+gainer"}, {"name": "gainer"}]},
+            {"tricks": [{"name": "gainer+gainer"}]},
+            {},
+        ]
+        self.assertEqual(train.train_name_counts(samples), {"cork": 1, "gainer": 3})
 
     def test_loss_decreases(self) -> None:
         self._run()

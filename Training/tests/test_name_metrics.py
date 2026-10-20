@@ -6,13 +6,13 @@ Run: python -m unittest discover -s Training/tests -t .
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import shutil
 import sys
 import tempfile
 import unittest
-from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -30,11 +30,18 @@ def seg(name: str, start: int) -> dict:
 
 
 class BuildNameMetricsTest(unittest.TestCase):
-    def per_name(self, support: int) -> dict:
-        return {"gainer": {"support": support, "precision": 0.75, "recall": 0.5}}
+    def per_name(self, support: int, predicted: int = 4) -> dict:
+        return {
+            "gainer": {
+                "support": support,
+                "predicted": predicted,
+                "precision": 0.75,
+                "recall": 0.5,
+            }
+        }
 
     def test_fewer_than_five_holdout_examples_publish_null_metrics(self) -> None:
-        out = name_metrics.build_name_metrics(self.per_name(4), Counter(gainer=9))
+        out = name_metrics.build_name_metrics(self.per_name(4), {"gainer": 9})
         self.assertEqual(
             out,
             {
@@ -48,20 +55,30 @@ class BuildNameMetricsTest(unittest.TestCase):
         )
 
     def test_five_holdout_examples_publish_the_metrics(self) -> None:
-        out = name_metrics.build_name_metrics(self.per_name(5), Counter(gainer=9))
+        out = name_metrics.build_name_metrics(self.per_name(5), {"gainer": 9})
         self.assertEqual(
             out["gainer"],
             {"precision": 0.75, "recall": 0.5, "holdout_count": 5, "train_count": 9},
         )
 
+    def test_never_predicted_name_has_no_precision(self) -> None:
+        # 0 of 0 predictions is undefined, not 0% precise; recall stands.
+        per_name = self.per_name(12, predicted=0)
+        per_name["gainer"].update(precision=0.0, recall=0.0)
+        out = name_metrics.build_name_metrics(per_name, {"gainer": 9})
+        self.assertEqual(
+            out["gainer"],
+            {"precision": None, "recall": 0.0, "holdout_count": 12, "train_count": 9},
+        )
+
     def test_entries_carry_exactly_the_manifest_keys(self) -> None:
-        out = name_metrics.build_name_metrics(self.per_name(7), Counter())
+        out = name_metrics.build_name_metrics(self.per_name(7), {})
         self.assertEqual(
             set(out["gainer"]), {"precision", "recall", "holdout_count", "train_count"}
         )
 
     def test_train_only_name_is_still_learning(self) -> None:
-        out = name_metrics.build_name_metrics({}, Counter(cork=3))
+        out = name_metrics.build_name_metrics({}, {"cork": 3})
         self.assertEqual(
             out["cork"],
             {"precision": None, "recall": None, "holdout_count": 0, "train_count": 3},
@@ -69,7 +86,27 @@ class BuildNameMetricsTest(unittest.TestCase):
 
     def test_background_is_never_a_name(self) -> None:
         with self.assertRaises(ValueError):
-            name_metrics.build_name_metrics({}, Counter(background=3))
+            name_metrics.build_name_metrics({}, {"background": 3})
+
+    def test_validate_accepts_only_the_manifest_shape(self) -> None:
+        good = {
+            "gainer": {
+                "precision": None,
+                "recall": 0.5,
+                "holdout_count": 6,
+                "train_count": 2,
+            }
+        }
+        self.assertEqual(name_metrics.validate(good), good)
+        bad = [
+            {},
+            {"gainer": {**good["gainer"], "support": 6}},
+            {"gainer": {**good["gainer"], "recall": 1.5}},
+            {"gainer": {**good["gainer"], "train_count": -1}},
+        ]
+        for data in bad:
+            with self.subTest(data), self.assertRaises(ValueError):
+                name_metrics.validate(data)
 
 
 class NameMetricsCliTest(unittest.TestCase):
@@ -82,6 +119,7 @@ class NameMetricsCliTest(unittest.TestCase):
         self.samples.mkdir()
         self.split = self.tmp / "split.json"
         self.report = self.tmp / "holdout_report.json"
+        self.metrics = self.tmp / "metrics.json"
         self.out = self.tmp / "name_metrics.json"
 
     def sample(self, sid: str, tricks: list[dict]) -> None:
@@ -109,34 +147,34 @@ class NameMetricsCliTest(unittest.TestCase):
             [
                 "--report",
                 str(self.report),
+                "--metrics",
+                str(self.metrics),
                 "--split",
                 str(self.split),
-                "--samples-dir",
-                str(self.samples),
                 "--out",
                 str(self.out),
             ]
         )
 
+    def write_metrics(self, counts: dict[str, int]) -> None:
+        sha = hashlib.sha256(self.split.read_bytes()).hexdigest()
+        write_json(self.metrics, {"split_sha256": sha, "train_name_counts": counts})
+
     def dataset(self) -> None:
-        # Holdout: five gainers (four found), two corks (both found).
-        # Train: three gainers, one cork, one kick (a combo counts for both
-        # of its names). Val: a gainer that must not count.
+        # Holdout: five gainers (four found), two corks (both found). The
+        # train counts are train.py's (test_train covers how it counts).
         self.sample("h1", [seg("gainer", 0), seg("gainer", 20), seg("cork", 40)])
         self.sample("h2", [seg("gainer", 0), seg("gainer", 20), seg("gainer", 40)])
         self.sample("h3", [seg("cork", 0)])
-        self.sample("t1", [seg("gainer", 0), seg("gainer", 20)])
-        self.sample("t2", [seg("gainer+kick", 0), seg("cork", 20)])
-        self.sample("v1", [seg("gainer", 0)])
         self.evaluate(
-            {"h1": "holdout", "h2": "holdout", "h3": "holdout"}
-            | {"t1": "train", "t2": "train", "v1": "val"},
+            {"h1": "holdout", "h2": "holdout", "h3": "holdout", "t1": "train"},
             {
                 "h1": [seg("gainer", 0), seg("gainer", 20), seg("cork", 40)],
                 "h2": [seg("gainer", 0), seg("gainer", 20)],
                 "h3": [seg("cork", 0)],
             },
         )
+        self.write_metrics({"cork": 1, "gainer": 3, "kick": 1})
 
     def test_writes_manifest_shaped_name_metrics(self) -> None:
         self.dataset()
@@ -179,11 +217,28 @@ class NameMetricsCliTest(unittest.TestCase):
         self.assertIn("split_sha256", self.stderr.getvalue())
         self.assertFalse(self.out.exists())
 
-    def test_missing_train_sample_is_refused(self) -> None:
+    def test_metrics_from_another_split_are_refused(self) -> None:
         self.dataset()
-        (self.samples / "t2.json").unlink()
+        write_json(self.metrics, {"split_sha256": "0" * 64, "train_name_counts": {}})
         self.assertEqual(self.run_cli(), 2)
+        self.assertIn("split_sha256", self.stderr.getvalue())
         self.assertFalse(self.out.exists())
+
+    def test_metrics_without_train_counts_are_refused(self) -> None:
+        self.dataset()
+        sha = hashlib.sha256(self.split.read_bytes()).hexdigest()
+        write_json(self.metrics, {"split_sha256": sha})
+        self.assertEqual(self.run_cli(), 2)
+        self.assertIn("train_name_counts", self.stderr.getvalue())
+
+    def test_errors_name_no_trick(self) -> None:
+        # Unmapped names are a contributor's free text: never in the log.
+        self.dataset()
+        report = json.loads(self.report.read_text(encoding="utf-8"))
+        report["per_name"]["gainer"]["recall"] = 2.0
+        write_json(self.report, report)
+        self.assertEqual(self.run_cli(), 2)
+        self.assertNotIn("gainer", self.stderr.getvalue())
 
     def test_malformed_report_is_refused(self) -> None:
         self.dataset()

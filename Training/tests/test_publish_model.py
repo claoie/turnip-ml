@@ -148,10 +148,20 @@ class FakeFarm:
     """GET /api/models/current + POST /api/models, as turnip-farm serves them."""
 
     def __init__(self, current: str | None = None, published: tuple[str, ...] = ()):
-        self.current = current
+        self.current: dict[str, Any] | None = None
+        if current:
+            self.current = {
+                "version": current,
+                "sha256": "0" * 64,
+                "r2_key": f"models/{current}.mlpackage.zip",
+                "holdout_report_r2_key": f"models/{current}.holdout_report.json",
+                "promoted_at": "2026-10-01T03:40:00.000Z",
+            }
         self.published = set(published) | ({current} if current else set())
         self.posts: list[dict[str, Any]] = []
         self.fail_next_post: int | None = None
+        # Insert the model, then lose the answer (a timeout after commit).
+        self.drop_next_answer = False
         self.calls = 0
 
     def transport(self, method, url, headers, body):
@@ -160,7 +170,7 @@ class FakeFarm:
             assert "Authorization" not in headers  # public endpoint
             if self.current is None:
                 return error(404, "NO_MODEL")
-            return 200, {"version": self.current, "model_type": "trick-detection"}
+            return 200, {**self.current, "model_type": "trick-detection"}
         if method == "POST" and url == FARM + "/api/models":
             if headers.get("Authorization") != f"Bearer {KEY}":
                 return error(401, "UNAUTHENTICATED")
@@ -178,8 +188,14 @@ class FakeFarm:
             if payload["version"] in self.published:
                 return error(409, "VERSION_EXISTS")
             self.published.add(payload["version"])
-            self.current = payload["version"]
+            self.current = {
+                key: payload[key]
+                for key in ("version", "sha256", "r2_key", "holdout_report_r2_key")
+            } | {"promoted_at": "2026-10-19T03:40:00.000Z"}
             self.posts.append(payload)
+            if self.drop_next_answer:
+                self.drop_next_answer = False
+                raise publish_model.PublishError("farm request failed: TimeoutError")
             return 201, {
                 "id": "00000000-0000-4000-8000-000000000001",
                 "version": payload["version"],
@@ -232,7 +248,13 @@ class RunFixture:
         self.train_ids = sorted(s for s, part in split.items() if part == "train")
         (self.dataset / "manifest.jsonl").write_text("\n".join(manifest) + "\n")
         (self.dataset / "dataset_manifest.json").write_text(
-            json.dumps({"taxonomy_version": 3, "samples": len(split)})
+            json.dumps(
+                {
+                    "taxonomy_version": 3,
+                    "canonical_names": ["cork", "corkscrew", "gainer"],
+                    "samples": len(split),
+                }
+            )
         )
         self.run_dir.mkdir()
         self.split = self.run_dir / "split.json"
@@ -257,7 +279,12 @@ class RunFixture:
             == 0
         )
         out = ["--out", str(self.challenger / "name_metrics.json")]
-        assert name_metrics.main(["--report", str(report), *common, *out]) == 0
+        metrics = ["--metrics", str(self.challenger / "metrics.json")]
+        split_arg = ["--split", str(self.split)]
+        assert (
+            name_metrics.main(["--report", str(report), *metrics, *split_arg, *out])
+            == 0
+        )
 
 
 class PublishTestCase(unittest.TestCase):
@@ -362,7 +389,7 @@ class PublishRoundTripTest(PublishTestCase):
     def test_logs_carry_no_ids_urls_or_keys(self) -> None:
         self.assertEqual(self.main(), 0)
         logs = self.logs()
-        self.assertIn("published trick-v1.0", logs)
+        self.assertIn("trick-v1.0: published", logs)
         for secret in [FARM, KEY, *R2_ENV.values(), *self.fixture.train_ids]:
             self.assertNotIn(secret, logs)
 
@@ -376,6 +403,32 @@ class PublishRoundTripTest(PublishTestCase):
         self.assertEqual(
             (self.challenger / "publish_request.json").read_bytes(), request
         )
+
+
+class RetryTest(PublishTestCase):
+    def test_a_lost_answer_is_reconciled_from_the_current_model(self) -> None:
+        self.farm.drop_next_answer = True
+        self.assertEqual(self.main(), 0, self.stderr.getvalue())
+        self.assertEqual(len(self.farm.posts), 1)
+        record = json.loads((self.challenger / "publish.json").read_text())
+        self.assertTrue(record["farm"]["reconciled"])
+        self.assertEqual(record["version"], "trick-v1.0")
+
+    def test_a_rerun_after_publishing_publishes_nothing_more(self) -> None:
+        self.assertEqual(self.main(), 0)
+        puts = self.r2.puts
+        self.assertEqual(self.main(), 0)
+        self.assertEqual(len(self.farm.posts), 1)  # no trick-v1.1 duplicate
+        self.assertEqual(self.r2.puts, puts)
+        self.assertIn("trick-v1.0: already published", self.stdout.getvalue())
+        record = json.loads((self.challenger / "publish.json").read_text())
+        self.assertTrue(record["farm"]["already_published"])
+
+    def test_a_lost_answer_without_an_insert_stays_an_error(self) -> None:
+        self.farm.fail_next_post = 503
+        self.assertEqual(self.main(), 2)
+        self.assertIn("HTTP 503", self.stderr.getvalue())
+        self.assertIsNone(self.farm.current)
 
 
 class VersionTest(PublishTestCase):
@@ -448,6 +501,45 @@ class RefusalTest(PublishTestCase):
     def assertNothingHappened(self) -> None:
         self.assertEqual(self.r2.objects, {})
         self.assertEqual(self.farm.posts, [])
+
+    def set_canonical_names(self, names: list[str] | None) -> None:
+        path = self.dataset / "dataset_manifest.json"
+        manifest = json.loads(path.read_text())
+        if names is None:
+            del manifest["canonical_names"]
+        else:
+            manifest["canonical_names"] = names
+        path.write_text(json.dumps(manifest))
+
+    def test_uncurated_trick_names_are_never_published(self) -> None:
+        # "corkscrew" trained as an unmapped token: a contributor's free
+        # text, which must not reach the public manifest.
+        self.set_canonical_names(["cork", "gainer"])
+        self.assertEqual(self.main(), 2)
+        self.assertIn("1 of the model's trick names", self.stderr.getvalue())
+        self.assertNotIn("corkscrew", self.logs())
+        self.assertNothingHappened()
+        self.assertEqual(self.farm.calls, 0)
+
+    def test_a_dataset_without_canonical_names_is_refused(self) -> None:
+        self.set_canonical_names(None)
+        self.assertEqual(self.main(), 2)
+        self.assertIn("canonical_names", self.stderr.getvalue())
+        self.assertNothingHappened()
+
+    def test_missing_train_samples_are_counted_not_named(self) -> None:
+        manifest = self.dataset / "manifest.jsonl"
+        lines = manifest.read_text().splitlines()
+        kept = [ln for ln in lines if json.loads(ln)["sample_id"] != self.train_id()]
+        manifest.write_text("\n".join(kept) + "\n")
+        self.assertEqual(self.main(), 2)
+        self.assertIn("1 train samples are not in", self.stderr.getvalue())
+        self.assertNotIn(self.train_id(), self.logs())
+        self.assertNothingHappened()
+
+    def train_id(self) -> str:
+        split = json.loads((self.run_dir / "split.json").read_text())
+        return min(sid for sid, part in split.items() if part == "train")
 
     def test_synthetic_source_ids_are_refused_before_any_side_effect(self) -> None:
         manifest = self.dataset / "manifest.jsonl"
@@ -527,9 +619,14 @@ class HttpTransportTest(PublishTestCase):
             def log_message(self, *args: Any) -> None:
                 pass
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        return self.start(Handler)
+
+    def start(self, handler: type[BaseHTTPRequestHandler]) -> str:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        # Cleanups run last-in first-out: stop serving, join, then close.
+        self.addCleanup(server.server_close)
         self.addCleanup(thread.join)
         self.addCleanup(server.shutdown)
         return f"http://127.0.0.1:{server.server_address[1]}"
@@ -546,6 +643,57 @@ class HttpTransportTest(PublishTestCase):
         farm = FakeFarm(current="trick-v1.0")
         self.assertEqual(self.run_over_http(farm), 0, self.stderr.getvalue())
         self.assertEqual(farm.posts[0]["version"], "trick-v1.1")
+
+    def test_redirects_are_never_followed(self) -> None:
+        # Following one would send the pipeline key to the Location host.
+        seen: list[str | None] = []
+
+        class Elsewhere(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                seen.append(self.headers.get("Authorization"))
+                self.send_response(500)
+                self.end_headers()
+
+            do_POST = do_GET
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        elsewhere = self.start(Elsewhere)
+
+        class Redirect(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/api/models/current":
+                    body = json.dumps({"error": {"code": "NO_MODEL"}}).encode()
+                    self.send_response(404)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.redirect()
+
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.redirect()
+
+            def redirect(self) -> None:
+                self.send_response(302)
+                self.send_header("Location", elsewhere + self.path)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        with mock.patch.dict(os.environ, {"TURNIP_FARM_URL": self.start(Redirect)}):
+            code = publish_model.main(
+                ["--run", str(self.run_dir), "--dataset", str(self.dataset)],
+                store=self.r2,
+                exporter=EXPORT,
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("HTTP 302", self.stderr.getvalue())
+        self.assertEqual(seen, [])
 
     def test_http_error_status_and_code_are_read(self) -> None:
         farm = FakeFarm(current="trick-v1.0", published=("trick-v1.1",))

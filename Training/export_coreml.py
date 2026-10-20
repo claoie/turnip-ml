@@ -64,8 +64,14 @@ PACKAGE_NAME = "TrickDetector.mlpackage"
 INPUT_NAME = "pose"
 OUTPUT_NAME = "window_probs"
 INPUT_CHANNELS = tkp1.KEYPOINT_COUNT * tkp1.CHANNELS + 1  # + gap indicator: 52
-# Default T the runtime pre-allocates for: a 60 s source.
+# Default T the runtime pre-allocates for: a 60 s source (or one window,
+# if a window is longer).
 DEFAULT_FRAMES = 600
+# The classifier head runs in fp32: standardizing divides by feat_std,
+# which can be small enough that fp16 overflows (65504) or keeps too few
+# bits of the quotient. Everything before it (pose values in [0, 1],
+# window means) runs in fp16.
+FP32_OPS = ("standardize_center", "standardize_scale", "logits", "window_probs")
 # coremltools stamps the wall-clock date here; a timestamp breaks the
 # byte-identical artifact, so it is dropped.
 CONVERSION_DATE_KEY = "com.github.apple.coremltools.conversion_date"
@@ -152,7 +158,10 @@ def build_mlmodel(ckpt: dict[str, Any]) -> Any:
     weight = np.asarray(ckpt["W"], dtype=np.float32).T  # [C, 68]
     bias = np.asarray(ckpt["b"], dtype=np.float32)
     mean = np.asarray(ckpt["feat_mean"], dtype=np.float32)
-    std = np.asarray(ckpt["feat_std"], dtype=np.float32)
+    # Multiply by 1 / std (fp32) rather than divide: the converter rewrites
+    # a division by a constant into exactly this multiply, under its own
+    # name, which would drop it out of FP32_OPS.
+    inv_std = (1.0 / np.asarray(ckpt["feat_std"], dtype=np.float64)).astype(np.float32)
     n_xy = 2 * tkp1.KEYPOINT_COUNT
 
     @mb.program(
@@ -188,18 +197,22 @@ def build_mlmodel(ckpt: dict[str, Any]) -> Any:
         )
         feat = mb.concat(values=[pos, speed], axis=1)  # [1, 68, N]
         feat = mb.transpose(x=mb.squeeze(x=feat, axes=[0]), perm=[1, 0])  # [N, 68]
-        feat = mb.real_div(x=mb.sub(x=feat, y=mean), y=std)
-        logits = mb.linear(x=feat, weight=weight, bias=bias)
+        feat = mb.sub(x=feat, y=mean, name="standardize_center")
+        feat = mb.mul(x=feat, y=inv_std, name="standardize_scale")
+        logits = mb.linear(x=feat, weight=weight, bias=bias, name="logits")
         return mb.softmax(x=logits, axis=-1, name=OUTPUT_NAME)
 
+    default = max(DEFAULT_FRAMES, W)
     shape = (
-        ct.RangeDim(lower_bound=W, upper_bound=tkp1.MAX_FRAMES, default=DEFAULT_FRAMES),
+        ct.RangeDim(lower_bound=W, upper_bound=tkp1.MAX_FRAMES, default=default),
         INPUT_CHANNELS,
     )
     return ct.convert(
         program,
         convert_to="mlprogram",
-        compute_precision=ct.precision.FLOAT16,
+        compute_precision=ct.transform.FP16ComputePrecision(
+            op_selector=lambda op: op.name not in FP32_OPS
+        ),
         minimum_deployment_target=ct.target.iOS15,
         inputs=[ct.TensorType(name=INPUT_NAME, shape=shape, dtype=np.float32)],
     )
@@ -266,7 +279,15 @@ def zip_files(files: dict[str, bytes]) -> bytes:
 
 def export(model_path: Path) -> bytes:
     ckpt = load_model(model_path)
-    return zip_files(package_files(build_mlmodel(ckpt), ckpt))
+    try:
+        return zip_files(package_files(build_mlmodel(ckpt), ckpt))
+    except ExportError:
+        raise
+    except Exception as e:
+        # coremltools raises whatever its passes raise (ValueError,
+        # RuntimeError, ...), and a changed package layout is a KeyError:
+        # all of them are a failed export (exit 2), not a traceback.
+        raise ExportError(f"Core ML conversion failed: {type(e).__name__}: {e}") from e
 
 
 def main(argv: list[str] | None = None) -> int:

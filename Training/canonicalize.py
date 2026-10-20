@@ -70,6 +70,11 @@ class Taxonomy:
                 )
         self._lookup = {key: canonical for key, (_, canonical) in best.items()}
 
+    @property
+    def canonical_names(self) -> list[str]:
+        """The curated canonical names at this version, sorted."""
+        return sorted(set(self._lookup.values()))
+
     def canonicalize(self, label: str) -> tuple[list[str], list[str]]:
         """(sorted canonical names, sorted unmapped tokens) for one raw label.
 

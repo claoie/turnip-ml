@@ -39,6 +39,10 @@ read -r TRAIN_RATIO VAL_RATIO HOLDOUT_RATIO <<<"${SPLIT_RATIOS:-0.8 0.1 0.1}"
 SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
 
 mkdir -p "$RUN"
+# A reused local data/run must not carry a previous run's publish record:
+# the summary reports a publish only when this run made one.
+rm -f "$RUN/challenger/publish.json" "$RUN/challenger/publish_request.json" \
+  "$RUN/challenger/TrickDetector.mlpackage.zip"
 
 split_args=(
   --in "$DATASET/manifest.jsonl" --out "$RUN/split.json" --seed 0
@@ -68,7 +72,7 @@ python Training/evaluate.py \
 
 python Training/name_metrics.py \
   --report "$RUN/challenger/holdout_report.json" \
-  --split "$RUN/split.json" --samples-dir "$DATASET/samples" \
+  --metrics "$RUN/challenger/metrics.json" --split "$RUN/split.json" \
   --out "$RUN/challenger/name_metrics.json"
 
 # Fixture gate (§6.3) -> promotion (§8). Not wired: the gate needs fixture

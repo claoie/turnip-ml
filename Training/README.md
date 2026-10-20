@@ -11,7 +11,8 @@ what this repo validates; see the root README for repo-wide conventions.
 - `train.py` — champion training / fine-tuning script (turnip-ml#13).
   Hermetic TOML config, deterministic, CI smoke-tested.
 - `name_metrics.py` — per-name holdout precision/recall plus holdout and
-  train counts, the manifest's `name_metrics` (turnip-ml#41).
+  train counts (from `train.py`'s `metrics.json`), the manifest's
+  `name_metrics` (turnip-ml#41).
 - `export_coreml.py` — exports a trained model to a byte-reproducible fp16
   Core ML `.mlpackage` zip (turnip-ml#16).
 - `publish_model.py` — publishes a promoted champion: export, R2 upload
@@ -145,18 +146,26 @@ python Training/publish_model.py --run data/run --dataset data/dataset
    pinned `taxonomy_version`, and `training_source_ids` (the train split's
    sources). A dataset that isn't the farm's (64-hex source ids) is
    refused before anything is uploaded, so `synthetic` mode can never
-   publish.
+   publish. So is a model whose trick names include one that isn't a
+   curated canonical name (`dataset_manifest.json`'s `canonical_names`):
+   unmapped labels train, but they are contributors' free text and the
+   manifest is public. Map them in the taxonomy first
+   (`unmapped_labels.log` is the queue).
 2. Exports the champion with `export_coreml.py`. The pipeline runs on
    Ubuntu, so the artifact is a `.mlpackage` zip the client compiles on
    device, not a compiled `.mlmodelc` (`docs/MODEL_CONTRACT.md` §2).
 3. Picks the version: the minor bump of the farm's current model, or
    `trick-v1.0` before the first; `--major` or `--version` override it.
+   If the current model already is this artifact (same sha256), an
+   earlier run published it and lost the answer: nothing more is done.
 4. Uploads the artifact and the holdout report under `models/<version>.*`,
    reads each back and checks its sha256. It never overwrites a key that
    holds other bytes.
 5. Calls `POST /api/models` and records the request body and the farm's
    answer in `data/run/challenger/` (`publish_request.json`,
-   `publish.json`).
+   `publish.json`). When the answer is lost (timeout, 5xx), the farm's
+   current model decides whether the insert landed. Requests never follow
+   a redirect, which would carry the pipeline key to another host.
 
 It prints the version, sizes and counts only.
 
