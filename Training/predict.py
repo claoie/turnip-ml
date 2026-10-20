@@ -74,7 +74,15 @@ def predict_split(
     ckpt = train.load_checkpoint(model_path)
     split = train.load_split(split_path)
     samples = load_split_samples(split, samples_dir, split_name)
+    return predict_samples(ckpt, samples)
 
+
+def predict_samples(
+    ckpt: dict[str, Any], samples: list[dict[str, Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    """Segments for keypoints-only samples ({"sample_id", "keypoints",
+    "tricks": []}); every sample gets an entry, empty when nothing fired.
+    Shared with Training/fixture_runner.py."""
     window_frames = int(ckpt["window_frames"])
     window_stride = int(ckpt["window_stride"])
     classes = [str(c) for c in ckpt["classes"]]

@@ -4,22 +4,28 @@
 # pull_request: only on the nightly schedule (from main) or by dispatch.
 #
 # Modes (dispatch input `source`; the schedule always runs `farm`):
-#   synthetic  rehearses the chain on the committed smoke fixture. No
-#              secrets; its run directory is uploaded as an artifact
-#              (synthetic data only).
+#   synthetic  rehearses the chain on the committed smoke fixture and a
+#              generated synthetic fixture set, twice: a first run with no
+#              champion bootstraps one, a second runs the fixture gate and
+#              the promotion gate against it. No secrets; both run
+#              directories are uploaded as an artifact (synthetic data
+#              only).
 #   farm       the real run, from the `training` Environment: count label
 #              rows changed since the stored watermark (skip at 50 or
 #              fewer unless `force`), full pull + pose blobs, the changed-
 #              source list, then the shared chain. Logs and artifacts of
 #              this public repository are public, so nothing per-sample is
 #              printed or uploaded as an artifact: the run directory goes
-#              to the private R2 bucket. The watermark advances only at
-#              the end of a successful run.
+#              to the private R2 bucket. A promoted champion (or a
+#              re-scored one) is stored back to R2. The watermark advances
+#              only at the end of a successful run without a fixture
+#              regression.
 #
-# Both modes then run Training/pipeline.sh: split -> train (fine-tune the
-# champion unless `from_scratch`) -> predict holdout -> evaluate holdout.
-# Explicit stops: the fixture gate needs the fixture runner (#27), so
-# promotion and publishing (#16) don't run yet; no champion changes.
+# Both modes run Training/pipeline.sh: split -> train (fine-tune the
+# champion unless `from_scratch`) -> predict holdout -> evaluate holdout
+# -> fixture runner -> fixture gate -> promotion gate. With no champion
+# yet, nothing is promoted unless a dispatch sets `bootstrap_champion`.
+# Publishing (#16) doesn't run yet.
 #
 # No actions/cache anywhere: pull_request runs can read caches written on
 # main, so nothing derived from contributed data may go into one.
@@ -43,6 +49,10 @@ on:
         description: 'train from scratch instead of fine-tuning the champion'
         type: boolean
         default: false
+      bootstrap_champion:
+        description: 'farm, no champion yet: make this run''s challenger the first champion'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -61,6 +71,13 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.source == 'synthetic'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      HOLDOUT_IDS: data/holdout_ids.txt
+      SPLIT_RATIOS: '0.5 0.25 0.25'
+      FROM_SCRATCH: ${{ inputs.from_scratch || false }}
+      FIXTURES: data/fixtures/fixtures.json
+      FIXTURE_POSES: data/fixtures/poses
+      INGESTED: data/ingested.json
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -72,23 +89,34 @@ jobs:
         run: pip install -r Training/requirements.txt
 
       # source-c (smoke-007/008) pinned to holdout; with 50/25/25 targets
-      # the seeded split puts source-a in train and source-b in val.
-      - name: Synthetic dataset (the committed smoke fixture)
+      # the seeded split puts source-a in train and source-b in val. The
+      # fixture set is synthetic too (make_synthetic_fixtures.py), and no
+      # source changed since any watermark.
+      - name: Synthetic dataset and fixture set
         run: |
           python Training/make_smoke_fixture.py --out data/dataset --seed 0
+          python Training/make_synthetic_fixtures.py --out data/fixtures --seed 0
           echo smoke-008 > data/holdout_ids.txt
+          echo '[]' > data/ingested.json
 
-      - name: Split, train, predict and evaluate
+      - name: 'First run: no champion, so bootstrap one'
         env:
-          HOLDOUT_IDS: data/holdout_ids.txt
-          SPLIT_RATIOS: '0.5 0.25 0.25'
-          FROM_SCRATCH: ${{ inputs.from_scratch || false }}
+          BOOTSTRAP_CHAMPION: 'true'
+        run: |
+          Training/pipeline.sh
+          mv data/run data/run-bootstrap
+          mkdir -p data/champion
+          cp data/run-bootstrap/champion_update/* data/champion/
+
+      - name: 'Second run: fixture gate and promotion against that champion'
         run: Training/pipeline.sh
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: synthetic-run
-          path: data/run
+          path: |
+            data/run-bootstrap
+            data/run
           retention-days: 7
 
   farm:
@@ -105,6 +133,9 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      # The fixture gate's regression alert; the gate records an unset one
+      # as alert_status "not-configured" and still skips promotion.
+      TURNIP_DISCORD_WEBHOOK_URL: ${{ secrets.TURNIP_DISCORD_WEBHOOK_URL }}
       # The aws CLI (preinstalled on the runner) reads R2 state with the
       # same credentials. R2 rejects the CLI's newer default checksums on
       # some versions; "when_required" works with or without that.
@@ -139,8 +170,12 @@ jobs:
 
       # training/state/export_state.json  the watermark (never printed: the
       #                                   cursor may embed raw label text)
-      # training/champion/model.npz       the fine-tune base, if any
+      # training/champion/model.npz       the champion, if any: fine-tune
+      #   .../metrics.json                base, promotion baseline and
+      #   .../fixture_scores.json         recorded fixture scores
       # training/holdout_ids.txt          admin-pinned holdout, if any
+      # training/fixtures/poses/          the fixture set's pose blobs
+      #                                   (verified by the fixture runner)
       - if: steps.config.outputs.configured == 'true'
         name: Restore training state from R2
         run: |
@@ -148,7 +183,7 @@ jobs:
           base="s3://${R2_BUCKET}/training"
           # Fails the job on bad credentials, so "not found" below is real.
           r2 ls "s3://${R2_BUCKET}/" > /dev/null
-          mkdir -p data/state data/champion data/run
+          mkdir -p data/state data/champion data/run data/fixture-poses
           restore() {  # restore <key under training/> <local path>
             if r2 ls "$base/$1" > /dev/null; then
               r2 cp --only-show-errors "$base/$1" "$2"
@@ -159,7 +194,13 @@ jobs:
           }
           restore state/export_state.json data/state/export_state.json
           restore champion/model.npz data/champion/model.npz
+          restore champion/metrics.json data/champion/metrics.json
+          restore champion/fixture_scores.json data/champion/fixture_scores.json
           restore holdout_ids.txt data/holdout_ids.txt
+          if r2 ls "$base/fixtures/poses/" > /dev/null; then
+            r2 cp --recursive --only-show-errors "$base/fixtures/poses/" data/fixture-poses/
+          fi
+          echo "restored $(find data/fixture-poses -type f | wc -l | tr -d ' ') fixture pose blobs"
 
       - if: steps.config.outputs.configured == 'true'
         name: Count label rows changed since the watermark
@@ -184,8 +225,9 @@ jobs:
           python Training/fetch_dataset.py build --out data/dataset --cache data/blob-cache
 
       # Taken after the dataset pull, so it covers every new row the
-      # challenger trains on (TRAINING_DESIGN.md §7); the fixture gate's
-      # --ingested once #27 lands. Its cursor becomes the new watermark.
+      # challenger trains on (TRAINING_DESIGN.md §7): the fixture gate's
+      # --ingested (pipeline.sh's default INGESTED). Its cursor becomes the
+      # new watermark.
       - if: steps.count.outputs.run == 'true'
         name: List the sources changed since the watermark
         run: |
@@ -195,9 +237,10 @@ jobs:
             --out-state data/state/new_state.json --out-sources data/run/ingested.json
 
       - if: steps.count.outputs.run == 'true'
-        name: Split, train, predict and evaluate
+        name: Split, train, evaluate, fixture gate and promotion
         env:
           FROM_SCRATCH: ${{ inputs.from_scratch || false }}
+          BOOTSTRAP_CHAMPION: ${{ inputs.bootstrap_champion || false }}
         run: |
           if [ -f data/holdout_ids.txt ]; then export HOLDOUT_IDS=data/holdout_ids.txt; fi
           Training/pipeline.sh
@@ -210,9 +253,37 @@ jobs:
             "s3://${R2_BUCKET}/training/runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
           echo "recorded training/runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
 
+      # What pipeline.sh staged: model.npz, metrics.json and
+      # fixture_scores.json on promotion or bootstrap, fixture_scores.json
+      # alone after a re-score. Model first, scores last: an upload that
+      # fails partway leaves the old, lower bar, never a false regression.
+      - if: steps.count.outputs.run == 'true'
+        name: Store the champion update in R2
+        run: |
+          update=data/run/champion_update
+          if [ ! -d "$update" ]; then
+            echo "champion unchanged"
+            exit 0
+          fi
+          for f in model.npz metrics.json fixture_scores.json; do
+            if [ -f "$update/$f" ]; then
+              aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+                s3 cp --only-show-errors "$update/$f" "s3://${R2_BUCKET}/training/champion/$f"
+              echo "stored training/champion/$f"
+            fi
+          done
+
+      # Held on a fixture regression: nothing sends quarantine.json to the
+      # farm yet, so tonight's suspect sources are still in the export, and
+      # the next run's changed-source list must still cover them.
       - if: steps.count.outputs.run == 'true'
         name: Advance the watermark
         run: |
+          gate=$(python -c 'import json; print(json.load(open("data/run/outcome.json"))["fixture_gate"])')
+          if [ "$gate" = regression ]; then
+            echo "::warning::Fixture regression: the watermark is held until the suspect sources are quarantined farm-side (data/run/fixture_gate/quarantine.json in this run's R2 record)."
+            exit 0
+          fi
           aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
             s3 cp --only-show-errors data/state/new_state.json \
             "s3://${R2_BUCKET}/training/state/export_state.json"

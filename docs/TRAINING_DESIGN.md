@@ -252,10 +252,15 @@ Nightly pipeline order:
    from-scratch training is the exception: architecture change or
    taxonomy major bump, decided by the maintainer). Val split for model
    selection; holdout never loaded.
-5. Fixture regression gate (§6.3) — challenger vs champion on fixtures.
-   Its quarantine candidates (§7) come from a second
-   `since=<watermark>` pull, taken after step 1's full pull; on
-   completion the watermark advances to that pull's newest cursor.
+5. Fixture regression gate (§6.3) — the fixture runner scores the
+   challenger on the trick-labeled fixture set, and the gate compares
+   that against the champion's recorded fixture scores. Its quarantine
+   candidates (§7) come from a second `since=<watermark>` pull, taken
+   after step 1's full pull; on completion the watermark advances to
+   that pull's newest cursor. The one exception is a regression while
+   nothing delivers the quarantine to the farm yet (§7 step 2): the
+   suspect sources are then still in the export, so the watermark holds
+   and the next run's candidates still cover them.
 6. Holdout evaluation (§6.2) — report written next to the artifact.
 7. Promotion gate (§8) — champion/challenger on the validation metric.
 8. Publish (§9, `MODEL_CONTRACT.md`).
@@ -270,9 +275,11 @@ Further loop properties:
 - **Config:** hermetic TOML; unknown/missing keys fail closed (PR #18).
 - **Compute:** `compute = "cpu"|"gpu"` remains the single GPU-worker
   seam (PR #18); the nightly job targets the GPU worker when available.
-- **Fixture scores** are recorded in the model registry alongside val
-  metrics, so the nightly job compares against the champion's fixture
-  scores without re-running the champion.
+- **Fixture scores** are recorded with the champion when it is
+  promoted, next to its model and val metrics (and in the gate's
+  registry record), so the nightly job compares against the champion's
+  fixture scores without re-running the champion. A change to the
+  fixture set re-scores the champion once (§6.3).
 
 ## 6. Evaluation
 
@@ -337,20 +344,60 @@ estimation is MoveNet's job, and fine-tuning it is off the table
 
 ### 6.3 Fixture regression gate (anti-poisoning)
 
-- **Fixtures:** the existing pose-accuracy fixtures (guarding the
-  *input* to the trick model) **plus** a trick-labeled fixture set —
-  fixed (pose sequence, labeled segments) pairs covering the core
-  vocabulary and known combos. Fixtures are versioned with the repo;
-  adding a fixture is a code change, never data-dependent.
+- **Fixtures:** a trick-labeled fixture set (`Training/fixtures/tricks/`)
+  — fixed (pose sequence, labeled segments) pairs covering the core
+  vocabulary and known combos, plus background-only sequences. The
+  labels are the maintainer's, never inferred from footage or taken
+  from the export, so nothing contributed can move them. The set's
+  `fixtures.json` (labels plus each pose's SHA-256) is versioned with
+  the repo; adding a fixture is a code change, never data-dependent.
+  The pose blobs stay out of git, content-addressed in the private
+  bucket (`training/fixtures/poses/<sha256>.tkp1.gz`), and are verified
+  against their committed hashes before use. The set guards the trick
+  model's *output*. Nothing guards its pose *input* any more: the
+  pose-accuracy fixtures went with the pose-accuracy harness (PR #22),
+  as pose estimation is MoveNet's job (§3).
+- **Fixture runner** (`Training/fixture_runner.py`): runs a model over
+  every fixture exactly as the holdout predictor runs it, and pools two
+  scores over the set. Labeled and predicted segments are matched
+  one-to-one at temporal IoU ≥ 0.5, with the evaluator's greedy
+  best-IoU matching:
+  - `segment_iou` = Σ matched IoU ÷ (labeled + predicted − matched):
+    a missed segment and a spurious one (on a background fixture too)
+    each count as IoU 0.
+  - `name_accuracy` = labeled segments matched with the exact name set
+    ÷ labeled segments. Unlike §6.1's name accuracy given detection, it
+    does not condition on detection, so finding less lowers both
+    scores.
+
+  Its output, `{"fixture_set", "segment_iou", "name_accuracy"}`, is
+  byte-identical on re-run. `fixture_set` is a SHA-256 over the whole
+  set (ids, labels, pose hashes) and the scoring rule, so any fixture
+  change changes it, and the gate refuses to compare scores across it.
 - **Gate:** after training a candidate, run it over the fixtures and
   compare segment IoU + name accuracy against the champion's recorded
-  fixture scores.
+  fixture scores (`Training/fixture_gate.py`).
+- **Recorded champion scores:** a challenger's fixture scores are
+  stored with it when it is promoted (`training/champion/`, next to its
+  model and metrics), so the nightly job never re-runs the champion.
+  When they are missing or carry another `fixture_set` (the set or the
+  scoring rule changed), the pipeline re-scores the champion once and
+  stores the new scores in their place.
+- **First champion:** with no champion there is nothing to compare
+  against, and the nightly path never promotes ungated: the run records
+  the challenger's fixture scores and stops. The maintainer seeds the
+  first champion explicitly (pipeline dispatch `bootstrap_champion`);
+  the gate guards every promotion after it. *(Judgment call: an
+  automatic first champion would be the one promotion nothing checks.)*
+- **Empty set:** until the maintainer adds fixtures, the gate and
+  promotion don't run; the pipeline says so and changes no champion.
 - **Regression policy (judgment call):** regression iff
   `challenger_fixture_score < champion_fixture_score − 0.01` (absolute,
-  on the composite fixture score). Any regression beyond that tolerance
-  triggers the quarantine flow (§7) and skips promotion. No human
-  override exists in the nightly path; the maintainer can re-run with
-  an explicit override flag, which is logged.
+  on the composite fixture score, the mean of the two). Any regression
+  beyond that tolerance triggers the quarantine flow (§7) and skips
+  promotion. No human override exists in the nightly path; the
+  maintainer can re-run with an explicit override flag, which is
+  logged.
 
 ### 6.4 Provenance and rubber-stamping
 
@@ -420,7 +467,9 @@ On fixture regression (master plan §6), in order:
      explicitly, so the alert and the quarantine list are the same. The
      farm inserts one row per id and skips sources already under an
      open quarantine. The farm does not pick sources by time window: it
-     does not know the pipeline's watermark.
+     does not know the pipeline's watermark. *(Not yet implemented: the
+     gate writes the list as `quarantine.json` with the run record, and
+     the watermark holds until it is applied — §5.)*
 3. **Training exclusion:** the export excludes sources with an
    unresolved quarantine row (`resolution IS NULL`) or
    `resolution='purged'`; `resolution='released'` rows are re-included.

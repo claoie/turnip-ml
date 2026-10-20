@@ -84,10 +84,10 @@ def trick_offset(name: str, f: int, start: int, end: int) -> tuple[float, float]
 
 
 def make_sample(
-    rng: random.Random, tricks: list[tuple[str, int, int]]
+    rng: random.Random, tricks: list[tuple[str, int, int]], n_frames: int = FRAMES
 ) -> list[list[list[float]]]:
     frames = []
-    for f in range(FRAMES):
+    for f in range(n_frames):
         frame = []
         for j, (bx, by) in enumerate(BASE_POSE):
             dx = dy = 0.0

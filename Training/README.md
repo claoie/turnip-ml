@@ -11,9 +11,18 @@ what this repo validates; see the root README for repo-wide conventions.
 - `train.py` — champion training / fine-tuning script (turnip-ml#13).
   Hermetic TOML config, deterministic, CI smoke-tested.
 - `make_smoke_fixture.py` — generates the tiny synthetic smoke fixture.
+- `fixture_runner.py` — scores a model on the trick-labeled fixture set
+  and writes the fixture gate's input (turnip-ml#27). See its docstring
+  for the fixture format and the scores.
+- `fixture_gate.py` — fixture regression gate (anti-poisoning).
+- `promote.py` — champion/challenger promotion gate.
+- `make_synthetic_fixtures.py` — generates a synthetic fixture set for
+  the tests and the pipeline's synthetic rehearsal.
 - `config/smoke.toml` — smoke-test hyperparameters (used in CI).
 - `config/full.toml` — full-run template (droplet / GPU worker).
 - `fixtures/smoke/` — tiny synthetic fixture (see its README).
+- `fixtures/tricks/` — the maintainer's trick-labeled fixture set for
+  the fixture gate; ships empty (see its README to add fixtures).
 - `requirements.txt` — pinned training dependencies.
 - `tests/` — unit tests (`python -m unittest discover -s Training/tests -t .`).
 
@@ -99,31 +108,62 @@ The workflow has two modes:
 - **`farm`** (the schedule, or dispatch with `source=farm`) runs from the
   `training` Environment, which holds `vars.TURNIP_FARM_URL` and the secrets
   `TURNIP_PIPELINE_KEY`, `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
-  `R2_SECRET_ACCESS_KEY` and `R2_BUCKET`. Until `TURNIP_FARM_URL` is set it
+  `R2_SECRET_ACCESS_KEY` and `R2_BUCKET`, plus `TURNIP_DISCORD_WEBHOOK_URL`
+  for the fixture gate's regression alert (optional: unset, the gate
+  records the alert as not configured). Until `TURNIP_FARM_URL` is set it
   does nothing. Otherwise:
-  1. restores the watermark, champion and pinned holdout ids from
-     `training/` in R2;
+  1. restores from `training/` in R2: the watermark, the champion
+     (`champion/model.npz`, `metrics.json`, `fixture_scores.json`), the
+     pinned holdout ids and the fixture set's pose blobs
+     (`fixtures/poses/`);
   2. `fetch_dataset.py count`: skips the run at 50 or fewer new label rows
      (dispatch `force` overrides);
   3. `fetch_dataset.py build`: full pull into `data/dataset`;
   4. `fetch_dataset.py count --out-sources`: the changed-source list;
   5. `pipeline.sh` (below);
-  6. records `data/run` under `training/runs/<run id>/` in R2, then
-     advances the watermark.
+  6. records `data/run` under `training/runs/<run id>/` in R2, stores what
+     `pipeline.sh` staged in `data/run/champion_update/` under
+     `training/champion/`, then advances the watermark, except after a
+     fixture regression: nothing sends `quarantine.json` to the farm yet,
+     so the watermark holds and the next run's changed-source list still
+     covers the suspect sources.
 - **`synthetic`** (dispatch default) rehearses the same chain on the smoke
-  fixture, with no secrets, and uploads its run directory as an artifact.
+  fixture and a synthetic fixture set, with no secrets, twice: a first run
+  with no champion bootstraps one, a second runs the fixture gate and the
+  promotion gate against it. Both run directories are uploaded as an
+  artifact.
 
 `Training/pipeline.sh` is the shared chain: `split_dataset.py` →
 `train.py` (`config/pipeline-finetune.toml` when a champion was restored,
 else `config/pipeline.toml`; dispatch `from_scratch` forces the latter) →
-`predict.py` on holdout → `evaluate.py`. It stops before the fixture gate,
-which needs the fixture runner (#27); promotion and publishing (#16) come
-after the gate, so a run changes no champion yet.
+`predict.py` on holdout → `evaluate.py` → `fixture_runner.py` on the
+challenger → `fixture_gate.py` against the champion's recorded fixture
+scores (re-scoring the champion once when they are missing or from another
+fixture set) → `promote.py` if the gate passed. A promoted challenger is
+staged with its fixture scores in `data/run/champion_update/`. Its
+explicit stops, each named in the job summary:
+
+- the fixture set (`fixtures/tricks/`) has no fixtures yet: no gate, no
+  promotion;
+- no champion yet: nothing to compare against, so nothing is promoted
+  unless the maintainer dispatches `bootstrap_champion` (with `force` when
+  there are 50 or fewer new label rows), which makes that run's challenger
+  the first champion;
+- a fixture regression: promotion is skipped;
+- publishing (#16) is not implemented, so a promoted champion becomes the
+  next fine-tune base and gate baseline, but reaches no device yet.
 
 Nothing per-sample reaches the log or an artifact in `farm` mode: this
-repository's logs and artifacts are public. Run it locally the same way:
-put a dataset in `data/dataset/` (`fetch_dataset.py build`, or
-`make_smoke_fixture.py --out data/dataset`) and run `Training/pipeline.sh`.
+repository's logs and artifacts are public, so the gates' decision records
+go to `data/run/` (`fixture_gate/decision.json`, `promotion.json`,
+`registry.json`), not the log. Run it locally the same way: put a dataset
+in `data/dataset/` (`fetch_dataset.py build`, or `make_smoke_fixture.py
+--out data/dataset`), the changed-source list in `data/run/ingested.json`
+(`[]` will do locally; it is required once a champion exists), and run
+`Training/pipeline.sh`. Point `FIXTURES` and `FIXTURE_POSES` at
+`make_synthetic_fixtures.py --out data/fixtures` output
+(`data/fixtures/fixtures.json`, `data/fixtures/poses`) to rehearse the
+gates without the real set.
 
 Swapping the smoke model for the real architecture (temporal conv net over
 the keypoint sequence) is a `build_dataset`/`train_classifier`-level change
