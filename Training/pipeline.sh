@@ -12,10 +12,12 @@
 #                   gate's quarantine candidates (needed once the gate runs)
 #
 # Steps: split -> train (fine-tune the champion unless FROM_SCRATCH=true)
-# -> predict holdout -> evaluate holdout -> score the challenger on the
-# trick-labeled fixture set (fixture_runner.py) -> fixture gate (§6.3)
-# against the champion's recorded fixture scores -> promotion gate (§8)
-# if the fixture gate passed. Everything lands in data/run/.
+# -> predict holdout -> evaluate holdout -> per-name metrics (#41) ->
+# score the challenger on the trick-labeled fixture set (fixture_runner.py)
+# -> fixture gate (§6.3) against the champion's recorded fixture scores ->
+# promotion gate (§8) if the fixture gate passed -> publish (#16: Core ML
+# export, R2 upload, POST /api/models) if it promoted and PUBLISH=true.
+# Everything lands in data/run/.
 #
 # The champion's fixture scores are recorded when it is promoted and kept
 # next to it, so the gate never re-runs the champion. When they are
@@ -32,8 +34,11 @@
 #   - a fixture regression: promotion is skipped, quarantine.json written;
 #   - a champion without metrics.json: the fixture gate runs, the
 #     promotion gate has nothing to compare and does not;
-#   - publishing (#16) does not exist yet: a promoted champion is staged
-#     in data/run/champion_update/ for the workflow to store, not published.
+#   - publishing runs only after a gated promotion, never after a
+#     bootstrap: an ungated model is never published.
+# A promoted (or bootstrapped) champion is staged in data/run/
+# champion_update/ for the workflow to store as the next fine-tune base
+# and gate baseline.
 #
 # Environment:
 #   HOLDOUT_IDS    file of admin-pinned holdout sample ids (optional)
@@ -48,6 +53,10 @@
 #   BOOTSTRAP_CHAMPION  "true" with no champion: promote this challenger
 #                  as the first champion (refused when one exists or the
 #                  fixture set has nothing to score)
+#   PUBLISH        "true" publishes a promoted champion (the workflow's farm
+#                  job; it also needs the farm and R2 variables of
+#                  Training/publish_model.py). Otherwise a promotion is
+#                  recorded but not published.
 #
 # Outputs besides data/run/challenger/ (fixture_scores.json included):
 #   outcome.json          what ran and what it decided (the workflow reads it)
@@ -109,9 +118,12 @@ fi
 
 mkdir -p "$RUN"
 # A fresh slate for this run's decisions (a local data/run is reused, and
-# train.py leaves files it doesn't write in the challenger directory).
+# train.py leaves files it doesn't write in the challenger directory). The
+# summary reports a fixture score or a publish only when this run made one.
 rm -rf "$UPDATE" "$GATE_OUT" "$RUN/champion" "$RUN/promotion.json" \
-  "$RUN/outcome.json" "$RUN/challenger/fixture_scores.json"
+  "$RUN/outcome.json" "$RUN/challenger/fixture_scores.json" \
+  "$RUN/challenger/publish.json" "$RUN/challenger/publish_request.json" \
+  "$RUN/challenger/TrickDetector.mlpackage.zip"
 
 split_args=(
   --in "$DATASET/manifest.jsonl" --out "$RUN/split.json" --seed 0
@@ -138,6 +150,11 @@ python Training/evaluate.py \
   --predictions "$RUN/challenger/holdout_predictions.json" \
   --split "$RUN/split.json" --samples-dir "$DATASET/samples" \
   --out "$RUN/challenger/holdout_report.json"
+
+python Training/name_metrics.py \
+  --report "$RUN/challenger/holdout_report.json" \
+  --metrics "$RUN/challenger/metrics.json" --split "$RUN/split.json" \
+  --out "$RUN/challenger/name_metrics.json"
 
 score_fixtures() { # score_fixtures <model.npz> <out scores>
   python Training/fixture_runner.py score --model "$1" --fixtures "$FIXTURES" \
@@ -254,7 +271,19 @@ set; its new fixture scores are staged in $UPDATE."
     fi
     ;;
 esac
-STOP="$STOP Publishing (#16): not run."
+# Publish (#16) only what both gates passed.
+if [ "$promotion" = promote ] && [ "${PUBLISH:-false}" = true ]; then
+  python Training/publish_model.py --run "$RUN" --dataset "$DATASET"
+  STOP="$STOP Published the promoted champion (#16)."
+elif [ "$promotion" = promote ]; then
+  STOP="$STOP Publishing: not run; PUBLISH is not true (only the farm \
+run publishes)."
+elif [ "$promotion" = bootstrap ]; then
+  STOP="$STOP Publishing: not run; a bootstrapped champion passed no \
+fixture gate, so it is never published (the first gated promotion is)."
+else
+  STOP="$STOP Publishing: not run (nothing was promoted)."
+fi
 if [ -d "$UPDATE" ]; then
   python Training/champion_slot.py manifest "$UPDATE"
 fi
@@ -330,5 +359,13 @@ if promotion in ("promote", "archive"):
     print(f"- Promotion gate: {promotion} on `{decision['metric']}` "
           f"({decision['champion_metric']} -> {decision['challenger_metric']}; "
           f"{decision['reason']})")
+names = load(run / "challenger" / "name_metrics.json")
+scored = sum(1 for m in names.values() if m["precision"] is not None)
+print(f"- Names: {len(names)}, {scored} with enough holdout examples to score")
+publish = run / "challenger" / "publish.json"
+if publish.exists():
+    record = load(publish)
+    print(f"- Published `{record['version']}`: {record['byte_size']} bytes, "
+          f"{record['training_sources']} training sources")
 print(f"\n**Stops.** {stop}")
 EOF

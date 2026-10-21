@@ -85,7 +85,10 @@ Deterministic pipeline per label string:
    (`unmapped_labels.log`) for later taxonomy work. Rationale: failing
    closed on unmapped names would starve early training when the
    vocabulary is still growing; the log feeds the taxonomy curation loop
-   (master plan §9, open question 1).
+   (master plan §9, open question 1). A model trained on an unmapped
+   name is not published, though: the manifest is public and the name
+   is a contributor's free text (`MODEL_CONTRACT.md` §1), so publishing
+   waits until the taxonomy maps it.
 
 Clip → Label shape (decided): the farm stores **one label row per
 `(clip_id, trick_name)`** (`BACKEND_DESIGN.md` §1.1) — one-to-many at
@@ -231,10 +234,15 @@ architecture.
 
 ### 4.3 Post-training conversion
 
-`coremltools` → Core ML (`.mlmodelc`), uploaded to R2; `POST
-/api/models` publishes the champion with its manifest (see
-`MODEL_CONTRACT.md`). Conversion is a pipeline step, not a manual
-action.
+`coremltools` → a Core ML ML Program package (`.mlpackage`, fp16),
+zipped byte-reproducibly and uploaded to R2; `POST /api/models`
+publishes the champion with its manifest (see `MODEL_CONTRACT.md` §2).
+Conversion is a pipeline step, not a manual action
+(`Training/export_coreml.py`, run by `Training/publish_model.py` after
+promotion). The client compiles the package on device: compiling to
+`.mlmodelc` needs macOS, and the pipeline runs on Ubuntu. The §4.1
+baseline exports as a window classifier whose per-window probabilities
+the client decodes into segments (`MODEL_CONTRACT.md` §3.2.1).
 
 ## 5. Training loop
 
@@ -303,7 +311,11 @@ artifact:
   model now knows this trick this well", so a name with fewer than 5
   holdout examples publishes its counts with `null` precision and
   recall rather than a number that small a sample can't support.
-  *(Judgment call on 5.)*
+  *(Judgment call on 5.)* Precision is also `null` for a name the
+  model never predicted on the holdout (0 of 0 is undefined).
+  `Training/name_metrics.py` writes it as `name_metrics.json` next to
+  the holdout report, taking `train_count` from `train.py`'s
+  `metrics.json` (`train_name_counts`), the counts §2.7 trains with.
 - **Background false-positive count** — spurious segments fired in
   unlabeled regions.
 - **By origin** — name accuracy and segment F1 split by label `origin`
@@ -391,8 +403,10 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   against, and the nightly path never promotes ungated: the run records
   the challenger's fixture scores and stops. The maintainer seeds the
   first champion explicitly (pipeline dispatch `bootstrap_champion`);
-  the gate guards every promotion after it. *(Judgment call: an
-  automatic first champion would be the one promotion nothing checks.)*
+  the gate guards every promotion after it. The bootstrapped champion is
+  the fine-tune base and gate baseline but is never published: only a
+  gated promotion is (§8). *(Judgment call: an automatic first champion
+  would be the one promotion nothing checks.)*
 - **Nothing to score:** until the set has a fixture with a labeled
   segment, the gate and promotion don't run, and a bootstrap is refused
   (the first champion needs fixture scores); the pipeline says so and

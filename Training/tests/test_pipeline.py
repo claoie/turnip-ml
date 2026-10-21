@@ -336,6 +336,30 @@ class GatesTest(PipelineTestCase):
         self.assertIn("no fixture scores recorded", result.stderr)
         self.assertIn("re-scored", result.stdout)
 
+    def test_only_a_gated_promotion_is_published(self):
+        # publish_model.py fails without the farm's environment, so a run
+        # that reaches it exits 2: that is how these runs show whether it
+        # was called.
+        with self.subTest("bootstrap"):
+            result = self.ok(BOOTSTRAP_CHAMPION="true", PUBLISH="true")
+            self.assertIn("never published", result.stdout)
+        with self.subTest("archive"):
+            self.seed_champion()
+            result = self.ok(PUBLISH="true")
+            self.assertEqual(self.outcome()["promotion"], "archive")
+            self.assertIn("nothing was promoted", result.stdout)
+        with self.subTest("promote"):
+            shutil.rmtree(self.champion)
+            self.seed_champion(**{"metrics.json": {"val_accuracy": 0.5}})
+            result = self.pipeline(PUBLISH="true")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("publish_model: error: missing environment", result.stderr)
+        with self.subTest("promote without PUBLISH"):
+            result = self.ok()
+            self.assertEqual(self.outcome()["promotion"], "promote")
+            self.assertIn("PUBLISH is not true", result.stdout)
+            self.assertFalse((self.run_dir / "challenger" / "publish.json").exists())
+
     def test_champion_without_metrics_runs_the_gate_only(self):
         self.seed_champion()
         (self.champion / "metrics.json").unlink()

@@ -24,9 +24,10 @@
 #
 # Both modes run Training/pipeline.sh: split -> train (fine-tune the
 # champion unless `from_scratch`) -> predict holdout -> evaluate holdout
-# -> fixture runner -> fixture gate -> promotion gate. With no champion
-# yet, nothing is promoted unless a dispatch sets `bootstrap_champion`.
-# Publishing (#16) doesn't run yet.
+# -> per-name metrics -> fixture runner -> fixture gate -> promotion gate
+# -> publish (#16). With no champion yet, nothing is promoted unless a
+# dispatch sets `bootstrap_champion`. Only a gated promotion is published
+# (never a bootstrap), and only the farm job may publish.
 #
 # No actions/cache anywhere: pull_request runs can read caches written on
 # main, so nothing derived from contributed data may go into one.
@@ -177,9 +178,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # The export set: training plus coremltools for the publish step.
       - if: steps.config.outputs.configured == 'true'
-        name: Install training dependencies
-        run: pip install -r Training/requirements.txt
+        name: Install training + export dependencies
+        run: pip install -r Training/requirements-export.txt
 
       # training/state/export_state.json  the watermark (never printed: the
       #                                   cursor may embed raw label text)
@@ -268,12 +270,17 @@ jobs:
           python Training/fetch_dataset.py count "${state[@]}" \
             --out-state data/state/new_state.json --out-sources data/run/ingested.json
 
+      # PUBLISH: a champion promoted past both gates is published
+      # (Training/publish_model.py, with the job's farm and R2 credentials);
+      # a bootstrapped one is not.
       - if: steps.count.outputs.run == 'true'
         name: Split, train, evaluate, fixture gate and promotion
         env:
           FROM_SCRATCH: ${{ inputs.from_scratch || false }}
           BOOTSTRAP_CHAMPION: ${{ inputs.bootstrap_champion || false }}
           REGISTRY: data/registry.json
+          PUBLISH: 'true'
+          TRAINING_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           if [ -f data/holdout_ids.txt ]; then export HOLDOUT_IDS=data/holdout_ids.txt; fi
           Training/pipeline.sh

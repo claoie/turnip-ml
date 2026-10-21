@@ -228,6 +228,8 @@ class BuildTest(FetchTestCase):
         self.assertEqual(meta["sample_ids"], [SRC_A, SRC_B, SRC_C])
         self.assertNotIn("cache_pruned", meta)  # describes the cache, not the data
         self.assertEqual(meta["taxonomy_version"], 2)
+        # Curated names only: "mystery flip" trains but is no canonical name.
+        self.assertEqual(meta["canonical_names"], ["cork", "gainer", "hook", "scoot"])
         self.assertEqual(meta["export_cursor"], "cur-5")
         log = (self.root / "dataset" / "unmapped_labels.log").read_text(
             encoding="utf-8"
@@ -492,21 +494,21 @@ class HttpTest(unittest.TestCase):
             FARM, 401, "Unauthorized", None, io.BytesIO(b"{}")
         )
         with (
-            mock.patch("urllib.request.urlopen", side_effect=error),
+            mock.patch("fetch_dataset.farm_urlopen", side_effect=error),
             self.assertRaisesRegex(FetchError, "HTTP 401"),
         ):
             fetch_dataset.http_get_json(FARM, {})
 
     def test_transport_failures_and_bad_json(self):
         with (
-            mock.patch("urllib.request.urlopen", side_effect=TimeoutError()),
+            mock.patch("fetch_dataset.farm_urlopen", side_effect=TimeoutError()),
             self.assertRaisesRegex(FetchError, "TimeoutError"),
         ):
             fetch_dataset.http_get_json(FARM, {})
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b"not json"
         with (
-            mock.patch("urllib.request.urlopen", return_value=response),
+            mock.patch("fetch_dataset.farm_urlopen", return_value=response),
             self.assertRaises(FetchError),
         ):
             fetch_dataset.http_get_json(FARM, {})

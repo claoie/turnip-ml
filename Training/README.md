@@ -10,6 +10,13 @@ what this repo validates; see the root README for repo-wide conventions.
   `source_id` (turnip-ml#12). See its docstring for the full contract.
 - `train.py` — champion training / fine-tuning script (turnip-ml#13).
   Hermetic TOML config, deterministic, CI smoke-tested.
+- `name_metrics.py` — per-name holdout precision/recall plus holdout and
+  train counts (from `train.py`'s `metrics.json`), the manifest's
+  `name_metrics` (turnip-ml#41).
+- `export_coreml.py` — exports a trained model to a byte-reproducible fp16
+  Core ML `.mlpackage` zip (turnip-ml#16).
+- `publish_model.py` — publishes a promoted champion: export, R2 upload
+  with read-back hash checks, `POST /api/models` (turnip-ml#16).
 - `make_smoke_fixture.py` — generates the tiny synthetic smoke fixture.
 - `fixture_runner.py` — scores a model on the trick-labeled fixture set
   and writes the fixture gate's input (turnip-ml#27); also the one place
@@ -28,6 +35,8 @@ what this repo validates; see the root README for repo-wide conventions.
 - `fixtures/tricks/` — the maintainer's trick-labeled fixture set for
   the fixture gate; ships empty (see its README to add fixtures).
 - `requirements.txt` — pinned training dependencies.
+- `requirements-export.txt` — `requirements.txt` plus pinned `coremltools`
+  for the export.
 - `tests/` — unit tests (`python -m unittest discover -s Training/tests -t .`).
 
 ## Determinism contract
@@ -75,7 +84,10 @@ python Training/train.py --config Training/config/smoke.toml
   covering at least half of it, else `background`. A segment carrying N
   names labels the window `"a+b"` (sorted) — `is_combo` is derived from the
   `"+"`, per the model output contract (master plan): source-frame
-  coordinates, one segment with N names.
+  coordinates, one segment with N names. Segments come from
+  `evaluate.ground_truth_segments` (one per distinct window, with every
+  name labeled on it), the same ground truth the holdout evaluation
+  scores against.
 - **Model (smoke).** Softmax linear classifier over per-joint mean position
   + mean speed, trained with full-batch gradient descent (seeded). The
   architecture is deliberately tiny: the smoke test proves the pipeline
@@ -148,13 +160,14 @@ The workflow has two modes:
 `Training/pipeline.sh` is the shared chain: `split_dataset.py` →
 `train.py` (`config/pipeline-finetune.toml` when a champion was restored,
 else `config/pipeline.toml`; dispatch `from_scratch` forces the latter) →
-`predict.py` on holdout → `evaluate.py` → `fixture_runner.py` on the
-challenger → `fixture_gate.py` against the champion's recorded fixture
-scores (re-scoring the champion once when they are missing or from another
-fixture set) → `promote.py` if the gate passed. A promoted challenger is
-staged with its fixture scores in `data/run/champion_update/`, as a whole
-slot with its manifest (a re-score stages the champion's own files with
-the new scores). Both gates append to the decision log (`REGISTRY`,
+`predict.py` on holdout → `evaluate.py` → `name_metrics.py` →
+`fixture_runner.py` on the challenger → `fixture_gate.py` against the
+champion's recorded fixture scores (re-scoring the champion once when they
+are missing or from another fixture set) → `promote.py` if the gate passed
+→ `publish_model.py` if it promoted, in `farm` mode only (`PUBLISH=true`).
+A promoted challenger is staged with its fixture scores in
+`data/run/champion_update/`, as a whole slot with its manifest (a re-score
+stages the champion's own files with the new scores). Both gates append to the decision log (`REGISTRY`,
 default `Training/registry.json`). Its explicit stops, each named in the
 job summary:
 
@@ -168,8 +181,47 @@ job summary:
 - a fixture regression: promotion is skipped;
 - a champion without `metrics.json`: the fixture gate runs, but the
   promotion gate has nothing to compare against and does not;
-- publishing (#16) is not implemented, so a promoted champion becomes the
-  next fine-tune base and gate baseline, but reaches no device yet.
+- publishing follows a gated promotion only: a bootstrapped champion
+  passed no fixture gate, so it becomes the fine-tune base and gate
+  baseline but is never published; the first gated promotion is.
+
+## Publishing a champion
+
+```sh
+python Training/publish_model.py --run data/run --dataset data/dataset
+```
+
+`publish_model.py` reads the farm and R2 settings from the environment
+(the `farm` variables above, plus optional `TRAINING_RUN_ID` and
+`MIN_CLIENT_VERSION`) and, in this order:
+
+1. Builds the whole `POST /api/models` body first: the descriptors of the
+   exported model, `val_metrics`, `name_metrics.json`, the dataset's
+   pinned `taxonomy_version`, and `training_source_ids` (the train split's
+   sources). A dataset that isn't the farm's (64-hex source ids) is
+   refused before anything is uploaded, so `synthetic` mode can never
+   publish. So is a model whose trick names include one that isn't a
+   curated canonical name (`dataset_manifest.json`'s `canonical_names`):
+   unmapped labels train, but they are contributors' free text and the
+   manifest is public. Map them in the taxonomy first
+   (`unmapped_labels.log` is the queue).
+2. Exports the champion with `export_coreml.py`. The pipeline runs on
+   Ubuntu, so the artifact is a `.mlpackage` zip the client compiles on
+   device, not a compiled `.mlmodelc` (`docs/MODEL_CONTRACT.md` §2).
+3. Picks the version: the minor bump of the farm's current model, or
+   `trick-v1.0` before the first; `--major` or `--version` override it.
+   If the current model already is this artifact (same sha256), an
+   earlier run published it and lost the answer: nothing more is done.
+4. Uploads the artifact and the holdout report under `models/<version>.*`,
+   reads each back and checks its sha256. It never overwrites a key that
+   holds other bytes.
+5. Calls `POST /api/models` and records the request body and the farm's
+   answer in `data/run/challenger/` (`publish_request.json`,
+   `publish.json`). When the answer is lost (timeout, 5xx), the farm's
+   current model decides whether the insert landed. Requests never follow
+   a redirect, which would carry the pipeline key to another host.
+
+It prints the version, sizes and counts only.
 
 Nothing per-sample reaches the log or an artifact in `farm` mode: this
 repository's logs and artifacts are public, so the gates' decision records
