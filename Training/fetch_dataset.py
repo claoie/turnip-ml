@@ -32,8 +32,9 @@ build --out DIR --cache DIR
       samples/<source_id>.json  train.py's sample format: sample_id (the
                                 source id), fps 10, keypoints
                                 [frame][17][x, y, confidence] (gap frames
-                                kept as zeros), and one trick entry per
-                                (clip, canonical name) on the clip window
+                                kept as zeros), one trick entry per
+                                (clip, canonical name) on the clip window,
+                                and the label provenance (below)
       manifest.jsonl            {"sample_id", "source_id"} per sample, the
                                 split_dataset.py input (splits group by
                                 source)
@@ -49,6 +50,24 @@ build --out DIR --cache DIR
     A label that canonicalizes to no name at all (only parentheticals or
     delimiters) contributes nothing; a clip left without names is dropped.
 
+Provenance
+----------
+Every export row carries its label's provenance (BACKEND_DESIGN.md
+§1.2.18, TRAINING_DESIGN.md §1): `origin` ("typed", "vocabulary" or
+"model"), and the clip's `proposal_model_version` (null for the heuristic
+detector or a manual clip), `suggested_names` (the names that model
+pre-filled, or on a blind clip would have; [] when none) and
+`suggestions_withheld` (the clip is in the blind sample). All four are
+required. A sample carries them as the farm sent them:
+  tricks[].origins   the sorted distinct origins of the clip's raw labels
+                     that canonicalized to this entry's name: one, unless
+                     two raw labels with different origins merged
+  clips              {clip_id: {"proposal_model_version",
+                     "suggested_names", "suggestions_withheld"}} for each
+                     clip with a trick entry; suggested_names verbatim, in
+                     the farm's order, not canonicalized
+Nothing here reads them yet; TRAINING_DESIGN.md §6.4 is what will.
+
 Environment (never argv: values would land in process lists and CI logs)
 -----------
 TURNIP_FARM_URL       farm base URL (https; http only for localhost)
@@ -59,9 +78,9 @@ R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
 Privacy: training data carries no account identifier. The farm exports
 none, and an export row that carries a user_id is refused rather than
 passed along. Stdout and stderr carry counts only, never raw labels,
-cursors or pose values; CI logs of this public repository are public. The
-dataset and the blob cache belong under data/ (gitignored) and must never
-be uploaded as a CI artifact or cache.
+provenance values, cursors or pose values; CI logs of this public
+repository are public. The dataset and the blob cache belong under data/
+(gitignored) and must never be uploaded as a CI artifact or cache.
 
 Determinism: rows are re-sorted after the pull (keyset pages split sources
 arbitrarily), JSON keys are sorted, float32 pose values are written
@@ -72,7 +91,14 @@ Fail closed: a malformed page or row (including one carrying a user_id),
 rows that disagree about a source or
 clip, a duplicate label row, a stuck or cycling cursor, a clip window
 outside its pose sequence, a checksum mismatch or an undecodable blob are
-errors (exit 2), never skipped.
+errors (exit 2), never skipped. For provenance, malformed means: a field
+missing; an origin outside the three; a proposal_model_version that is
+neither null nor a non-empty string; suggested_names that is not a list
+of non-empty strings; a suggestions_withheld that is not a boolean;
+suggested names or a blind clip without a proposal_model_version (the
+farm's clips_suggestions_need_model CHECK); or origin "model" on a clip
+with no proposal_model_version or with suggestions_withheld (both refused
+by POST /api/clips, BACKEND_DESIGN.md §7.3).
 """
 
 from __future__ import annotations
@@ -112,6 +138,9 @@ PIPELINE_KEY_ENV = "TURNIP_PIPELINE_KEY"
 R2_ENV = ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET")
 
 HEX64_RE = re.compile(r"[0-9a-f]{64}")
+# A label's origin (BACKEND_DESIGN.md §1.2.18): typed by hand, picked from
+# the vocabulary's suggestions, or pre-filled by the trick model and kept.
+ORIGINS = ("typed", "vocabulary", "model")
 # The only files the blob cache writes, under <cache>/poses/.
 CACHE_ENTRY_RE = re.compile(r"([0-9a-f]{64})\.tkp1\.gz(\.tmp)?")
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
@@ -134,6 +163,11 @@ class LabelRow:
     end_frame: int
     trick_name: str
     taxonomy_version: int
+    origin: str
+    # The clip's provenance, repeated on each of its label rows.
+    proposal_model_version: str | None
+    suggested_names: tuple[str, ...]
+    suggestions_withheld: bool
 
 
 @dataclass(frozen=True)
@@ -164,6 +198,10 @@ def parse_row(i: int, row: Any) -> LabelRow:
         "end_frame",
         "trick_name",
         "taxonomy_version",
+        "origin",
+        "proposal_model_version",
+        "suggested_names",
+        "suggestions_withheld",
     }
     if not isinstance(row, dict) or not fields <= set(row):
         raise FetchError(f"export row {i} is missing fields")
@@ -195,6 +233,41 @@ def parse_row(i: int, row: Any) -> LabelRow:
     version = row["taxonomy_version"]
     if not (_is_int(version) and version >= 1):
         raise FetchError(f"export row {i}: taxonomy_version must be an integer >= 1")
+    # Provenance (BACKEND_DESIGN.md §1.2.18). Errors name the field, never
+    # the value: a suggested name is label text.
+    origin = row["origin"]
+    if not isinstance(origin, str) or origin not in ORIGINS:
+        raise FetchError(f"export row {i}: origin must be one of {', '.join(ORIGINS)}")
+    model_version = row["proposal_model_version"]
+    if model_version is not None and not (
+        isinstance(model_version, str) and model_version
+    ):
+        raise FetchError(
+            f"export row {i}: proposal_model_version must be a non-empty string or null"
+        )
+    suggested = row["suggested_names"]
+    if not isinstance(suggested, list) or not all(
+        isinstance(n, str) and n for n in suggested
+    ):
+        raise FetchError(
+            f"export row {i}: suggested_names must be a list of non-empty strings"
+        )
+    withheld = row["suggestions_withheld"]
+    if not isinstance(withheld, bool):
+        raise FetchError(f"export row {i}: suggestions_withheld must be a boolean")
+    # The farm's clips_suggestions_need_model CHECK: suggested names and the
+    # blind sample both need the model that proposed them.
+    if model_version is None and (suggested or withheld):
+        raise FetchError(
+            f"export row {i}: suggested_names or suggestions_withheld without a "
+            "proposal_model_version"
+        )
+    # POST /api/clips refuses these (BACKEND_DESIGN.md §7.3): a kept
+    # suggestion needs a model that proposed it and showed it.
+    if origin == "model" and (model_version is None or withheld):
+        raise FetchError(
+            f"export row {i}: origin model on a clip whose model showed no names"
+        )
     return LabelRow(
         source_id=source_id,
         r2_key=row["r2_key"],
@@ -204,6 +277,10 @@ def parse_row(i: int, row: Any) -> LabelRow:
         end_frame=end,
         trick_name=name,
         taxonomy_version=version,
+        origin=origin,
+        proposal_model_version=model_version,
+        suggested_names=tuple(suggested),
+        suggestions_withheld=withheld,
     )
 
 
@@ -446,6 +523,15 @@ def r2_getter_from_env() -> BlobGetter:
 # -- dataset -------------------------------------------------------------------
 
 
+def _clip_provenance(row: LabelRow) -> dict[str, Any]:
+    """The clip-level provenance a row repeats, as the sample carries it."""
+    return {
+        "proposal_model_version": row.proposal_model_version,
+        "suggested_names": list(row.suggested_names),
+        "suggestions_withheld": row.suggestions_withheld,
+    }
+
+
 def _group(rows: list[LabelRow]) -> dict[str, dict[str, list[LabelRow]]]:
     """source_id -> clip_id -> rows, checking per-source/per-clip agreement."""
     sources: dict[str, dict[str, list[LabelRow]]] = {}
@@ -465,6 +551,8 @@ def _group(rows: list[LabelRow]) -> dict[str, dict[str, list[LabelRow]]]:
             row.end_frame,
         ):
             raise FetchError(f"rows for clip {row.clip_id} disagree on its window")
+        if clip_rows and _clip_provenance(clip_rows[0]) != _clip_provenance(row):
+            raise FetchError(f"rows for clip {row.clip_id} disagree on its provenance")
         clip_rows.append(row)
     # A clip id belongs to exactly one source.
     owners = Counter(clip for clips in sources.values() for clip in clips)
@@ -537,6 +625,7 @@ def _write_dataset(
         except tkp1.Tkp1Error as e:
             raise FetchError(f"{first.r2_key}: {e}") from e
         tricks: list[dict[str, Any]] = []
+        provenance: dict[str, dict[str, Any]] = {}
         for clip_id, rows in clips.items():
             start, end = rows[0].start_frame, rows[0].end_frame
             if end > pose.frame_count:
@@ -544,10 +633,12 @@ def _write_dataset(
                     f"clip {clip_id} ends at frame {end}, past the "
                     f"{pose.frame_count}-frame pose sequence"
                 )
-            names: set[str] = set()
+            # canonical name -> the origins of the raw labels that gave it.
+            names: dict[str, set[str]] = {}
             for row in rows:
                 canonical, tokens = taxonomy.canonicalize(row.trick_name)
-                names.update(canonical)
+                for n in canonical:
+                    names.setdefault(n, set()).add(row.origin)
                 unmapped.update(tokens)
             if not names:
                 clips_dropped += 1
@@ -556,9 +647,16 @@ def _write_dataset(
             # one window. Read them through evaluate.ground_truth_segments,
             # which merges each window into one multi-name segment.
             tricks.extend(
-                {"clip_id": clip_id, "name": n, "start_frame": start, "end_frame": end}
+                {
+                    "clip_id": clip_id,
+                    "name": n,
+                    "origins": sorted(names[n]),
+                    "start_frame": start,
+                    "end_frame": end,
+                }
                 for n in sorted(names)
             )
+            provenance[clip_id] = _clip_provenance(rows[0])
         tricks.sort(
             key=lambda t: (t["start_frame"], t["end_frame"], t["clip_id"], t["name"])
         )
@@ -567,6 +665,7 @@ def _write_dataset(
             "fps": FPS,
             "keypoints": pose.keypoints,
             "tricks": tricks,
+            "clips": provenance,
         }
         path = staging / "samples" / f"{source_id}.json"
         path.write_text(_dump(sample), encoding="utf-8")

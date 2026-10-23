@@ -29,6 +29,9 @@ Sample JSON format (one file per sample in samples_dir):
    "keypoints": [[[x, y, score] * 17] * n_frames],  # MoveNet-17 order
    "tricks": [{"name": ..., "start_frame": ..., "end_frame": ...,
                "clip_id": ...?}]}
+fetch_dataset.py also writes label provenance (tricks[].origins and a
+top-level "clips"); training does not read it yet, and samples without
+it (the smoke fixture) load the same.
 The tricks become segments through evaluate.ground_truth_segments, the
 rule the holdout evaluation scores against: one segment per distinct
 window with every name labeled on it. Multi-name segments label the

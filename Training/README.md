@@ -6,6 +6,9 @@ what this repo validates; see the root README for repo-wide conventions.
 
 ## Layout
 
+- `fetch_dataset.py` — builds the dataset from the farm's label export and
+  the R2 pose blobs (`count` and `build`). See its docstring for the full
+  contract.
 - `split_dataset.py` — deterministic train/val/holdout splitter grouped by
   `source_id` (turnip-ml#12). See its docstring for the full contract.
 - `train.py` — champion training / fine-tuning script (turnip-ml#13).
@@ -46,6 +49,29 @@ the artifact: the same manifest + seed + Python interpreter version always
 yields the byte-identical output. No timestamps, no unseeded RNG, no
 dependence on input order. A training run that cannot be reproduced
 byte-for-byte on the same interpreter is a bug.
+
+## The dataset
+
+`fetch_dataset.py build` writes one `samples/<source_id>.json` per source:
+the pose keypoints at 10 Hz and one `tricks` entry per (clip, canonical
+name) on the clip's window, plus `manifest.jsonl` (the splitter's input)
+and `dataset_manifest.json`. Samples also carry each label's provenance
+(`docs/TRAINING_DESIGN.md` §1, §6.4):
+
+- `tricks[].origins` — how the name was given: `typed`, `vocabulary` or
+  `model` (a model suggestion the user kept). Sorted; more than one only
+  when two raw labels with different origins canonicalize to the same
+  name.
+- `clips` — per clip id, the clip's `proposal_model_version` (`null` for
+  the heuristic detector or a manual clip), `suggested_names` (what that
+  model pre-filled, or on a blind clip would have, verbatim; `[]` when
+  none) and `suggestions_withheld` (the clip is in the blind sample).
+
+All four export fields are required and validated against the farm's
+schema; a missing or malformed one fails the build (exit 2). Nothing reads
+the provenance yet: turnip-ml#40 adds the rubber-stamp measures and the
+down-weighting. The smoke fixture carries none, as `train.py`'s sample
+format does not require it.
 
 ## Splitting a manifest
 

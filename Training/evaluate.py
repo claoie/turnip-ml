@@ -22,6 +22,7 @@ Inputs
                 clip_id may be absent; when present it must be a non-empty
                 string (null is refused). Entries on one window are one
                 segment carrying all their names (see "Ground truth").
+                Label provenance (fetch_dataset.py) is ignored here.
 --out           report path. Defaults to "holdout_report.json" next to the
                 predictions file (i.e. next to the model artifact).
 --iou-threshold temporal-IoU threshold for a detection. Default 0.5.

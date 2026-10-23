@@ -19,8 +19,11 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import evaluate
 import fetch_dataset
+import predict
 import tkp1
+import train
 from fetch_dataset import EXIT_ERROR, EXIT_OK, BlobCache, ExportClient, FetchError
 
 FARM = "https://farm.example"
@@ -68,18 +71,38 @@ def row(source, clip, name, start=5, end=15, version=1, **overrides):
         "end_frame": end,
         "trick_name": name,
         "taxonomy_version": version,
+        # The farm's defaults: a typed name on a heuristic or manual clip.
+        "origin": "typed",
+        "proposal_model_version": None,
+        "suggested_names": [],
+        "suggestions_withheld": False,
     }
     data.update(overrides)
     return data
 
 
+MODEL = "trick-v1.2"
+WITH_MODEL = {"proposal_model_version": MODEL}
+# Clip 1: the model pre-filled two names; the user kept one, removed the
+# other and typed a combo. Clip 2: a blind clip, named from the vocabulary.
+PROPOSED = {
+    "proposal_model_version": MODEL,
+    "suggested_names": ["gainer", "cork"],
+    "suggestions_withheld": False,
+}
+BLIND = {
+    "proposal_model_version": MODEL,
+    "suggested_names": ["cork"],
+    "suggestions_withheld": True,
+}
+
 # Export order is the farm's cursor order, which interleaves sources.
 ROWS = [
     row(SRC_B, 3, "Cork"),
-    row(SRC_A, 1, "hook - scoot (combo)", 20, 30, version=2),
+    row(SRC_A, 1, "hook - scoot (combo)", 20, 30, version=2, **PROPOSED),
     row(SRC_C, 5, "Mystery Flip", 0, 40),
-    row(SRC_A, 1, "Gainer", 20, 30),
-    row(SRC_A, 2, "corkscrew"),
+    row(SRC_A, 1, "Gainer", 20, 30, origin="model", **PROPOSED),
+    row(SRC_A, 2, "corkscrew", origin="vocabulary", **BLIND),
     row(SRC_B, 4, "(combo)", 30, 35),
 ]
 
@@ -185,7 +208,7 @@ class BuildTest(FetchTestCase):
         )
         a = self.sample(SRC_A)
         self.assertEqual(a["sample_id"], SRC_A)
-        self.assertEqual(set(a), {"sample_id", "fps", "keypoints", "tricks"})
+        self.assertEqual(set(a), {"sample_id", "fps", "keypoints", "tricks", "clips"})
         self.assertEqual(a["fps"], 10)
         self.assertEqual(len(a["keypoints"]), 40)
         self.assertEqual(len(a["keypoints"][0]), 17)
@@ -210,6 +233,99 @@ class BuildTest(FetchTestCase):
             [t["clip_id"] for t in self.sample(SRC_B)["tricks"]], [CLIP[3]]
         )
         self.assertEqual(self.sample(SRC_C)["tricks"][0]["name"], "mystery flip")
+
+    def test_samples_carry_provenance(self):
+        self.build()
+        a, b = self.sample(SRC_A), self.sample(SRC_B)
+        # Each name keeps the origin of the raw label it came from; a combo
+        # label's origin covers every name it canonicalizes to.
+        self.assertEqual(
+            [(t["clip_id"], t["name"], t["origins"]) for t in a["tricks"]],
+            [
+                (CLIP[2], "cork", ["vocabulary"]),
+                (CLIP[1], "gainer", ["model"]),
+                (CLIP[1], "hook", ["typed"]),
+                (CLIP[1], "scoot", ["typed"]),
+            ],
+        )
+        # Clip-level provenance once per clip, as the farm sent it: the
+        # suggested names verbatim and in order, the removed "cork" included.
+        self.assertEqual(a["clips"], {CLIP[1]: PROPOSED, CLIP[2]: BLIND})
+        # The farm's defaults are carried too; the dropped clip 4 is not.
+        self.assertEqual(
+            b["clips"],
+            {
+                CLIP[3]: {
+                    "proposal_model_version": None,
+                    "suggested_names": [],
+                    "suggestions_withheld": False,
+                }
+            },
+        )
+        self.assertEqual(b["tricks"][0]["origins"], ["typed"])
+
+    def test_merged_names_keep_every_origin(self):
+        # Two raw labels on one clip canonicalize to "cork": the entry lists
+        # both origins, sorted; the policy for that is TRAINING_DESIGN.md
+        # §6.4's, not the dataset's.
+        rows = [
+            row(SRC_A, 1, "corkscrew", origin="model", **PROPOSED),
+            row(SRC_A, 1, "cork", origin="typed", **PROPOSED),
+            row(SRC_A, 1, "Gainer", origin="vocabulary", **PROPOSED),
+        ]
+        self.build(FakeExport(rows))
+        self.assertEqual(
+            [(t["name"], t["origins"]) for t in self.sample(SRC_A)["tricks"]],
+            [("cork", ["model", "typed"]), ("gainer", ["vocabulary"])],
+        )
+
+    def test_legitimate_provenance_is_accepted(self):
+        # Every shape the farm can export: a model-proposed window with no
+        # names above the pre-fill bar, blind or not; a typed name on a
+        # blind clip; a heuristic clip.
+        cases = {
+            "window-only": WITH_MODEL,
+            "blind-window-only": {**WITH_MODEL, "suggestions_withheld": True},
+            "typed-on-blind": BLIND,
+            "kept-suggestion": {"origin": "model", **PROPOSED},
+            "heuristic": {},
+        }
+        for name, provenance in cases.items():
+            with self.subTest(case=name):
+                self.build(FakeExport([row(SRC_A, 1, "cork", **provenance)]), out=name)
+                self.assertEqual(
+                    self.sample(SRC_A, out=name)["clips"][CLIP[1]],
+                    {
+                        "proposal_model_version": provenance.get(
+                            "proposal_model_version"
+                        ),
+                        "suggested_names": provenance.get("suggested_names", []),
+                        "suggestions_withheld": provenance.get(
+                            "suggestions_withheld", False
+                        ),
+                    },
+                )
+
+    def test_consumers_load_the_samples(self):
+        # train.py, predict.py and evaluate.py read fetch_dataset's samples,
+        # provenance and all.
+        self.build()
+        samples = self.root / "dataset" / "samples"
+        split = {SRC_A: "train", SRC_B: "val", SRC_C: "holdout"}
+        train_samples, val_samples = train.load_samples(samples, split)
+        self.assertEqual(
+            [s["sample_id"] for s in train_samples + val_samples], [SRC_A, SRC_B]
+        )
+        gt = evaluate.load_ground_truth(samples, sorted(split))
+        self.assertEqual(
+            gt[SRC_A],
+            [
+                (5, 15, frozenset({"cork"})),
+                (20, 30, frozenset({"gainer", "hook", "scoot"})),
+            ],
+        )
+        [holdout] = predict.load_split_samples(split, samples, "holdout")
+        self.assertEqual(holdout["sample_id"], SRC_C)
 
     def test_manifests(self):
         self.build()
@@ -404,6 +520,49 @@ class RowValidationTest(FetchTestCase):
         del missing["blob_sha256"]
         self.assert_build_refused([missing])
 
+    def test_malformed_provenance(self):
+        cases = {
+            "origin-unknown": {"origin": "suggested"},
+            "origin-cased": {"origin": "Typed"},
+            "origin-null": {"origin": None},
+            "origin-list": {"origin": ["typed"]},
+            "version-empty": {"proposal_model_version": ""},
+            "version-int": {"proposal_model_version": 12},
+            "names-null": {"suggested_names": None},
+            "names-string": {"suggested_names": "cork", **WITH_MODEL},
+            "names-int-element": {"suggested_names": [1], **WITH_MODEL},
+            "names-null-element": {"suggested_names": [None], **WITH_MODEL},
+            "names-empty-element": {"suggested_names": [""], **WITH_MODEL},
+            "withheld-null": {"suggestions_withheld": None},
+            "withheld-int": {"suggestions_withheld": 0},
+            "withheld-string": {"suggestions_withheld": "false"},
+            # The farm's clips_suggestions_need_model CHECK.
+            "names-without-model": {"suggested_names": ["cork"]},
+            "blind-without-model": {"suggestions_withheld": True},
+            # POST /api/clips refuses a kept suggestion nobody was shown.
+            "model-origin-without-model": {"origin": "model"},
+            "model-origin-on-blind": {"origin": "model", **BLIND},
+        }
+        for name, provenance in cases.items():
+            with self.subTest(case=name):
+                self.assert_build_refused([row(SRC_A, 1, "cork", **provenance)])
+        for field in (
+            "origin",
+            "proposal_model_version",
+            "suggested_names",
+            "suggestions_withheld",
+        ):
+            with self.subTest(missing=field):
+                missing = row(SRC_A, 1, "cork")
+                del missing[field]
+                self.assert_build_refused([missing])
+
+    def test_malformed_provenance_fails_count_too(self):
+        export = FakeExport([row(SRC_A, 1, "cork", origin="suggested")])
+        argv = ["count", "--out-state", str(self.root / "o")]
+        self.assertEqual(fetch_dataset.main(argv, transport=export), EXIT_ERROR)
+        self.assertFalse((self.root / "o").exists())
+
     def test_rows_that_disagree(self):
         cases = {
             "source-blob": [
@@ -413,6 +572,28 @@ class RowValidationTest(FetchTestCase):
             "clip-window": [row(SRC_A, 1, "cork", 5, 15), row(SRC_A, 1, "hook", 5, 16)],
             "duplicate-label": [row(SRC_A, 1, "cork"), row(SRC_A, 1, "cork")],
             "clip-two-sources": [row(SRC_A, 1, "cork"), row(SRC_B, 1, "hook")],
+            # A clip's provenance is one clips row, repeated on each label.
+            "clip-model-version": [
+                row(SRC_A, 1, "cork", **PROPOSED),
+                row(SRC_A, 1, "hook", **{**PROPOSED, "proposal_model_version": "v2"}),
+            ],
+            "clip-suggested-names": [
+                row(SRC_A, 1, "cork", **PROPOSED),
+                row(SRC_A, 1, "hook", **{**PROPOSED, "suggested_names": ["gainer"]}),
+            ],
+            "clip-suggested-order": [
+                row(SRC_A, 1, "cork", **PROPOSED),
+                row(
+                    SRC_A,
+                    1,
+                    "hook",
+                    **{**PROPOSED, "suggested_names": ["cork", "gainer"]},
+                ),
+            ],
+            "clip-withheld": [
+                row(SRC_A, 1, "cork", **PROPOSED),
+                row(SRC_A, 1, "hook", **{**PROPOSED, "suggestions_withheld": True}),
+            ],
         }
         for name, rows in cases.items():
             with self.subTest(case=name):
@@ -604,8 +785,28 @@ class MainTest(FetchTestCase):
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(json.loads(self.stdout.getvalue())["samples"], 3)
         output = self.stdout.getvalue() + self.stderr.getvalue()
-        for secret in ("Mystery", "corkscrew", "cur-", KEY):
+        for secret in ("Mystery", "corkscrew", "cur-", KEY, MODEL, "vocabulary"):
             self.assertNotIn(secret, output)
+
+    def test_malformed_provenance_exits_2_without_leaking(self):
+        cases = {
+            "origin": {"origin": "leaked-origin"},
+            "version": {"proposal_model_version": ["leaked-version"]},
+            "names": {"suggested_names": ["leaked-name"]},  # no proposing model
+        }
+        argv = ["build", "--out", str(self.root / "ds"), "--cache", str(self.cache)]
+        for name, provenance in cases.items():
+            with self.subTest(case=name):
+                self.stderr.truncate(0)
+                self.stderr.seek(0)
+                export = FakeExport([row(SRC_A, 1, "cork", **provenance)])
+                code = fetch_dataset.main(
+                    argv, transport=export, blob_getter=self.blobs
+                )
+                self.assertEqual(code, EXIT_ERROR)
+                self.assertIn("export row 0", self.stderr.getvalue())
+                self.assertNotIn("leaked", self.stderr.getvalue())
+                self.assertEqual(self.stdout.getvalue(), "")
 
     def test_build_failure_exits_2_without_leaking(self):
         self.blobs.blobs[f"poses/{SRC_B}.tkp1.gz"] = BLOBS[SRC_A]
