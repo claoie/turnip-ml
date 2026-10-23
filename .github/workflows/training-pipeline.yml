@@ -18,16 +18,20 @@
 #              printed or uploaded as an artifact: the run directory goes
 #              to the private R2 bucket. A promoted champion (or a
 #              re-scored one) is stored back to R2 as a new version, and
-#              the gates' decision log with it. The watermark advances
-#              only at the end of a successful run without a fixture
-#              regression.
+#              the gates' decision log with it. A fixture regression's
+#              suspect sources are then quarantined farm-side
+#              (Training/report_quarantine.py). The watermark advances
+#              only at the end of a successful run, and after a
+#              regression only once the farm has accepted every
+#              quarantine request.
 #
 # Both modes run Training/pipeline.sh: split -> train (fine-tune the
 # champion unless `from_scratch`) -> predict holdout -> evaluate holdout
 # -> per-name metrics -> fixture runner -> fixture gate -> promotion gate
 # -> publish (#16). With no champion yet, nothing is promoted unless a
 # dispatch sets `bootstrap_champion`. Only a gated promotion is published
-# (never a bootstrap), and only the farm job may publish.
+# (never a bootstrap), and only the farm job may publish or quarantine:
+# the synthetic job has no secrets, and its sources are not farm ids.
 #
 # No actions/cache anywhere: pull_request runs can read caches written on
 # main, so nothing derived from contributed data may go into one.
@@ -324,14 +328,37 @@ jobs:
             echo "stored training/registry.json"
           fi
 
-      # Held on a fixture regression: nothing sends quarantine.json to the
-      # farm yet, so tonight's suspect sources are still in the export, and
-      # the next run's changed-source list must still cover them.
+      # A fixture regression quarantines tonight's suspect sources
+      # farm-side (TRAINING_DESIGN.md §7 step 2): POST /api/quarantine with
+      # the gate's quarantine.json, so the export leaves them out until the
+      # maintainer releases or purges them. It runs after the run record and
+      # the decision log are stored, so a failed send leaves both for
+      # review, fails the run and keeps the watermark held. The farm skips
+      # sources already under quarantine, so the next run just sends again.
       - if: steps.count.outputs.run == 'true'
-        name: Advance the watermark
+        id: quarantine
+        name: Quarantine the suspect sources farm-side
         run: |
           gate=$(python -c 'import json; print(json.load(open("data/run/outcome.json"))["fixture_gate"])')
-          if [ "$gate" = regression ]; then
+          if [ "$gate" != regression ]; then
+            echo "no fixture regression: nothing to quarantine"
+            exit 0
+          fi
+          python Training/report_quarantine.py --quarantine data/run/fixture_gate/quarantine.json
+          echo "reported=true" >> "$GITHUB_OUTPUT"
+
+      # After a fixture regression, only once the step above has every
+      # quarantine request accepted: until then the suspect sources are
+      # still in the export, and the next run's changed-source list must
+      # still cover them. A failed send already stops the job before this
+      # step; the check keeps the hold if that ever changes.
+      - if: steps.count.outputs.run == 'true'
+        name: Advance the watermark
+        env:
+          QUARANTINE_REPORTED: ${{ steps.quarantine.outputs.reported }}
+        run: |
+          gate=$(python -c 'import json; print(json.load(open("data/run/outcome.json"))["fixture_gate"])')
+          if [ "$gate" = regression ] && [ "$QUARANTINE_REPORTED" != true ]; then
             echo "::warning::Fixture regression: the watermark is held until the suspect sources are quarantined farm-side (data/run/fixture_gate/quarantine.json in this run's R2 record)."
             exit 0
           fi

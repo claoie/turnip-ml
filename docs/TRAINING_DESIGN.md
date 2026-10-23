@@ -265,10 +265,10 @@ Nightly pipeline order:
    that against the champion's recorded fixture scores. Its quarantine
    candidates (§7) come from a second `since=<watermark>` pull, taken
    after step 1's full pull; on completion the watermark advances to
-   that pull's newest cursor. The one exception is a regression while
-   nothing delivers the quarantine to the farm yet (§7 step 2): the
-   suspect sources are then still in the export, so the watermark holds
-   and the next run's candidates still cover them.
+   that pull's newest cursor. After a regression it advances only once
+   the farm has accepted the quarantine (§7 step 2): until then the
+   suspect sources are still in the export, so the watermark holds and
+   the next run's candidates still cover them.
 6. Holdout evaluation (§6.2) — report written next to the artifact.
 7. Promotion gate (§8) — champion/challenger on the validation metric.
 8. Publish (§9, `MODEL_CONTRACT.md`).
@@ -489,9 +489,11 @@ On fixture regression (master plan §6), in order:
      explicitly, so the alert and the quarantine list are the same. The
      farm inserts one row per id and skips sources already under an
      open quarantine. The farm does not pick sources by time window: it
-     does not know the pipeline's watermark. *(Not yet implemented: the
-     gate writes the list as `quarantine.json` with the run record, and
-     the watermark holds until it is applied — §5.)*
+     does not know the pipeline's watermark. The gate writes the list
+     as `quarantine.json`; the nightly job sends it with
+     `Training/report_quarantine.py` (`POST /api/quarantine`, at most
+     10000 ids per request) and holds the watermark until the farm has
+     accepted every request (§5).
 3. **Training exclusion:** the export excludes sources with an
    unresolved quarantine row (`resolution IS NULL`) or
    `resolution='purged'`; `resolution='released'` rows are re-included.

@@ -26,6 +26,8 @@ what this repo validates; see the root README for repo-wide conventions.
 - `champion_slot.py` — the champion's file hashes: the manifest
   `pipeline.sh` stages, and the pointer the workflow stores and verifies.
 - `fixture_gate.py` — fixture regression gate (anti-poisoning).
+- `report_quarantine.py` — sends a fixture regression's `quarantine.json`
+  to the farm (`POST /api/quarantine`, turnip-ml#51); `farm` mode only.
 - `promote.py` — champion/challenger promotion gate.
 - `make_synthetic_fixtures.py` — generates a synthetic fixture set for
   the tests and the pipeline's synthetic rehearsal.
@@ -146,10 +148,14 @@ The workflow has two modes:
      what `pipeline.sh` staged in `data/run/champion_update/` as a new
      champion version, and only then rewrites `champion/current.json`, so
      an upload that fails partway changes nothing; stores the decision
-     log; then advances the watermark, except after a fixture regression:
-     nothing sends `quarantine.json` to the farm yet, so the watermark
-     holds and the next run's changed-source list still covers the
-     suspect sources.
+     log;
+  7. after a fixture regression, sends `quarantine.json` to the farm with
+     `report_quarantine.py` (below): the export leaves the suspect
+     sources out until the maintainer releases or purges them;
+  8. advances the watermark. After a regression only once the farm has
+     accepted every quarantine request: a failed send fails the run and
+     the watermark holds, so the next run's changed-source list still
+     covers the suspect sources and sends them again.
 - **`synthetic`** (dispatch default) rehearses the same chain on the smoke
   fixture and a synthetic fixture set, with no secrets, twice: a first run
   with no champion bootstraps one, a second runs the fixture gate and the
@@ -222,6 +228,35 @@ python Training/publish_model.py --run data/run --dataset data/dataset
    a redirect, which would carry the pipeline key to another host.
 
 It prints the version, sizes and counts only.
+
+## Quarantining a regression's sources
+
+```sh
+python Training/report_quarantine.py --quarantine data/run/fixture_gate/quarantine.json
+```
+
+`report_quarantine.py` reads `TURNIP_FARM_URL` and `TURNIP_PIPELINE_KEY`
+from the environment and, in this order:
+
+1. Validates every row of the gate's `quarantine.json` by the farm's rules
+   before sending anything: `source_id` a farm source id (64 lowercase
+   hex), `reason` non-empty and at most 1000 characters, `metrics` an
+   object or null, no other key, no source listed twice. `synthetic`
+   mode's sources are not farm ids, so it can never quarantine. An empty
+   file sends nothing.
+2. Sends one `POST /api/quarantine` body `{source_ids, reason, metrics}`
+   per reason and metrics, at most 10000 ids each (the farm's limit), in
+   a fixed order.
+3. Counts a body as sent only when the farm answers 2xx and its
+   `quarantined`, `already_open` and `unknown` lists account for every id
+   sent. `unknown` sources were deleted by their owner after the export
+   pull; that is not an error. A transport failure or a 5xx is retried
+   (three tries in all); a 401, a 422 or a 3xx fails at once, with exit 2.
+   The farm skips sources already under an open quarantine, so a retry
+   or a re-run after a failure is safe. Requests never follow a redirect.
+
+It prints counts only: never source ids, nor the farm's error messages (a
+422's details name the offending id).
 
 Nothing per-sample reaches the log or an artifact in `farm` mode: this
 repository's logs and artifacts are public, so the gates' decision records

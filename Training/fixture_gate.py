@@ -44,6 +44,7 @@ On regression:
     `data_quarantine` insert (source_id, reason, metrics); the farm
     assigns id and quarantined_at. No account id: who uploaded a source
     is read farm-side from source_attribution while it exists.
+    report_quarantine.py sends the rows (the workflow's farm job only).
   - Discord alert (webhook from TURNIP_DISCORD_WEBHOOK_URL) with the
     metrics delta and the affected source ids. Never account ids: a
     Discord message outlives the farm's 30-day attribution window.

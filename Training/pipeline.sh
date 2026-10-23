@@ -31,7 +31,9 @@
 #     against, so nothing is promoted unless BOOTSTRAP_CHAMPION=true, the
 #     maintainer's explicit choice to make this challenger the first
 #     champion (§6.3: the nightly path never promotes ungated);
-#   - a fixture regression: promotion is skipped, quarantine.json written;
+#   - a fixture regression: promotion is skipped, quarantine.json written
+#     (nothing here sends it: the workflow's farm job does, with
+#     Training/report_quarantine.py, before it advances the watermark);
 #   - a champion without metrics.json: the fixture gate runs, the
 #     promotion gate has nothing to compare and does not;
 #   - publishing runs only after a gated promotion, never after a
@@ -246,8 +248,9 @@ challenger the first champion."
     case $gate/$promotion in
       regression/*)
         STOP="Fixture gate: regression, so promotion was skipped; \
-$GATE_OUT/quarantine.json lists the changed sources. Nothing sends it to \
-the farm yet." ;;
+$GATE_OUT/quarantine.json lists the changed sources. Only the \
+workflow's farm job sends it to the farm (Training/report_quarantine.py), \
+before it advances the watermark." ;;
       pass/promote)
         stage_challenger
         STOP="Fixture gate: pass. Promotion: promote; the challenger is \
