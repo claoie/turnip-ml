@@ -47,7 +47,8 @@ effect, so a bad run uploads nothing.
    NO_MODEL -> trick-v1.0; trick-v<M>.<m> (a rollback's -rb<N> suffix
    included) -> trick-v<M>.<m+1>, or trick-v<M+1>.0 with --major.
 3. Upload the artifact to models/<version>.mlpackage.zip and the holdout
-   report to models/<version>.holdout_report.json. A key that already
+   report to reports/<version>-holdout.json (the farm's reports/ prefix
+   for pipeline reports, docs/DEPLOYMENT.md §9). A key that already
    holds other bytes is an error (a published version is immutable); one
    holding the same bytes is kept (a retry after a failed publish). Each
    object is read back and its sha256 checked; a mismatch is an error.
@@ -491,7 +492,7 @@ def publish(
         "r2_key": f"models/{version}.mlpackage.zip",
         "sha256": sha,
         "byte_size": len(artifact),
-        "holdout_report_r2_key": f"models/{version}.holdout_report.json",
+        "holdout_report_r2_key": f"reports/{version}-holdout.json",
     }
 
     upload_verified(store, body["r2_key"], artifact, ARTIFACT_TYPE)

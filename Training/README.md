@@ -212,8 +212,8 @@ python Training/publish_model.py --run data/run --dataset data/dataset
    `trick-v1.0` before the first; `--major` or `--version` override it.
    If the current model already is this artifact (same sha256), an
    earlier run published it and lost the answer: nothing more is done.
-4. Uploads the artifact and the holdout report under `models/<version>.*`,
-   reads each back and checks its sha256. It never overwrites a key that
+4. Uploads the artifact to `models/<version>.mlpackage.zip` and the holdout
+   report to `reports/<version>-holdout.json`, reads each back and checks its sha256. It never overwrites a key that
    holds other bytes.
 5. Calls `POST /api/models` and records the request body and the farm's
    answer in `data/run/challenger/` (`publish_request.json`,

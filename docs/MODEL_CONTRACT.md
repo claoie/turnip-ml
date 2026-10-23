@@ -67,7 +67,7 @@ finds every field:
     "gainer": {"precision": 0.90, "recall": 0.84, "holdout_count": 31, "train_count": 412}
     // ...one entry per canonical name
   },
-  "holdout_report_r2_key": "models/trick-v1.3.holdout_report.json",
+  "holdout_report_r2_key": "reports/trick-v1.3-holdout.json",
                                       // models.holdout_report_r2_key
   "training_run_id": "nightly-2026-10-07",
                                       // models.training_run_id
@@ -140,7 +140,8 @@ Notes:
    the pipeline runs on Ubuntu, so the client compiles the package on
    device (§4).
 3. Upload the artifact to `models/trick-v<...>.mlpackage.zip` and the
-   holdout report to `models/trick-v<...>.holdout_report.json` in R2.
+   holdout report to `reports/trick-v<...>-holdout.json` in R2 (`models/`
+   and `reports/` are the pipeline's prefixes in the shared bucket).
    Each object is read back and its sha256 checked. A key that already
    holds other bytes is never overwritten.
 4. `POST /api/models` (service-key scoped; `Training/publish_model.py`,
@@ -355,7 +356,9 @@ space from there.
   re-promotes the previous champion — `r2_key`, `sha256`, `byte_size`,
   `input_desc`, `output_desc`, `taxonomy_version`, `val_metrics`,
   `name_metrics`, `holdout_report_r2_key`, and `training_run_id` copied
-  from the previous champion's row, and its training source list
+  from the previous champion's row (the artifact and the report stay at
+  their original `models/` and `reports/` keys; nothing is re-uploaded),
+  and its training source list
   re-sent as `training_source_ids` (the registry keeps it,
   `TRAINING_DESIGN.md` §9); a new unique `version`
   (`trick-v<major>.<minor>-rb<N>`, e.g. `trick-v1.3-rb1` — versions are
