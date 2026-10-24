@@ -48,7 +48,8 @@ effect, so a bad run uploads nothing.
    included) -> trick-v<M>.<m+1>, or trick-v<M+1>.0 with --major.
 3. Upload the artifact to models/<version>.mlpackage.zip and the holdout
    report to reports/<version>-holdout.json (the farm's reports/ prefix
-   for pipeline reports, docs/DEPLOYMENT.md §9). A key that already
+   for pipeline reports: turnip-farm docs/BACKEND_DESIGN.md manifest
+   examples; its docs/DEPLOYMENT.md §9 lists the prefixes). A key that already
    holds other bytes is an error (a published version is immutable); one
    holding the same bytes is kept (a retry after a failed publish). Each
    object is read back and its sha256 checked; a mismatch is an error.
