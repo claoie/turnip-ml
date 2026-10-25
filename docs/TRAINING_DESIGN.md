@@ -29,6 +29,9 @@ what those PRs implement, it says so explicitly.
   clip's `proposal_model_version`, `suggested_names` and
   `suggestions_withheld`. Training uses them to measure and limit the
   model learning from its own suggestions (§6.4).
+- On-device personalization (`MODEL_CONTRACT.md` §3.5) adds nothing to
+  the export. It trains on the device from the user's own library and
+  uploads nothing it learns.
 
 ## 2. Dataset construction
 
@@ -203,7 +206,9 @@ classifier** over per-joint mean position + mean speed, with an
 `init_checkpoint` path that continues from the champion (the fine-tune
 path). The CI smoke test trains it on a synthetic fixture. This is the
 MVP that proves the pipeline end-to-end; it is not the production
-architecture.
+architecture. Its export also returns the standardized window features
+the softmax layer reads, as the embedding output the app's on-device
+personalization uses (`MODEL_CONTRACT.md` §3.2.2).
 
 ### 4.2 Proposed production architecture
 
@@ -222,6 +227,13 @@ architecture.
   contract's `name_scores` (`MODEL_CONTRACT.md` §3.2), which the app
   thresholds before pre-filling a name, so their calibration matters
   as much as their ranking.
+- **Embedding output:** the encoder's output pooled per window,
+  `D ≤ 128`, exported next to the heads (`MODEL_CONTRACT.md` §3.2.2).
+  The app's on-device personalization ranks names by how close a clip
+  is to the user's own named clips in this space (§3.5 there), so it
+  works best when the encoder places windows of one trick close
+  together.
+  *(Judgment call on 128: the app stores one embedding per saved clip.)*
 - **Rationale:** tricks are temporal patterns in joint trajectories;
   frame-wise classifiers (the §4.1 baseline) cannot model duration or
   boundaries. The encoder → proposal → classification split mirrors the
@@ -242,7 +254,10 @@ Conversion is a pipeline step, not a manual action
 promotion). The client compiles the package on device: compiling to
 `.mlmodelc` needs macOS, and the pipeline runs on Ubuntu. The §4.1
 baseline exports as a window classifier whose per-window probabilities
-the client decodes into segments (`MODEL_CONTRACT.md` §3.2.1).
+the client decodes into segments (`MODEL_CONTRACT.md` §3.2.1). The
+export also writes the embedding output and its `output_desc.embedding`
+descriptor (`MODEL_CONTRACT.md` §3.2.2). Not built yet:
+`export_coreml.py` emits `window_probs` only.
 
 ## 5. Training loop
 
@@ -465,6 +480,15 @@ Provenance is client-reported and unverifiable, like the names
 themselves; a client that lies about it is a poisoning case, which the
 fixture gate (§6.3) remains the defense against.
 
+On-device personalization (`MODEL_CONTRACT.md` §3.5) leaves these
+measures as they are. It never pre-fills, so `suggested_names` and
+`origin: model` stay the central model's. Its ranking is withheld on
+blind clips along with the model's, so blind names stay independent of
+both. What it does change, the export cannot see: a name picked from a
+personally ranked list arrives as `origin: vocabulary`, and a window the
+personal keep layer passed looks like any other model proposal
+(`MODEL_CONTRACT.md` §6 item 9).
+
 ## 7. Quarantine mechanics (anti-poisoning)
 
 On fixture regression (master plan §6), in order:
@@ -592,3 +616,9 @@ one review can clear.
 10. Landed or bailed (master plan §9 Q4) — if clips gain an optional
     outcome, whether a bail trains as its trick, as a separate class,
     or not at all.
+11. Offline check of on-device personalization (`MODEL_CONTRACT.md`
+    §3.5) — contributions lose their account link after 30 days, so
+    the export cannot group them by user. Replaying personalization per
+    source (built on a source's earlier clips, scored on its later ones)
+    is the closest offline proxy, and the contract's fixed clip-embedding
+    rule makes that replay match the client.
