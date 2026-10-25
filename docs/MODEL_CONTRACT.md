@@ -7,8 +7,10 @@ on-device. It implements the "Export + deploy" step of master plan §6
 (`https://github.com/hoiekim/turnip-farm/blob/main/docs/MASTER_PLAN.md`)
 and the OTA flow of §5.4. Companion docs: the farm's
 `BACKEND_DESIGN.md` (`models` table, `POST /api/models`,
-`GET /api/models/current`), `POSE_FORMAT.md` (pose wire format), and
-`TRAINING_DESIGN.md` (how champions are produced).
+`GET /api/models/current`), `POSE_FORMAT.md` (pose wire format),
+`TRAINING_DESIGN.md` (how champions are produced), and on the client
+`turnip-ios/docs/PERSONALIZATION_DESIGN.md` (the on-device personal
+layer that §3.5 bounds).
 
 ## 1. Manifest format
 
@@ -51,7 +53,14 @@ finds every field:
     "window_stride": 8,
     "classes": ["background", "cork", "cork+gainer", "gainer"],
     "background_class": "background",
-    "combo_separator": "+"
+    "combo_separator": "+",
+    "embedding": {                    // §3.2.2; absent → no personalization (§5)
+      "output_name": "window_embeddings",
+                                      // the Core ML output feature, [N, D]
+      "shape": ["N", 68],
+      "window_frames": 16,
+      "window_stride": 8
+    }
   },
   "vocabulary": [                     // assembled from label_taxonomy
     {"canonical": "cork", "aliases": ["cork 720", "corkscrew"]},
@@ -121,6 +130,11 @@ Notes:
   (`Training/export_coreml.py`). The §4.1 baseline's `output_desc` is a
   window classifier's (§3.2.1); the production model's will describe its
   segment outputs (§3.2).
+- `output_desc.embedding` describes the model's embedding output
+  (§3.2.2), which only the client's on-device personal layer reads
+  (§3.5). It lives inside `output_desc`, so it needs no farm column. A
+  model without it is valid: the client runs without personalization
+  (§5).
 - `val_metrics` carries the active architecture's promotion metric, for
   the baseline `val_accuracy` over `n_val_windows` windows. Holdout
   metrics are in the report behind `holdout_report_r2_key`.
@@ -243,11 +257,46 @@ segment `start_frame=120, end_frame=175` spans seconds 12.0–17.5 of the
 canonical timeline; the client converts to its own frame/timestamp
 space from there.
 
+#### 3.2.2 Embedding output
+
+The model also returns a fixed-length embedding per window for the
+client's personal layer (§3.5). Nothing else reads it, and nothing in
+§3.3 depends on it.
+
+- Output `window_embeddings` (`output_desc.embedding.output_name`):
+  float32 `[N, D]` on the window grid `output_desc.embedding` gives.
+  Row `i` covers frames `[i · window_stride, i · window_stride +
+  window_frames)`, and `N` follows §3.2.1's formula with the
+  embedding's own `window_frames` and `window_stride`.
+- **Baseline:** the same grid as `window_probs`, and `D = 68`: each
+  window's standardized features, the input of the softmax layer. That
+  is per-joint mean x/y position, then per-joint mean absolute
+  frame-to-frame x/y change, the `standardize_scale` output of
+  `Training/export_coreml.py`, in fp32. Like the classifier, it reads x
+  and y only.
+- **Production model** (`TRAINING_DESIGN.md` §4.2): the temporal
+  encoder's output pooled over each row's window, `D ≤ 128`.
+  *(Judgment call: the client keeps one embedding per saved clip, and
+  128 fp32 values are 512 bytes.)*
+- **Comparable within one `version` only.** The baseline refits its
+  standardization (`feat_mean`, `feat_std`) on every retrain, and the
+  production encoder's weights change on every retrain, so two
+  versions' embeddings live in different spaces. A client never
+  compares embeddings across versions (§3.5, §4).
+- **Status: not built.** `Training/export_coreml.py` emits
+  `window_probs` only. Until the export adds the output and its
+  descriptor, published models carry no `output_desc.embedding` and
+  clients run without personalization.
+
 ### 3.3 Client postprocessing (normative)
 
 1. **Threshold:** drop segments with `score < 0.5`. (Judgment call: a
    fixed default for now; a future manifest `client_config` may
-   override it per model version.)
+   override it per model version.) A client whose personal keep layer
+   has passed its gate (§3.5) decides segments scoring in `[0.3, 0.7)`
+   per user instead: a segment at or above 0.7 always passes and one
+   below 0.3 never does, so personalization moves the bar only inside
+   that band.
 2. **NMS:** class-agnostic non-maximum suppression — for overlapping
    segments with temporal IoU > 0.5, keep the higher `score`.
    (Judgment call: single class-agnostic pass; per-name NMS only if
@@ -262,14 +311,20 @@ space from there.
    is `origin: vocabulary`). A segment whose names all fall below the
    bar is still proposed, as a window with no names. (Judgment call:
    0.5, the segment threshold's default, until holdout calibration says
-   otherwise. Fewer, surer pre-fills leave less to rubber-stamp.)
+   otherwise. Fewer, surer pre-fills leave less to rubber-stamp.) The
+   personal layer (§3.5) ranks suggestions too, and only ranks: a name
+   it favors is never pre-filled.
 5. **Blind sample.** At creation, each model-proposed clip is drawn
    into the blind sample with probability 0.1, once, and the draw is
    persisted with the clip: a blind clip gets its window but no
-   pre-filled names and no model ranking in the suggestions
-   (`suggestions_withheld: true`). Its names are then independent of
-   the model, which is what `TRAINING_DESIGN.md` §6.4 measures
-   rubber-stamping against. The app never treats a blind clip
+   pre-filled names and no ranking in the suggestions, from the model
+   or from the personal layer (`suggestions_withheld: true`). Its names
+   are then independent of the model, which is what
+   `TRAINING_DESIGN.md` §6.4 measures rubber-stamping against. The
+   personal ranking is withheld as well because it is built from the
+   user's earlier names, kept pre-fills among them. The draw is made on
+   every model-proposed clip, whether the segment passed step 1 at 0.5
+   or through the personal keep layer. The app never treats a blind clip
    differently anywhere else — the Profile counts it like any other
    clip (`turnip-ios/docs/PROFILE_DESIGN.md` §6) — and never tells the
    user which clips are blind. (Judgment call: 0.1 trades unbiased
@@ -281,7 +336,10 @@ space from there.
    the user kept or removed them — and sends all three, with step 5's
    `suggestions_withheld`, with the clip if it is contributed (`POST
    /api/clips`). Names below the pre-fill bar are not recorded: they
-   were never offered as an answer, only ranked.
+   were never offered as an answer, only ranked. The personal layer
+   adds nothing here: `proposal_model_version` is the active central
+   `version` even when the personal keep layer passed the segment, and
+   `suggested_names` are the central pre-fills only.
 7. The surviving segments feed the app as proposals — windows to the
    clip list, names to the naming step after it — and the user confirms
    or edits them per the confirmed contribution flow. Proposals are
@@ -297,6 +355,45 @@ space from there.
 - Inference is fully on-device; no data leaves the device for
   inference. The manifest/vocabulary download (§4) is the only network
   touch in this contract.
+
+### 3.5 On-device personalization (client)
+
+The client may adapt proposals and suggestions to its user, trained on
+the device from that user's own clip library: the central model is
+trained on everyone's contributions, and each device personalizes on
+top of it. The design is `turnip-ios/docs/PERSONALIZATION_DESIGN.md`.
+This section is what that design must keep, so that the rest of this
+contract, and the training measures built on it (`TRAINING_DESIGN.md`
+§6.4), hold unchanged.
+
+- **On the device only.** It trains on the user's library, and nothing
+  it learns or stores is uploaded. It adds no field to any upload, so
+  the farm and the training export are unchanged. This is not
+  federated learning, which would upload model updates.
+- **On top of the central model, never inside it.** It reads the
+  active model's `window_embeddings` (§3.2.2) and segment `score`s. The
+  model itself runs as published.
+- **Keyed to one `version`.** Personal state is built against the
+  active version and discarded when another one activates. The client
+  rebuilds it from the data its library keeps, never by carrying state
+  across versions (§3.2.2, §4).
+- **A clip's embedding** is the mean of the `window_embeddings` rows
+  whose windows lie wholly inside the clip's window (the single
+  most-overlapping row when none do), L2-normalized. *(Judgment call;
+  fixing it here lets an offline replay reproduce the client,
+  `TRAINING_DESIGN.md` §10.)*
+- **Two parts, each bounded:**
+  - *Name ranking* orders the naming screen's suggestions by how
+    close a clip is to the user's own named clips. It never pre-fills
+    a name or confirms one, and it is withheld on blind clips (§3.3
+    steps 4–5).
+  - *The keep layer* decides segments scoring inside the §3.3 step-1
+    band, `[0.3, 0.7)`, from what the user kept and dismissed before.
+- **Gated.** Each part is used only while it beats the central
+  behavior on the user's own most recent clips, held out from its
+  training. Otherwise §3.3 applies as written.
+- **Everything else in §3.3 is unchanged:** NMS, merge, the pre-fill
+  bar, the blind draw, and provenance.
 
 ## 4. OTA update flow
 
@@ -314,6 +411,10 @@ space from there.
   is a load failure (below).
 - **Atomic swap:** verify → compile → move into place → activate on the
   next inference call. Never half-replace the active model.
+- **Personal state:** activating a new version switches the personal
+  layer off until the client has rebuilt it against that version
+  (§3.5). The rebuild is deferred background work and never delays
+  activation.
 - **Failure fallback:** any failure — network error, checksum mismatch,
   Core ML compile or load error — keeps the previous model active and retries on
   the next poll. The client retains the previous artifact until the new
@@ -349,6 +450,10 @@ space from there.
 - **Model absent:** heuristic detector fallback (master plan §5.4) —
   proposals are window-only and names come from the user, with
   suggestions from the naming vocabulary above.
+- **Embedding absent:** a model whose `output_desc` has no `embedding`
+  is valid, and the client runs §3.3 without personalization. The
+  output is additive: older clients read their outputs by name and
+  ignore it, so adding it needs no `min_client_version` bump.
 - **`min_client_version`:** clients below it skip the update silently
   (logged locally). Breaking input-format changes bump
   `min_client_version` and the model major version together.
@@ -389,3 +494,16 @@ space from there.
    for the client to compile, because compiling needs macOS. An export
    job on a macOS runner could ship `.mlmodelc` and skip the on-device
    compile.
+8. Personal keep band (§3.3 step 1) — `[0.3, 0.7)` is a starting
+   point. Setting it per model version would need a manifest field, and
+   a manifest field needs a farm column first (§1).
+9. What the farm cannot see (§3.5) — which contributed windows the
+   personal keep layer passed, and which names were picked from a
+   personally ranked list. Nothing measures either today
+   (`auto_detected` and `origin: vocabulary` are stored, not analyzed
+   for it); telling them apart would need a clip field in
+   `BACKEND_DESIGN.md`.
+10. Re-embedding on every version (§3.2.2) — if a future training mode
+    freezes the encoder, an embedding-space identifier in
+    `output_desc.embedding` would let clients keep embeddings across
+    versions that share it.
