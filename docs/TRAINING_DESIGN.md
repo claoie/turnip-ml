@@ -256,8 +256,7 @@ promotion). The client compiles the package on device: compiling to
 baseline exports as a window classifier whose per-window probabilities
 the client decodes into segments (`MODEL_CONTRACT.md` §3.2.1). The
 export also writes the embedding output and its `output_desc.embedding`
-descriptor (`MODEL_CONTRACT.md` §3.2.2). Not built yet:
-`export_coreml.py` emits `window_probs` only.
+descriptor (`MODEL_CONTRACT.md` §3.2.2).
 
 ## 5. Training loop
 

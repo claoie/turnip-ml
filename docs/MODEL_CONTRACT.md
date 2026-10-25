@@ -283,10 +283,10 @@ client's personal layer (§3.5). Nothing else reads it, and nothing in
   production encoder's weights change on every retrain, so two
   versions' embeddings live in different spaces. A client never
   compares embeddings across versions (§3.5, §4).
-- **Status: not built.** `Training/export_coreml.py` emits
-  `window_probs` only. Until the export adds the output and its
-  descriptor, published models carry no `output_desc.embedding` and
-  clients run without personalization.
+- **Status: built for the baseline.** `Training/export_coreml.py`
+  emits `window_embeddings` and its `output_desc.embedding`
+  descriptor. A model without them is still valid, and clients run it
+  without personalization (§5).
 
 ### 3.3 Client postprocessing (normative)
 
