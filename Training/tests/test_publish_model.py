@@ -360,6 +360,11 @@ class PublishRoundTripTest(PublishTestCase):
         self.assertEqual(
             (body["input_desc"], body["output_desc"]), export_coreml.descriptors(ckpt)
         )
+        # The farm stores output_desc as given: the client's personal layer
+        # finds the embedding output there (MODEL_CONTRACT.md §3.2.2).
+        self.assertEqual(
+            body["output_desc"]["embedding"]["output_name"], "window_embeddings"
+        )
         self.assertEqual(set(body["val_metrics"]), {"val_accuracy", "n_val_windows"})
         # Unset optional fields are omitted, never sent as null.
         self.assertNotIn("training_run_id", body)

@@ -25,6 +25,14 @@ Output `window_probs`: float32 [N, C], N = (T - window_frames) //
        Decoding windows into segments is the client's step (contract
        §3.2.1); the manifest's output_desc (`descriptors`) carries the
        window parameters and the class list it needs.
+Output `window_embeddings`: float32 [N, 68], the same windows as
+       `window_probs`. Row i is that window's standardized features,
+       what the softmax-linear head reads: per-joint mean x/y position,
+       then per-joint mean absolute frame-to-frame x/y change, centered
+       by feat_mean and scaled by 1 / feat_std, in fp32. Only the
+       client's on-device personal layer reads it (contract §3.2.2,
+       §3.5), from output_desc.embedding. It is comparable within one
+       model version only: every retrain refits feat_mean and feat_std.
 
 Artifact
 --------
@@ -63,15 +71,25 @@ import train
 PACKAGE_NAME = "TrickDetector.mlpackage"
 INPUT_NAME = "pose"
 OUTPUT_NAME = "window_probs"
+EMBEDDING_NAME = "window_embeddings"
 INPUT_CHANNELS = tkp1.KEYPOINT_COUNT * tkp1.CHANNELS + 1  # + gap indicator: 52
+N_FEATURES = 2 * 2 * tkp1.KEYPOINT_COUNT  # mean position + mean speed: 68
 # Default T the runtime pre-allocates for: a 60 s source (or one window,
 # if a window is longer).
 DEFAULT_FRAMES = 600
 # The classifier head runs in fp32: standardizing divides by feat_std,
 # which can be small enough that fp16 overflows (65504) or keeps too few
 # bits of the quotient. Everything before it (pose values in [0, 1],
-# window means) runs in fp16.
-FP32_OPS = ("standardize_center", "standardize_scale", "logits", "window_probs")
+# window means) runs in fp16. The embedding output reads standardize_scale
+# through an fp32 identity, since a MIL program's output takes its op's
+# name (ct.convert ignores `outputs` names for one).
+FP32_OPS = (
+    "standardize_center",
+    "standardize_scale",
+    "logits",
+    OUTPUT_NAME,
+    EMBEDDING_NAME,
+)
 # coremltools stamps the wall-clock date here; a timestamp breaks the
 # byte-identical artifact, so it is dropped.
 CONVERSION_DATE_KEY = "com.github.apple.coremltools.conversion_date"
@@ -95,12 +113,11 @@ def load_model(path: Path) -> dict[str, Any]:
         raise ExportError(str(e)) from e
     classes = [str(c) for c in ckpt["classes"]]
     W, S = int(ckpt["window_frames"]), int(ckpt["window_stride"])
-    n_features = 2 * 2 * tkp1.KEYPOINT_COUNT  # mean position + mean speed: 68
     shapes = {
-        "W": (n_features, len(classes)),
+        "W": (N_FEATURES, len(classes)),
         "b": (len(classes),),
-        "feat_mean": (n_features,),
-        "feat_std": (n_features,),
+        "feat_mean": (N_FEATURES,),
+        "feat_std": (N_FEATURES,),
     }
     for key, shape in shapes.items():
         if ckpt[key].shape != shape:
@@ -139,6 +156,12 @@ def descriptors(ckpt: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         "classes": ckpt["classes"],
         "background_class": train.BACKGROUND,
         "combo_separator": "+",
+        "embedding": {
+            "output_name": EMBEDDING_NAME,
+            "shape": ["N", N_FEATURES],
+            "window_frames": ckpt["window_frames"],
+            "window_stride": ckpt["window_stride"],
+        },
     }
     return input_desc, output_desc
 
@@ -200,7 +223,8 @@ def build_mlmodel(ckpt: dict[str, Any]) -> Any:
         feat = mb.sub(x=feat, y=mean, name="standardize_center")
         feat = mb.mul(x=feat, y=inv_std, name="standardize_scale")
         logits = mb.linear(x=feat, weight=weight, bias=bias, name="logits")
-        return mb.softmax(x=logits, axis=-1, name=OUTPUT_NAME)
+        probs = mb.softmax(x=logits, axis=-1, name=OUTPUT_NAME)
+        return probs, mb.identity(x=feat, name=EMBEDDING_NAME)
 
     default = max(DEFAULT_FRAMES, W)
     shape = (

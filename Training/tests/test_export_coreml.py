@@ -76,6 +76,16 @@ class LoadModelTest(SmokeModel):
         self.assertEqual(
             (output_desc["window_frames"], output_desc["window_stride"]), (8, 4)
         )
+        # Contract §3.2.2: the baseline's embedding is on window_probs' grid.
+        self.assertEqual(
+            output_desc["embedding"],
+            {
+                "output_name": "window_embeddings",
+                "shape": ["N", 68],
+                "window_frames": 8,
+                "window_stride": 4,
+            },
+        )
         json.dumps([input_desc, output_desc], allow_nan=False)  # JSONB-safe
 
     def test_malformed_checkpoints_are_refused(self) -> None:
@@ -169,8 +179,18 @@ class ExportTest(SmokeModel):
         lo, ch = inp.type.multiArrayType.shapeRange.sizeRanges
         self.assertEqual((lo.lowerBound, lo.upperBound), (8, tkp1.MAX_FRAMES))
         self.assertEqual((ch.lowerBound, ch.upperBound), (52, 52))
-        self.assertEqual([o.name for o in spec.description.output], ["window_probs"])
-        # fp16 up to the window features; the classifier head in fp32.
+        self.assertEqual(
+            [o.name for o in spec.description.output],
+            ["window_probs", "window_embeddings"],
+        )
+        for out in spec.description.output:
+            self.assertEqual(
+                out.type.multiArrayType.dataType,
+                Model_pb2.ArrayFeatureType.FLOAT32,
+                out.name,
+            )
+        # fp16 up to the window features; the classifier head and the
+        # embedding in fp32.
         dtypes = {
             out.name: out.type.tensorType.dataType
             for fn in spec.mlProgram.functions.values()
@@ -214,9 +234,10 @@ class ExportTest(SmokeModel):
                 zf.extractall(tmp)
             mlmodel = ct.models.MLModel(str(Path(tmp) / export_coreml.PACKAGE_NAME))
             pose = np.full((32, 52), 0.9, dtype=np.float32)
-            got = mlmodel.predict({"pose": pose})["window_probs"]
-        self.assertTrue(np.all(np.isfinite(got)))
-        np.testing.assert_allclose(got.sum(axis=1), 1.0, atol=1e-3)
+            got = mlmodel.predict({"pose": pose})
+        self.assertTrue(np.all(np.isfinite(got["window_probs"])))
+        self.assertTrue(np.all(np.isfinite(got["window_embeddings"])))
+        np.testing.assert_allclose(got["window_probs"].sum(axis=1), 1.0, atol=1e-3)
 
     @unittest.skipUnless(sys.platform == "darwin", "Core ML runs on macOS only")
     def test_predictions_match_the_numpy_model(self) -> None:
@@ -241,11 +262,22 @@ class ExportTest(SmokeModel):
                 want = train._softmax(np, logits + ckpt["b"])
                 gap = (kps[:, :, 2].sum(axis=1) == 0)[:, None]
                 pose = np.concatenate([kps.reshape(n, 51), gap], axis=1)
-                got = mlmodel.predict({"pose": pose.astype(np.float32)})["window_probs"]
+                out = mlmodel.predict({"pose": pose.astype(np.float32)})
+                got, emb = out["window_probs"], out["window_embeddings"]
                 with self.subTest(path.name):
                     self.assertEqual(got.shape, want.shape)
                     np.testing.assert_allclose(got, want, atol=5e-3)
                     np.testing.assert_array_equal(got.argmax(1), want.argmax(1))
+                    # The features are fp16 and 1 / feat_std scales their
+                    # error up: compare them unstandardized.
+                    self.assertEqual(emb.shape, feats.shape)
+                    np.testing.assert_allclose(
+                        emb * ckpt["feat_std"] + ckpt["feat_mean"], feats, atol=2e-3
+                    )
+                    # The embedding is exactly what the classifier head reads.
+                    np.testing.assert_allclose(
+                        train._softmax(np, emb @ ckpt["W"] + ckpt["b"]), got, atol=1e-5
+                    )
 
 
 if __name__ == "__main__":
