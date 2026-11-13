@@ -37,7 +37,10 @@ effect, so a bad run uploads nothing.
    taxonomy_version. Unmapped label tokens train (TRAINING_DESIGN.md
    §2.2), but they are a contributor's free text and the manifest is
    public, so a model that names one is not published until the taxonomy
-   maps it (dataset/unmapped_labels.log is the queue).
+   maps it (dataset/unmapped_labels.log is the queue). Nor may either
+   include a name dataset_manifest.json holds back for too few
+   contributors (TRAINING_DESIGN.md §6.2); fetch_dataset.py already
+   leaves those out of training, so this is the last line.
 1. Export model.npz with export_coreml.py into
    challenger/TrickDetector.mlpackage.zip; sha256 and byte_size are over
    those exact zip bytes, the bytes the client downloads.
@@ -242,6 +245,21 @@ def build_request(run: Path, dataset: Path) -> dict[str, Any]:
             "canonical names (unmapped labels, see the dataset's "
             "unmapped_labels.log): map them in the taxonomy before publishing, "
             "since the manifest is public"
+        )
+
+    held_back = manifest.get("held_back_names")
+    if not isinstance(held_back, list) or not all(
+        isinstance(n, str) for n in held_back
+    ):
+        raise PublishError(
+            "dataset_manifest.json has no held_back_names: rebuild the dataset "
+            "with fetch_dataset.py build"
+        )
+    rare = (class_names | set(published_names)) & set(held_back)
+    if rare:
+        raise PublishError(
+            f"{len(rare)} of the model's trick names have too few contributors "
+            "to ship (TRAINING_DESIGN.md §6.2): they are held back"
         )
 
     body: dict[str, Any] = {

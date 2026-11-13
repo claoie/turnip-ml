@@ -94,7 +94,9 @@ Deterministic pipeline per label string:
    not split.
 4. **Judgment call:** tokens with no mapping keep their normalized form
    as the canonical name and are appended to a curation queue
-   (`unmapped_labels.log`) for later taxonomy work. Rationale: failing
+   (`unmapped_labels.log`) for later taxonomy work. They train only if
+   the farm's contributor counts cover them; otherwise the rare-trick
+   hold-back (§6.2) holds their clips back. Rationale: failing
    closed on unmapped names would starve early training when the
    vocabulary is still growing; the log feeds the taxonomy curation loop
    (master plan §9, open question 1). A model trained on an unmapped
@@ -393,13 +395,34 @@ estimation is MoveNet's job, and fine-tuning it is off the table
     model that learned individuals fails as well as one that memorized
     sources. That errs on the side of failing.
   - The promotion gate archives a challenger that did not pass (§8).
-- **Proposed (not yet implemented): release checks and hold-back.**
+- **Proposed (not yet implemented): release checks and schedule.**
   Release checks also confirm that no pose sequences ship inside the
-  model artifact. The farm's privacy plan (`BACKEND_DESIGN.md` §8.1)
-  adds two rules: no per-example embeddings ship in a model, and a rare
-  trick, with its metrics, is held back until enough people have
-  contributed it. Models are retrained on a set schedule, so deleted
-  data leaves within one cycle (§2.1).
+  model artifact, and the farm's privacy plan (`BACKEND_DESIGN.md` §8.1)
+  adds that no per-example embeddings ship in a model. Models are
+  retrained on a set schedule, so deleted data leaves within one cycle
+  (§2.1).
+- **Rare-trick hold-back.** A trick, with its metrics, ships only once
+  enough distinct people have contributed it (`BACKEND_DESIGN.md` §8.1).
+  - Both numbers come from the farm, which alone knows the accounts
+    (`BACKEND_DESIGN.md` §1.2.27, §7.3). Every export page carries
+    `trick_contributors`, distinct contributors per canonical trick
+    (a trick missing from it has 0), and `contributor_minimum`, the
+    count a trick needs (5, the farm's judgment call, §10 Q12). A trick
+    trains iff `contributors >= contributor_minimum`.
+  - Both are the same on every page, but read conservatively: a trick's
+    count is its minimum over the pages and the minimum is the greatest
+    any page gives.
+  - Fail closed: a page without either field holds every trick back,
+    and an unmapped token (§2.2) has no count.
+  - `fetch_dataset.py build` holds back every clip carrying a name below
+    the minimum, whole, combos included: no trick entry, so no name,
+    `train_count` or holdout metric. Its window goes to the sample's
+    `held_back_windows`, and training drops every window that overlaps
+    one or lies within the §2.5 margin of one, so the trick trains
+    neither as a name nor as background.
+  - `dataset_manifest.json` lists the held-back names, and
+    `publish_model.py` refuses a model that names one. Logs carry only
+    how many names and clips were held back.
 
 ### 6.3 Fixture regression gate (anti-poisoning)
 
@@ -668,6 +691,7 @@ one review can clear.
     source (built on a source's earlier clips, scored on its later ones)
     is the closest offline proxy, and the contract's fixed clip-embedding
     rule makes that replay match the client.
-12. Rare-trick hold-back (§6.2) — how many distinct contributors a trick
-    needs before it ships, and the retrain schedule that bounds how long
-    deleted data stays in a model.
+12. Rare-trick hold-back (§6.2) — the farm's `contributor_minimum` of 5
+    distinct contributors before a trick ships is a starting point.
+    Open: the retrain schedule that bounds how long deleted data stays
+    in a model.

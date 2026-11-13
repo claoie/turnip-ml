@@ -80,6 +80,14 @@ the provenance yet: turnip-ml#40 adds the rubber-stamp measures and the
 down-weighting. The smoke fixture carries none, as `train.py`'s sample
 format does not require it.
 
+A trick with fewer distinct contributors than the farm's
+`contributor_minimum` is held back whole. The counts come from the
+export's `trick_contributors`; a trick it doesn't list has none, and an
+export without either field holds every trick back. A held-back trick's
+clips leave no trick entry and go to the sample's `held_back_windows`,
+which `train.py` never trains on, and `dataset_manifest.json` lists the
+held-back names (`docs/TRAINING_DESIGN.md` §6.2).
+
 ## Splitting a manifest
 
 ```sh
