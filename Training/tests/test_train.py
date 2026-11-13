@@ -256,6 +256,50 @@ class TrainTest(unittest.TestCase):
             [],
         )
 
+    def test_build_dataset_drops_held_back_windows(self) -> None:
+        # A held-back clip at [96, 112) in a 200-frame sample, 8-frame
+        # windows at stride 8 (25 windows): without a margin, only the 2
+        # that overlap it (starts 96, 104) drop out; the touching ones at 88
+        # and 112 stay background. Nothing is labeled with its trick.
+        sample = {
+            "sample_id": "s",
+            "keypoints": np.zeros((200, 17, 3)),
+            "tricks": [],
+            "held_back_windows": [[96, 112]],
+        }
+        _, labels, prov = train.build_dataset(np, [sample], 8, 8)
+        self.assertEqual(len(labels), 23)
+        self.assertEqual(set(labels), {"background"})
+        starts = {start for _, start, _ in prov}
+        self.assertTrue(starts.isdisjoint({96, 104}))
+        self.assertTrue({88, 112} <= starts)
+        # With a 20-frame margin, every window less than 20 frames away goes
+        # too (starts 72 to 128), as around a trained segment; 64 and 136,
+        # 24 frames away, stay.
+        _, labels, prov = train.build_dataset(np, [sample], 8, 8, margin_frames=20)
+        self.assertEqual(len(labels), 17)
+        starts = {start for _, start, _ in prov}
+        self.assertTrue(starts.isdisjoint(range(72, 129, 8)))
+        self.assertTrue({64, 136} <= starts)
+
+    def test_held_back_windows_drop_trick_windows_too(self) -> None:
+        # A trained segment overlapping a held-back clip loses those windows.
+        sample = {
+            "sample_id": "s",
+            "keypoints": np.zeros((32, 17, 3)),
+            "tricks": [{"name": "gainer", "start_frame": 0, "end_frame": 32}],
+            "held_back_windows": [[16, 24]],
+        }
+        _, labels, prov = train.build_dataset(np, [sample], 8, 8)
+        self.assertEqual([start for _, start, _ in prov], [0, 8, 24])
+        self.assertEqual(labels, ["gainer"] * 3)
+
+    def test_malformed_held_back_windows_fail_closed(self) -> None:
+        for bad in ({"a": 1}, [[5]], [[5, 5]], [[-1, 4]], [[0, 4.0]], [[True, 4]]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                train.held_back_windows({"sample_id": "s", "held_back_windows": bad})
+        self.assertEqual(train.held_back_windows({"sample_id": "s"}), [])
+
     def test_window_label_counts_each_name_once(self) -> None:
         # Two clips labeling overlapping spans "gainer": the window is
         # "gainer", not "gainer+gainer".

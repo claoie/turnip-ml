@@ -229,6 +229,20 @@ class LeakageGapTest(LeakageGapTestCase):
         self.assertEqual(gap["holdout_window_accuracy"], 0.7)
         self.assertEqual(gap["n_holdout_windows_unseen_label"], 10)
 
+    def test_held_back_windows_reach_the_window_count(self) -> None:
+        split = {"h1": "holdout"}
+        self.split_path.write_text(json.dumps(split))
+        self._sample("h1", [seg("cork", 0, 8)], frames=8)
+        rec = json.loads((self.samples_dir / "h1.json").read_text())
+        rec["held_back_windows"] = [[0, 4]]
+        write_json(self.samples_dir / "h1.json", rec)
+        [sample] = leakage_gap.load_split_samples(split, self.samples_dir, "holdout")
+        self.assertEqual(sample["held_back_windows"], [(0, 4)])
+        rec["held_back_windows"] = [[4, 4]]
+        write_json(self.samples_dir / "h1.json", rec)
+        with self.assertRaises(ValueError):
+            leakage_gap.load_split_samples(split, self.samples_dir, "holdout")
+
     def test_no_holdout_window_fails_closed(self) -> None:
         # Every holdout sample shorter than window_frames: no window, so
         # the accuracy is undefined rather than vacuously 1.0.
