@@ -34,13 +34,15 @@ build --out DIR --cache DIR
                                 [frame][17][x, y, confidence] (gap frames
                                 kept as zeros), one trick entry per
                                 (clip, canonical name) on the clip window,
-                                and the label provenance (below)
+                                held_back_windows (below), and the label
+                                provenance (below)
       manifest.jsonl            {"sample_id", "source_id"} per sample, the
                                 split_dataset.py input (splits group by
                                 source)
       dataset_manifest.json     pinned taxonomy_version and its curated
-                                canonical names, export cursor,
-                                counts and sorted sample ids
+                                canonical names, export cursor, the
+                                held-back names, counts and sorted
+                                sample ids
       unmapped_labels.log       "<count>\t<token>" per unmapped label token,
                                 the taxonomy curation queue
     Raw labels are canonicalized at one pinned taxonomy version: the
@@ -49,6 +51,32 @@ build --out DIR --cache DIR
     next run (see canonicalize.py for the per-raw resolution).
     A label that canonicalizes to no name at all (only parentheticals or
     delimiters) contributes nothing; a clip left without names is dropped.
+
+Rare-trick hold-back
+--------------------
+A trick ships, with its metrics, only once enough distinct people have
+contributed it (TRAINING_DESIGN.md §6.2). The farm decides both numbers
+(BACKEND_DESIGN.md §1.2.27, §7.3), and every export page carries them:
+  trick_contributors   [{"canonical": name, "contributors": count}],
+                       distinct contributors per canonical trick under
+                       the current taxonomy; a trick missing from the
+                       list has 0
+  contributor_minimum  the count a trick needs: it trains iff
+                       contributors >= contributor_minimum
+Both are whole-export values, the same on every page. Read
+conservatively all the same: a trick's count is its minimum over the
+pages (absent from a page counts 0), the minimum is the greatest any
+page gives, and a page without either field holds every trick back
+(fail closed). Unmapped tokens have no count, so they are held back
+too. A malformed field is an error.
+
+A clip that carries any held-back name is held back whole: it leaves no
+trick entry (so no name, train count or holdout metric), and its window
+is written to the sample's `held_back_windows` instead, which train.py
+never trains on, as a name or as background. dataset_manifest.json
+records the held-back names (publish_model.py refuses a model that
+names one); stdout carries only how many names and clips were held
+back.
 
 Provenance
 ----------
@@ -138,6 +166,11 @@ PIPELINE_KEY_ENV = "TURNIP_PIPELINE_KEY"
 R2_ENV = ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET")
 
 HEX64_RE = re.compile(r"[0-9a-f]{64}")
+# Rare-trick hold-back (TRAINING_DESIGN.md §6.2): the export fields with
+# the farm's per-trick count of distinct contributors and the count a
+# trick needs before it trains and ships (BACKEND_DESIGN.md §1.2.27).
+TRICK_CONTRIBUTORS_FIELD = "trick_contributors"
+CONTRIBUTOR_MINIMUM_FIELD = "contributor_minimum"
 # A label's origin (BACKEND_DESIGN.md §1.2.18): typed by hand, picked from
 # the vocabulary's suggestions, or pre-filled by the trick model and kept.
 ORIGINS = ("typed", "vocabulary", "model")
@@ -175,6 +208,12 @@ class ExportPull:
     rows: list[LabelRow]
     taxonomy: list[tuple[str, str, int]]
     cursor: str | None  # the newest non-null next_cursor seen
+    # Distinct contributors per canonical name, the minimum over the pages
+    # (module docstring, "Rare-trick hold-back").
+    contributor_counts: dict[str, int]
+    # The farm's hold-back threshold; None when a page lacked it, which
+    # holds every trick back.
+    contributor_minimum: int | None
 
 
 # -- export ------------------------------------------------------------------
@@ -305,6 +344,47 @@ def parse_taxonomy(i: int, entry: Any) -> tuple[str, str, int]:
     return raw, canonical, version
 
 
+def _is_count(n: Any) -> bool:
+    return isinstance(n, int) and not isinstance(n, bool) and n >= 0
+
+
+def parse_contributor_counts(page: dict[str, Any]) -> dict[str, int]:
+    """A page's per-trick contributor counts; {} when the page has none."""
+    entries = page.get(TRICK_CONTRIBUTORS_FIELD)
+    if entries is None:
+        return {}
+    where = f"export {TRICK_CONTRIBUTORS_FIELD}"
+    if not isinstance(entries, list):
+        raise FetchError(f"{where} must be an array")
+    counts: dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"canonical", "contributors"}:
+            raise FetchError(f"{where} entries must be {{canonical, contributors}}")
+        name, n = entry["canonical"], entry["contributors"]
+        if not (isinstance(name, str) and name and _is_count(n)):
+            raise FetchError(f"{where} entries need a name and a count >= 0")
+        if name in counts:
+            raise FetchError(f"{where} lists a trick twice")
+        counts[name] = n
+    return counts
+
+
+def parse_contributor_minimum(page: dict[str, Any]) -> int | None:
+    """A page's hold-back threshold; None when the page has none."""
+    minimum = page.get(CONTRIBUTOR_MINIMUM_FIELD)
+    if minimum is None:
+        return None
+    if not _is_count(minimum) or minimum < 1:
+        raise FetchError(f"export {CONTRIBUTOR_MINIMUM_FIELD} must be a count >= 1")
+    return int(minimum)
+
+
+def _min_counts(pages: list[dict[str, int]]) -> dict[str, int]:
+    """Per name, the minimum over the pages; absent from a page counts 0."""
+    names = set().union(*pages) if pages else set()
+    return {n: min(page.get(n, 0) for page in pages) for n in sorted(names)}
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Never follow a redirect: it would carry the pipeline key to whatever
     host the Location names. A 3xx then surfaces as an HTTPError."""
@@ -373,6 +453,8 @@ class ExportClient:
         """Every row after `since` (None: the whole export)."""
         rows: list[LabelRow] = []
         taxonomy: set[tuple[str, str, int]] = set()
+        counts: list[dict[str, int]] = []
+        minimums: list[int | None] = []
         cursor = since
         seen: set[str | None] = {since}
         while True:
@@ -397,13 +479,17 @@ class ExportClient:
             offset = len(rows)
             rows.extend(parse_row(offset + i, r) for i, r in enumerate(page["rows"]))
             taxonomy.update(parse_taxonomy(i, t) for i, t in enumerate(page_taxonomy))
+            counts.append(parse_contributor_counts(page))
+            minimums.append(parse_contributor_minimum(page))
             if not page["rows"] or next_cursor is None:
                 break
             if next_cursor in seen:
                 raise FetchError("export cursor did not advance")
             seen.add(next_cursor)
             cursor = next_cursor
-        return ExportPull(rows, sorted(taxonomy), cursor)
+        known = [m for m in minimums if m is not None]
+        minimum = max(known) if known and len(known) == len(minimums) else None
+        return ExportPull(rows, sorted(taxonomy), cursor, _min_counts(counts), minimum)
 
 
 # -- pose blobs ----------------------------------------------------------------
@@ -617,6 +703,8 @@ def _write_dataset(
     (staging / "samples").mkdir()
     unmapped: Counter[str] = Counter()
     clips_dropped = 0
+    clips_held_back = 0
+    held_back_names: set[str] = set()
     sample_ids: list[str] = []
     for source_id, clips in sources.items():
         first = next(iter(clips.values()))[0]
@@ -625,6 +713,7 @@ def _write_dataset(
         except tkp1.Tkp1Error as e:
             raise FetchError(f"{first.r2_key}: {e}") from e
         tricks: list[dict[str, Any]] = []
+        held_back: set[tuple[int, int]] = set()
         provenance: dict[str, dict[str, Any]] = {}
         for clip_id, rows in clips.items():
             start, end = rows[0].start_frame, rows[0].end_frame
@@ -642,6 +731,19 @@ def _write_dataset(
                 unmapped.update(tokens)
             if not names:
                 clips_dropped += 1
+                continue
+            rare = {
+                n
+                for n in names
+                if pull.contributor_minimum is None
+                or pull.contributor_counts.get(n, 0) < pull.contributor_minimum
+            }
+            if rare:
+                # The whole clip: a combo window labeled with only its
+                # common names would teach the model the wrong thing.
+                held_back_names |= rare
+                held_back.add((start, end))
+                clips_held_back += 1
                 continue
             # One entry per (clip, name): a combo clip is several entries on
             # one window. Read them through evaluate.ground_truth_segments,
@@ -665,6 +767,7 @@ def _write_dataset(
             "fps": FPS,
             "keypoints": pose.keypoints,
             "tricks": tricks,
+            "held_back_windows": [list(w) for w in sorted(held_back)],
             "clips": provenance,
         }
         path = staging / "samples" / f"{source_id}.json"
@@ -674,8 +777,12 @@ def _write_dataset(
     sample_ids.sort()
     stats = {
         "samples": len(sample_ids),
-        "clips": sum(len(clips) for clips in sources.values()) - clips_dropped,
+        "clips": sum(len(clips) for clips in sources.values())
+        - clips_dropped
+        - clips_held_back,
         "clips_dropped_without_names": clips_dropped,
+        "clips_held_back": clips_held_back,
+        "names_held_back": len(held_back_names),
         "label_rows": len(pull.rows),
         "taxonomy_version": taxonomy.version,
         "unmapped_tokens": len(unmapped),
@@ -688,6 +795,11 @@ def _write_dataset(
         # public and the token is a contributor's free text.
         "canonical_names": taxonomy.canonical_names,
         "export_cursor": pull.cursor,
+        # Names with fewer than the farm's contributor_minimum contributors
+        # (null: no minimum, so every name): never trained or published
+        # (TRAINING_DESIGN.md §6.2).
+        "held_back_names": sorted(held_back_names),
+        "contributor_minimum": pull.contributor_minimum,
         "sample_ids": sample_ids,
     }
     (staging / "manifest.jsonl").write_text(
