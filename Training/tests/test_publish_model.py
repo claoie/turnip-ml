@@ -252,6 +252,7 @@ class RunFixture:
                 {
                     "taxonomy_version": 3,
                     "canonical_names": ["cork", "corkscrew", "gainer"],
+                    "held_back_names": [],
                     "samples": len(split),
                 }
             )
@@ -525,6 +526,31 @@ class RefusalTest(PublishTestCase):
         self.assertNotIn("corkscrew", self.logs())
         self.assertNothingHappened()
         self.assertEqual(self.farm.calls, 0)
+
+    def set_held_back_names(self, names: list[str] | None) -> None:
+        path = self.dataset / "dataset_manifest.json"
+        manifest = json.loads(path.read_text())
+        if names is None:
+            del manifest["held_back_names"]
+        else:
+            manifest["held_back_names"] = names
+        path.write_text(json.dumps(manifest))
+
+    def test_held_back_trick_names_are_never_published(self) -> None:
+        self.set_held_back_names(["gainer"])
+        self.assertEqual(self.main(), 2)
+        self.assertIn(
+            "1 of the model's trick names have too few", self.stderr.getvalue()
+        )
+        self.assertNotIn("gainer", self.logs())
+        self.assertNothingHappened()
+        self.assertEqual(self.farm.calls, 0)
+
+    def test_a_dataset_without_held_back_names_is_refused(self) -> None:
+        self.set_held_back_names(None)
+        self.assertEqual(self.main(), 2)
+        self.assertIn("held_back_names", self.stderr.getvalue())
+        self.assertNothingHappened()
 
     def test_a_dataset_without_canonical_names_is_refused(self) -> None:
         self.set_canonical_names(None)

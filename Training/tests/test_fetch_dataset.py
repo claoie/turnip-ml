@@ -107,11 +107,38 @@ ROWS = [
 ]
 
 
+# The farm's hold-back threshold, and enough contributors for every name
+# in ROWS to train.
+MINIMUM = 5
+COUNTS = {
+    name: MINIMUM + 4 for name in ("cork", "gainer", "hook", "scoot", "mystery flip")
+}
+
+
+def contributors(counts):
+    """A {name: count} dict in the farm's trick_contributors form."""
+    return [{"canonical": n, "contributors": c} for n, c in sorted(counts.items())]
+
+
 class FakeExport:
     """Paginated export; cursors are opaque strings; records requests."""
 
-    def __init__(self, rows=ROWS, page_size=2, null_on_last_page=False, taxonomy=None):
+    def __init__(
+        self,
+        rows=ROWS,
+        page_size=2,
+        null_on_last_page=False,
+        taxonomy=None,
+        counts=COUNTS,
+        minimum=MINIMUM,
+    ):
         self.rows = list(rows)
+        # trick_contributors and contributor_minimum on every page. None
+        # leaves the field out; a callable maps the page's start index to
+        # the value; a counts dict is sent in the farm's list form, any
+        # other counts value as it is.
+        self.counts = counts
+        self.minimum = minimum
         self.page_size = page_size
         self.null_on_last_page = null_on_last_page
         # None: the mappings for the versions present on each page (the
@@ -134,7 +161,16 @@ class FakeExport:
             taxonomy = [t for t in TAXONOMY if t["taxonomy_version"] in versions]
         else:
             taxonomy = self.taxonomy
-        return {"rows": page, "taxonomy": taxonomy, "next_cursor": next_cursor}
+        body = {"rows": page, "taxonomy": taxonomy, "next_cursor": next_cursor}
+        counts = self.counts(start) if callable(self.counts) else self.counts
+        if counts is not None:
+            if isinstance(counts, dict):
+                counts = contributors(counts)
+            body[fetch_dataset.TRICK_CONTRIBUTORS_FIELD] = counts
+        minimum = self.minimum(start) if callable(self.minimum) else self.minimum
+        if minimum is not None:
+            body[fetch_dataset.CONTRIBUTOR_MINIMUM_FIELD] = minimum
+        return body
 
 
 class FakeBlobs:
@@ -200,6 +236,8 @@ class BuildTest(FetchTestCase):
                 "samples": 3,
                 "clips": 4,
                 "clips_dropped_without_names": 1,
+                "clips_held_back": 0,
+                "names_held_back": 0,
                 "label_rows": 6,
                 "taxonomy_version": 2,
                 "unmapped_tokens": 1,
@@ -208,7 +246,11 @@ class BuildTest(FetchTestCase):
         )
         a = self.sample(SRC_A)
         self.assertEqual(a["sample_id"], SRC_A)
-        self.assertEqual(set(a), {"sample_id", "fps", "keypoints", "tricks", "clips"})
+        self.assertEqual(
+            set(a),
+            {"sample_id", "fps", "keypoints", "tricks", "held_back_windows", "clips"},
+        )
+        self.assertEqual(a["held_back_windows"], [])
         self.assertEqual(a["fps"], 10)
         self.assertEqual(len(a["keypoints"]), 40)
         self.assertEqual(len(a["keypoints"][0]), 17)
@@ -347,10 +389,135 @@ class BuildTest(FetchTestCase):
         # Curated names only: "mystery flip" trains but is no canonical name.
         self.assertEqual(meta["canonical_names"], ["cork", "gainer", "hook", "scoot"])
         self.assertEqual(meta["export_cursor"], "cur-5")
+        self.assertEqual(meta["held_back_names"], [])
+        self.assertEqual(meta["contributor_minimum"], MINIMUM)
         log = (self.root / "dataset" / "unmapped_labels.log").read_text(
             encoding="utf-8"
         )
         self.assertEqual(log, "1\tmystery flip\n")
+
+    def test_rare_trick_holds_back_its_whole_clip(self):
+        # scoot is one contributor short: clip 1 (gainer + hook + scoot) is
+        # held back whole, gainer and hook included.
+        counts = {**COUNTS, "scoot": MINIMUM - 1}
+        argv = [
+            "build",
+            "--out",
+            str(self.root / "dataset"),
+            "--cache",
+            str(self.cache),
+        ]
+        code = fetch_dataset.main(
+            argv, transport=FakeExport(counts=counts), blob_getter=self.blobs
+        )
+        self.assertEqual(code, EXIT_OK)
+        stats = json.loads(self.stdout.getvalue())
+        self.assertEqual(stats["clips_held_back"], 1)
+        self.assertEqual(stats["names_held_back"], 1)
+        self.assertEqual(stats["clips"], 3)
+        a = self.sample(SRC_A)
+        self.assertEqual([t["clip_id"] for t in a["tricks"]], [CLIP[2]])
+        self.assertEqual(a["held_back_windows"], [[20, 30]])
+        self.assertNotIn(CLIP[1], a["clips"])
+        meta = json.loads((self.root / "dataset" / "dataset_manifest.json").read_text())
+        self.assertEqual(meta["held_back_names"], ["scoot"])
+        # Stdout carries counts, never the held-back name.
+        self.assertNotIn("scoot", self.stdout.getvalue())
+
+    def test_minimum_contributors_ship(self):
+        counts = {**COUNTS, "scoot": MINIMUM}
+        stats = self.build(FakeExport(counts=counts))
+        self.assertEqual(stats["clips_held_back"], 0)
+        self.assertEqual(self.sample(SRC_A)["held_back_windows"], [])
+
+    def test_the_farms_minimum_decides(self):
+        # The same counts against a higher farm minimum hold scoot back.
+        counts = {**COUNTS, "scoot": MINIMUM}
+        stats = self.build(FakeExport(counts=counts, minimum=MINIMUM + 1))
+        self.assertEqual(stats["clips_held_back"], 1)
+        meta = json.loads((self.root / "dataset" / "dataset_manifest.json").read_text())
+        self.assertEqual(meta["contributor_minimum"], MINIMUM + 1)
+
+    def test_no_minimum_holds_every_trick_back(self):
+        stats = self.build(FakeExport(minimum=None))
+        self.assertEqual(stats["clips"], 0)
+        self.assertEqual(stats["clips_held_back"], 4)
+        meta = json.loads((self.root / "dataset" / "dataset_manifest.json").read_text())
+        self.assertIsNone(meta["contributor_minimum"])
+
+    def test_the_minimum_is_the_greatest_over_pages(self):
+        def minimum(start):
+            return 10 if start == 2 else MINIMUM
+
+        stats = self.build(FakeExport(minimum=minimum))
+        self.assertEqual(stats["clips"], 0)  # every count is MINIMUM + 4 = 9
+
+    def test_a_page_without_the_minimum_holds_every_trick_back(self):
+        def minimum(start):
+            return None if start == 4 else MINIMUM
+
+        stats = self.build(FakeExport(minimum=minimum))
+        self.assertEqual(stats["clips"], 0)
+
+    def test_no_counts_hold_every_trick_back(self):
+        # Fail closed: an export without the field trains no trick.
+        stats = self.build(FakeExport(counts=None))
+        self.assertEqual(stats["clips"], 0)
+        self.assertEqual(stats["clips_held_back"], 4)
+        self.assertEqual(stats["names_held_back"], 5)
+        for source in (SRC_A, SRC_B, SRC_C):
+            self.assertEqual(self.sample(source)["tricks"], [])
+
+    def test_a_name_without_a_count_is_held_back(self):
+        counts = {n: c for n, c in COUNTS.items() if n != "mystery flip"}
+        self.build(FakeExport(counts=counts))
+        self.assertEqual(self.sample(SRC_C)["tricks"], [])
+        self.assertEqual(self.sample(SRC_C)["held_back_windows"], [[0, 40]])
+
+    def test_counts_are_the_minimum_over_pages(self):
+        # One page says cork has few contributors; the others say many.
+        def counts(start):
+            return {**COUNTS, "cork": 1} if start == 2 else COUNTS
+
+        self.build(FakeExport(counts=counts))
+        self.assertEqual(self.sample(SRC_B)["tricks"], [])
+        self.assertEqual(self.sample(SRC_B)["held_back_windows"], [[5, 15]])
+
+    def test_a_page_without_counts_holds_every_trick_back(self):
+        def counts(start):
+            return None if start == 4 else COUNTS
+
+        stats = self.build(FakeExport(counts=counts))
+        self.assertEqual(stats["clips"], 0)
+
+    def test_malformed_counts_fail_closed(self):
+        good = {"canonical": "cork", "contributors": 9}
+        bad_counts = [
+            "cork",
+            [["cork", 9]],
+            [{**good, "contributors": -1}],
+            [{**good, "contributors": "9"}],
+            [{**good, "contributors": True}],
+            [{**good, "canonical": ""}],
+            [{**good, "extra": 1}],
+            [good, good],
+        ]
+        exports = [
+            (FakeExport(counts=lambda start, b=b: b), "trick_contributors")
+            for b in bad_counts
+        ] + [
+            (FakeExport(minimum=b), "contributor_minimum")
+            for b in (0, -1, "5", True, 2.5)
+        ]
+        argv = ["build", "--out", str(self.root / "o"), "--cache", str(self.cache)]
+        for export, field in exports:
+            with self.subTest(field=field):
+                code = fetch_dataset.main(
+                    argv, transport=export, blob_getter=self.blobs
+                )
+                self.assertEqual(code, EXIT_ERROR)
+                self.assertIn(field, self.stderr.getvalue())
+                self.assertFalse((self.root / "o").exists())
 
     def test_pin_is_the_farms_current_taxonomy_version(self):
         # A curation-only bump: version 3 maps a raw string no label was
@@ -359,7 +526,8 @@ class BuildTest(FetchTestCase):
             *TAXONOMY,
             {"raw": "mystery flip", "canonical": "mystery", "taxonomy_version": 3},
         ]
-        stats = self.build(FakeExport(taxonomy=curated))
+        counts = {**COUNTS, "mystery": COUNTS["cork"]}
+        stats = self.build(FakeExport(taxonomy=curated, counts=counts))
         self.assertEqual(stats["taxonomy_version"], 3)
         self.assertEqual(stats["unmapped_tokens"], 0)
         self.assertEqual(self.sample(SRC_C)["tricks"][0]["name"], "mystery")
