@@ -12,7 +12,8 @@
 #                   gate's quarantine candidates (needed once the gate runs)
 #
 # Steps: split -> train (fine-tune the champion unless FROM_SCRATCH=true)
-# -> predict holdout -> evaluate holdout -> per-name metrics (#41) ->
+# -> predict holdout -> evaluate holdout -> membership-inference check
+# (§6.2, written into the holdout report) -> per-name metrics (#41) ->
 # score the challenger on the trick-labeled fixture set (fixture_runner.py)
 # -> fixture gate (§6.3) against the champion's recorded fixture scores ->
 # promotion gate (§8) if the fixture gate passed -> publish (#16: Core ML
@@ -31,6 +32,8 @@
 #     against, so nothing is promoted unless BOOTSTRAP_CHAMPION=true, the
 #     maintainer's explicit choice to make this challenger the first
 #     champion (§6.3: the nightly path never promotes ungated);
+#   - a challenger that fails the membership-inference check: the
+#     promotion gate archives it (promote.py reads the holdout report);
 #   - a fixture regression: promotion is skipped, quarantine.json written
 #     (nothing here sends it: the workflow's farm job does, with
 #     Training/report_quarantine.py, before it advances the watermark);
@@ -153,6 +156,20 @@ python Training/evaluate.py \
   --split "$RUN/split.json" --samples-dir "$DATASET/samples" \
   --out "$RUN/challenger/holdout_report.json"
 
+# Membership inference (§6.2): exit 3 is a failed check, not an error;
+# it is recorded in the report, and promote.py archives on it.
+membership=pass
+status=0
+python Training/membership_inference.py \
+  --model "$RUN/challenger/model.npz" --split "$RUN/split.json" \
+  --samples-dir "$DATASET/samples" \
+  --report "$RUN/challenger/holdout_report.json" || status=$?
+case $status in
+  0) ;;
+  3) membership=fail ;;
+  *) die "membership-inference check failed to run (exit $status)" ;;
+esac
+
 python Training/name_metrics.py \
   --report "$RUN/challenger/holdout_report.json" \
   --metrics "$RUN/challenger/metrics.json" --split "$RUN/split.json" \
@@ -236,6 +253,7 @@ challenger the first champion."
       status=0
       python Training/promote.py --champion "$CHAMPION/metrics.json" \
         --challenger "$RUN/challenger/metrics.json" \
+        --holdout-report "$RUN/challenger/holdout_report.json" \
         --registry "$REGISTRY" >"$RUN/promotion.json" || status=$?
       case $status in
         0) promotion=promote ;;
@@ -256,7 +274,12 @@ before it advances the watermark." ;;
         STOP="Fixture gate: pass. Promotion: promote; the challenger is \
 staged with its fixture scores as the champion in $UPDATE." ;;
       pass/archive)
-        STOP="Fixture gate: pass. Promotion: archive; the champion stays." ;;
+        STOP="Fixture gate: pass. Promotion: archive; the champion stays."
+        if [ "$membership" = fail ]; then
+          STOP="$STOP The challenger did not pass the membership-inference \
+check (§6.2), so it was archived whatever its metric."
+        fi
+        ;;
       pass/not-run)
         STOP="Fixture gate: pass. Promotion: not run; the champion has no \
 metrics.json to compare against. Store its val metrics with it \
@@ -307,13 +330,14 @@ fi
 echo "$STOP"
 
 python - "$RUN" "$config" "$STOP" "$gate" "$promotion" "$rescored" \
-  "$scoreable" "$champion_scores" >>"$SUMMARY" <<'EOF'
+  "$scoreable" "$champion_scores" "$membership" >>"$SUMMARY" <<'EOF'
 import json
 import sys
 from pathlib import Path
 
 run = Path(sys.argv[1])
-config, stop, gate, promotion, rescored, scoreable, champion_scores = sys.argv[2:]
+(config, stop, gate, promotion, rescored, scoreable, champion_scores,
+ membership) = sys.argv[2:]
 
 
 def load(path):
@@ -333,6 +357,7 @@ outcome = {
     "fixtures_scoreable": scoreable == "true",
     "leakage_flagged": gap.get("flagged", False),
     "leakage_streak": gap.get("streak_promoted_runs_over_threshold", 0),
+    "membership_inference": membership,
 }
 (run / "outcome.json").write_text(
     json.dumps(outcome, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -368,6 +393,12 @@ if gap:
           f"(val_f1 {gap['val_f1']:.4f} vs holdout f1 {gap['holdout_f1']:.4f}); "
           f"streak {gap['streak_promoted_runs_over_threshold']} promoted runs "
           f"over 0.05{flag_note}")
+
+
+mi = report["membership_inference"]
+print(f"- Membership inference (§6.2): {membership}, auc {mi['auc']:.4f} "
+      f"(max {mi['max_auc']}) over {mi['n_train_sources']} train and "
+      f"{mi['n_holdout_sources']} holdout sources (min {mi['min_sources']})")
 
 
 def scores_line(label, path):
