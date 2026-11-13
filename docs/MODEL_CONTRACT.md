@@ -152,7 +152,10 @@ Notes:
    holds one directory, `TrickDetector.mlpackage/`. It is not
    a compiled `.mlmodelc`: compiling needs macOS (`coremlcompiler`) and
    the pipeline runs on Ubuntu, so the client compiles the package on
-   device (§4).
+   device (§4). Release checks (`Training/release_checks.py`,
+   TRAINING_DESIGN.md §6.2) then confirm the zip carries nothing but the
+   model's parameters: no pose sequences and no per-example embeddings.
+   A failure publishes nothing.
 3. Upload the artifact to `models/trick-v<...>.mlpackage.zip` and the
    holdout report to `reports/trick-v<...>-holdout.json` in R2 (`models/`
    and `reports/` are the pipeline's prefixes in the shared bucket).

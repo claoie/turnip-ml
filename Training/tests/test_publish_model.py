@@ -34,6 +34,7 @@ import export_coreml
 import name_metrics
 import predict
 import publish_model
+import release_checks
 import train
 
 REPO = Path(__file__).resolve().parent.parent.parent
@@ -63,6 +64,13 @@ def stand_in_export(model_path: Path) -> bytes:
 
 
 EXPORT = export_coreml.export if HAVE_COREMLTOOLS else stand_in_export
+
+
+def stand_in_release_check(model_path: Path, artifact: bytes) -> None:
+    """The stand-in artifact is no Core ML package: nothing to check."""
+
+
+RELEASE_CHECK = release_checks.check if HAVE_COREMLTOOLS else stand_in_release_check
 
 
 # -- fakes -----------------------------------------------------------------------
@@ -324,6 +332,7 @@ class PublishTestCase(unittest.TestCase):
             transport=(farm or self.farm).transport,
             store=r2 or self.r2,
             exporter=EXPORT,
+            release_check=RELEASE_CHECK,
         )
 
     def logs(self) -> str:
@@ -526,6 +535,24 @@ class RefusalTest(PublishTestCase):
         self.assertNothingHappened()
         self.assertEqual(self.farm.calls, 0)
 
+    def test_a_failed_release_check_publishes_nothing(self) -> None:
+        def failing(model_path: Path, artifact: bytes) -> None:
+            raise release_checks.ReleaseCheckError("program holds a pose window")
+
+        code = publish_model.main(
+            ["--run", str(self.run_dir), "--dataset", str(self.dataset)],
+            transport=self.farm.transport,
+            store=self.r2,
+            exporter=EXPORT,
+            release_check=failing,
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("release checks failed", self.stderr.getvalue())
+        self.assertNothingHappened()
+        self.assertEqual(self.farm.calls, 0)
+        artifact = self.run_dir / "challenger" / publish_model.ARTIFACT_NAME
+        self.assertFalse(artifact.exists())
+
     def test_a_dataset_without_canonical_names_is_refused(self) -> None:
         self.set_canonical_names(None)
         self.assertEqual(self.main(), 2)
@@ -642,6 +669,7 @@ class HttpTransportTest(PublishTestCase):
                 ["--run", str(self.run_dir), "--dataset", str(self.dataset)],
                 store=self.r2,
                 exporter=EXPORT,
+                release_check=RELEASE_CHECK,
             )
 
     def test_publish_over_http(self) -> None:
@@ -695,6 +723,7 @@ class HttpTransportTest(PublishTestCase):
                 ["--run", str(self.run_dir), "--dataset", str(self.dataset)],
                 store=self.r2,
                 exporter=EXPORT,
+                release_check=RELEASE_CHECK,
             )
         self.assertEqual(code, 2)
         self.assertIn("HTTP 302", self.stderr.getvalue())

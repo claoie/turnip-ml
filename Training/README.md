@@ -18,8 +18,12 @@ what this repo validates; see the root README for repo-wide conventions.
   `name_metrics` (turnip-ml#41).
 - `export_coreml.py` — exports a trained model to a byte-reproducible fp16
   Core ML `.mlpackage` zip (turnip-ml#16).
-- `publish_model.py` — publishes a promoted champion: export, R2 upload
-  with read-back hash checks, `POST /api/models` (turnip-ml#16).
+- `publish_model.py` — publishes a promoted champion: export, release
+  checks, R2 upload with read-back hash checks, `POST /api/models`
+  (turnip-ml#16).
+- `release_checks.py` — confirms an exported artifact carries nothing
+  but the model's parameters: no pose sequences, no per-example
+  embeddings (`docs/TRAINING_DESIGN.md` §6.2).
 - `make_smoke_fixture.py` — generates the tiny synthetic smoke fixture.
 - `fixture_runner.py` — scores a model on the trick-labeled fixture set
   and writes the fixture gate's input (turnip-ml#27); also the one place
@@ -250,6 +254,8 @@ python Training/publish_model.py --run data/run --dataset data/dataset
 2. Exports the champion with `export_coreml.py`. The pipeline runs on
    Ubuntu, so the artifact is a `.mlpackage` zip the client compiles on
    device, not a compiled `.mlmodelc` (`docs/MODEL_CONTRACT.md` §2).
+   `release_checks.py` then checks the zip holds nothing but the
+   model's parameters; a failure stops the publish before any upload.
 3. Picks the version: the minor bump of the farm's current model, or
    `trick-v1.0` before the first; `--major` or `--version` override it.
    If the current model already is this artifact (same sha256), an

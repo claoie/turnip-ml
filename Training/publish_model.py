@@ -40,7 +40,10 @@ effect, so a bad run uploads nothing.
    maps it (dataset/unmapped_labels.log is the queue).
 1. Export model.npz with export_coreml.py into
    challenger/TrickDetector.mlpackage.zip; sha256 and byte_size are over
-   those exact zip bytes, the bytes the client downloads.
+   those exact zip bytes, the bytes the client downloads. The release
+   checks (release_checks.py: no pose sequences, no per-example
+   embeddings, nothing but the model's parameters) run on those bytes
+   first; a failure is an error before anything is uploaded or written.
 2. Version: GET /api/models/current (public). If the current model is
    already this artifact (same sha256), it was published before, by a run
    whose answer was lost, and nothing more happens. Otherwise 404
@@ -93,6 +96,7 @@ from typing import Any, Protocol
 
 import export_coreml
 import name_metrics
+import release_checks
 import train
 from fetch_dataset import (
     FARM_URL_ENV,
@@ -124,6 +128,7 @@ REPORT_TYPE = "application/json"
 # (method, url, headers, body) -> (HTTP status, parsed JSON body or None)
 Transport = Callable[[str, str, dict[str, str], bytes | None], tuple[int, Any]]
 Exporter = Callable[[Path], bytes]
+ReleaseCheck = Callable[[Path, bytes], None]
 
 
 class PublishError(Exception):
@@ -457,8 +462,10 @@ def publish(
     version: str | None = None,
     major: bool = False,
     exporter: Exporter = export_coreml.export,
+    release_check: ReleaseCheck = release_checks.check,
 ) -> dict[str, Any]:
-    """Export, upload and publish the run's challenger. Returns the record."""
+    """Export, check, upload and publish the run's challenger. Returns the
+    record."""
     challenger = run / "challenger"
     body = build_request(run, dataset)
     report = (challenger / "holdout_report.json").read_bytes()
@@ -466,6 +473,10 @@ def publish(
         artifact = exporter(challenger / "model.npz")
     except export_coreml.ExportError as e:
         raise PublishError(f"export failed: {e}") from e
+    try:
+        release_check(challenger / "model.npz", artifact)
+    except release_checks.ReleaseCheckError as e:
+        raise PublishError(f"release checks failed: {e}") from e
     (challenger / ARTIFACT_NAME).write_bytes(artifact)
     sha = _sha256(artifact)
 
@@ -530,6 +541,7 @@ def main(
     transport: Transport | None = None,
     store: ObjectStore | None = None,
     exporter: Exporter = export_coreml.export,
+    release_check: ReleaseCheck = release_checks.check,
 ) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     try:
@@ -547,6 +559,7 @@ def main(
             args.version,
             args.major,
             exporter,
+            release_check,
         )
     except (PublishError, OSError) as e:
         print(f"publish_model: error: {e}", file=sys.stderr)

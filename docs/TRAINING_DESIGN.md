@@ -375,13 +375,28 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   receives the model, so treating it as anonymous needs evidence
   (`BACKEND_DESIGN.md` §9 Q8, EDPB Opinion 28/2024). The holdout report
   gains a membership-inference check: can the model's outputs tell
-  training sources from holdout sources better than chance? Release
-  checks also confirm that no pose sequences ship inside the model
-  artifact. The farm's privacy plan (`BACKEND_DESIGN.md` §8.1) adds two
-  rules: no per-example embeddings ship in a model, and a rare trick,
-  with its metrics, is held back until enough people have contributed
-  it. Models are retrained on a set schedule, so deleted data leaves
-  within one cycle (§2.1).
+  training sources from holdout sources better than chance? The farm's
+  privacy plan (`BACKEND_DESIGN.md` §8.1) also holds a rare trick, with
+  its metrics, back until enough people have contributed it. Models are
+  retrained on a set schedule, so deleted data leaves within one cycle
+  (§2.1).
+- **Release checks: nothing but the model ships.** No pose sequences
+  and no per-example embeddings ship inside a model artifact (the
+  second is the farm's privacy plan, `BACKEND_DESIGN.md` §8.1).
+  `Training/publish_model.py` runs `Training/release_checks.py` on the
+  exported zip before anything is uploaded, and a failure publishes
+  nothing. The checks are allow-lists, so whatever is not one of the
+  model's parameters fails however it is stored:
+  - the checkpoint holds only the model's keys, at the shapes the
+    export reads;
+  - the zip holds only the package's spec, weight file and manifest;
+  - every floating-point value in the Core ML program equals one of the
+    model's parameters (`feat_mean`, `1 / feat_std`, `W`, `b`), and
+    every other value (shapes, axes, flags) has at most 8 elements;
+  - the weight file holds only blobs the program reads;
+  - the metadata, inputs and outputs are the contract's
+    (`MODEL_CONTRACT.md` §3). The `window_embeddings` output is computed
+    on the device from its own input; it stores nothing.
 
 ### 6.3 Fixture regression gate (anti-poisoning)
 
