@@ -21,7 +21,15 @@ what those PRs implement, it says so explicitly.
   video, and no account identifier: the farm links a contribution to an
   account only internally, until 30 days after its last write, and
   never exports that link (master plan §1; `BACKEND_DESIGN.md`
-  §1.2.17).
+  §1.2.17). That makes the data de-linked and hard to re-identify, not
+  anonymous: a pose sequence can still be matched to a video of the same
+  clip (`BACKEND_DESIGN.md` §9 Q9).
+- *Proposed (farm privacy plan, `BACKEND_DESIGN.md` §8.1; not built):*
+  the farm keeps the account link until deletion instead of 30 days,
+  still never exported, and cuts short transformed segments at ingest
+  (hip-centered, scaled to a standard body, one head point, light
+  noise). Training would then read segments, not whole-session pose,
+  and §2.2 and §2.5 need revisiting when that lands.
 - The export excludes quarantined sources (master plan §4) and presents
   one **(source, clip, canonical trick name)** row per label — see §2.2.
 - Each row also carries the label's provenance (`BACKEND_DESIGN.md`
@@ -369,7 +377,11 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   gains a membership-inference check: can the model's outputs tell
   training sources from holdout sources better than chance? Release
   checks also confirm that no pose sequences ship inside the model
-  artifact.
+  artifact. The farm's privacy plan (`BACKEND_DESIGN.md` §8.1) adds two
+  rules: no per-example embeddings ship in a model, and a rare trick,
+  with its metrics, is held back until enough people have contributed
+  it. Models are retrained on a set schedule, so deleted data leaves
+  within one cycle (§2.1).
 
 ### 6.3 Fixture regression gate (anti-poisoning)
 
@@ -624,8 +636,12 @@ one review can clear.
     outcome, whether a bail trains as its trick, as a separate class,
     or not at all.
 11. Offline check of on-device personalization (`MODEL_CONTRACT.md`
-    §3.5) — contributions lose their account link after 30 days, so
-    the export cannot group them by user. Replaying personalization per
+    §3.5) — contributions lose their account link after 30 days, and
+    the export never carries it, so the export cannot group them by
+    user. Replaying personalization per
     source (built on a source's earlier clips, scored on its later ones)
     is the closest offline proxy, and the contract's fixed clip-embedding
     rule makes that replay match the client.
+12. Rare-trick hold-back (§6.2) — how many distinct contributors a trick
+    needs before it ships, and the retrain schedule that bounds how long
+    deleted data stays in a model.
