@@ -13,6 +13,9 @@ Inputs
               Default: val_accuracy.
 --threshold   minimum *relative* improvement required to promote, as a
               fraction. Default: 0.01 (">=1%").
+--refresh     a scheduled from-scratch retrain (Training/retrain_schedule.py):
+              the threshold is -REFRESH_TOLERANCE instead (see "Refresh").
+              Not combinable with --threshold.
 --registry    model-registry stand-in: a JSON array file each decision
               record is appended to. Default: Training/registry.json.
               This file is the audit trail the scheduled nightly trigger
@@ -23,7 +26,17 @@ Decision rule
     improvement = (challenger - champion) / champion      (champion != 0)
 Promote iff improvement >= threshold. When the champion's metric is 0,
 promote iff the challenger's metric is > 0; 0-vs-0 is "no improvement"
-and archives.
+and archives, except on a refresh (negative threshold), which needs no
+improvement.
+
+Refresh
+-------
+A scheduled retrain exists to replace the champion, whose weights still
+carry data deleted since it was trained (TRAINING_DESIGN.md §2.1), so it
+need not beat the champion: it promotes unless it is more than
+REFRESH_TOLERANCE (2%) worse, relative. *(Judgment call on 2%.)* The
+fixture gate runs before it as for every challenger. The record carries
+"refresh": true.
 
 Exit codes: 0 = promote, 3 = archive, 2 = input/usage error (fail closed).
 
@@ -63,6 +76,7 @@ EXIT_ERROR = 2
 
 DEFAULT_METRIC = "val_accuracy"
 DEFAULT_THRESHOLD = 0.01
+REFRESH_TOLERANCE = 0.02
 DEFAULT_REGISTRY = "Training/registry.json"
 
 
@@ -111,6 +125,13 @@ def decide(
                 float("inf"),
                 f"champion {metric}=0, challenger={challenger:.6f} > 0",
             )
+        if threshold < 0.0 and challenger == 0.0:
+            # A refresh needs no improvement, only no loss.
+            return (
+                "promote",
+                0.0,
+                f"champion {metric}=0, challenger=0: no loss, threshold {threshold:.4%}",
+            )
         return (
             "archive",
             0.0,
@@ -149,6 +170,7 @@ def run(
     metric: str,
     threshold: float,
     registry_path: Path,
+    refresh: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """Evaluate the gate. Returns (decision_record, exit_code)."""
     champion_metrics = load_metrics(champion_path)
@@ -168,6 +190,7 @@ def run(
         "reason": reason,
         "champion_metrics": champion_metrics,
         "challenger_metrics": challenger_metrics,
+        "refresh": refresh,
     }
 
     registry = load_registry(registry_path)
@@ -202,9 +225,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--threshold",
-        default=DEFAULT_THRESHOLD,
+        default=None,
         type=float,
         help=f"minimum relative improvement to promote (default: {DEFAULT_THRESHOLD})",
+    )
+    p.add_argument(
+        "--refresh",
+        action="store_true",
+        help=f"scheduled retrain: promote unless {REFRESH_TOLERANCE:.0%} worse",
     )
     p.add_argument(
         "--registry",
@@ -218,12 +246,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     try:
-        if not math.isfinite(args.threshold) or args.threshold < 0:
-            raise GateError(
-                f"threshold must be a finite number >= 0, got {args.threshold}"
-            )
+        if args.refresh:
+            if args.threshold is not None:
+                raise GateError("--refresh sets the threshold; drop --threshold")
+            threshold = -REFRESH_TOLERANCE
+        else:
+            threshold = DEFAULT_THRESHOLD if args.threshold is None else args.threshold
+            if not math.isfinite(threshold) or threshold < 0:
+                raise GateError(
+                    f"threshold must be a finite number >= 0, got {threshold}"
+                )
         record, code = run(
-            args.champion, args.challenger, args.metric, args.threshold, args.registry
+            args.champion,
+            args.challenger,
+            args.metric,
+            threshold,
+            args.registry,
+            args.refresh,
         )
     except GateError as e:
         print(f"promote: error: {e}", file=sys.stderr)

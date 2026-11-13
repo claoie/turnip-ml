@@ -164,11 +164,15 @@ def outcome(
     scoreable=True,
     leakage_flagged=False,
     leakage_streak=0,
+    from_scratch=False,
+    refresh=False,
 ):
     return {
         "champion_rescored": rescored,
         "fixture_gate": gate,
         "fixtures_scoreable": scoreable,
+        "from_scratch": from_scratch,
+        "refresh": refresh,
         "leakage_flagged": leakage_flagged,
         "leakage_streak": leakage_streak,
         "promotion": promotion,
@@ -179,7 +183,8 @@ class StopsTest(PipelineTestCase):
     def test_bootstrap_stages_the_first_champion_with_its_scores(self):
         bootstrap = self.root / "data" / "bootstrap"
         self.assertEqual(
-            self.load(bootstrap / "outcome.json"), outcome("not-run", "bootstrap")
+            self.load(bootstrap / "outcome.json"),
+            outcome("not-run", "bootstrap", from_scratch=True),
         )
         update = bootstrap / "champion_update"
         self.assertEqual(sorted(p.name for p in update.iterdir()), FULL_SLOT)
@@ -190,7 +195,9 @@ class StopsTest(PipelineTestCase):
 
     def test_no_champion_scores_the_challenger_and_stops(self):
         result = self.ok()
-        self.assertEqual(self.outcome(), outcome("not-run", "not-run"))
+        self.assertEqual(
+            self.outcome(), outcome("not-run", "not-run", from_scratch=True)
+        )
         self.assertTrue((self.run_dir / "challenger" / "fixture_scores.json").exists())
         self.assertEqual(self.update_files(), [])
         self.assertIn("no champion yet", result.stdout)
@@ -217,7 +224,8 @@ class StopsTest(PipelineTestCase):
                 # Nothing to gate, so no changed-source list is needed.
                 result = self.ok(FIXTURES=fixtures, INGESTED="data/missing.json")
                 self.assertEqual(
-                    self.outcome(), outcome("not-run", "not-run", scoreable=False)
+                    self.outcome(),
+                    outcome("not-run", "not-run", scoreable=False),
                 )
                 self.assertFalse(
                     (self.run_dir / "challenger" / "fixture_scores.json").exists()
@@ -388,6 +396,33 @@ class GatesTest(PipelineTestCase):
             self.assertEqual(self.outcome()["promotion"], "promote")
             self.assertIn("PUBLISH is not true", result.stdout)
             self.assertFalse((self.run_dir / "challenger" / "publish.json").exists())
+
+    def test_scheduled_retrain_replaces_an_equal_champion(self):
+        # The from-scratch challenger matches the champion's val accuracy
+        # (the smoke data is separable): a normal run archives it, a
+        # refresh promotes it.
+        self.seed_champion()
+        champion_acc = self.load(self.champion / "metrics.json")["val_accuracy"]
+        self.ok(FROM_SCRATCH="true")
+        challenger = self.load(self.run_dir / "challenger" / "metrics.json")
+        self.assertEqual(challenger["val_accuracy"], champion_acc)
+        self.assertEqual(self.outcome(), outcome("pass", "archive", from_scratch=True))
+        result = self.ok(FROM_SCRATCH="true", REFRESH="true")
+        self.assertEqual(
+            self.outcome(),
+            outcome("pass", "promote", from_scratch=True, refresh=True),
+        )
+        self.assertEqual(self.update_files(), FULL_SLOT)
+        self.assertIn("replaced the champion", result.stdout)
+        promotion = self.load(self.run_dir / "promotion.json")
+        self.assertIs(promotion["refresh"], True)
+
+    def test_refresh_needs_from_scratch(self):
+        self.seed_champion()
+        result = self.pipeline(REFRESH="true")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("REFRESH=true needs FROM_SCRATCH=true", result.stderr)
+        self.assertFalse(self.run_dir.exists())
 
     def test_champion_without_metrics_runs_the_gate_only(self):
         self.seed_champion()

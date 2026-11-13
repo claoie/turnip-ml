@@ -12,11 +12,13 @@
 #              only).
 #   farm       the real run, from the `training` Environment: count label
 #              rows changed since the stored watermark (skip at 50 or
-#              fewer unless `force`), full pull + pose blobs, the changed-
-#              source list, then the shared chain. Logs and artifacts of
-#              this public repository are public, so nothing per-sample is
-#              printed or uploaded as an artifact: the run directory goes
-#              to the private R2 bucket. A promoted champion (or a
+#              fewer unless `force`, or a scheduled retrain is due: then
+#              the run trains from scratch and the promotion gate runs as
+#              a refresh, TRAINING_DESIGN.md §2.1), full pull + pose blobs,
+#              the changed-source list, then the shared chain. Logs and
+#              artifacts of this public repository are public, so nothing
+#              per-sample is printed or uploaded as an artifact: the run
+#              directory goes to the private R2 bucket. A promoted champion (or a
 #              re-scored one) is stored back to R2 as a new version, and
 #              the gates' decision log with it. A fixture regression's
 #              suspect sources are then quarantined farm-side
@@ -189,6 +191,8 @@ jobs:
 
       # training/state/export_state.json  the watermark (never printed: the
       #                                   cursor may embed raw label text)
+      # training/state/retrain_state.json the date of the last full
+      #                                   (from-scratch) retrain
       # training/champion/current.json    the champion pointer, if any:
       #                                   its version and file hashes
       #   .../versions/<version>/         model.npz (fine-tune base),
@@ -216,6 +220,7 @@ jobs:
             fi
           }
           restore state/export_state.json data/state/export_state.json
+          restore state/retrain_state.json data/state/retrain_state.json
           if r2 ls "$base/champion/current.json" > /dev/null; then
             r2 cp --only-show-errors "$base/champion/current.json" data/champion-pointer.json
             version=$(python Training/champion_slot.py version data/champion-pointer.json)
@@ -240,9 +245,24 @@ jobs:
           fi
           echo "restored $(find data/fixture-poses -type f | wc -l | tr -d ' ') fixture pose blobs"
 
+      # A full retrain every RETRAIN_INTERVAL_DAYS (retrain_schedule.py), so
+      # data deleted farm-side leaves the champion's weights within one
+      # cycle, even on nights the label count would skip.
+      - if: steps.config.outputs.configured == 'true'
+        name: Check the retrain schedule
+        id: schedule
+        run: |
+          python Training/retrain_schedule.py due \
+            --state data/state/retrain_state.json --today "$(date -u +%F)" > data/schedule.json
+          due=$(python -c 'import json; print(str(json.load(open("data/schedule.json"))["due"]).lower())')
+          echo "scheduled retrain due: $due"
+          echo "due=$due" >> "$GITHUB_OUTPUT"
+
       - if: steps.config.outputs.configured == 'true'
         name: Count label rows changed since the watermark
         id: count
+        env:
+          RETRAIN_DUE: ${{ steps.schedule.outputs.due }}
         run: |
           state=()
           [ -f data/state/export_state.json ] && state=(--state data/state/export_state.json)
@@ -250,7 +270,7 @@ jobs:
             --out-state data/state/count_state.json > data/count.json
           new=$(python -c 'import json; print(json.load(open("data/count.json"))["new_labels"])')
           echo "new label rows since the watermark: $new"
-          if [ "$new" -le 50 ] && [ "$FORCE" != "true" ]; then
+          if [ "$new" -le 50 ] && [ "$FORCE" != "true" ] && [ "$RETRAIN_DUE" != "true" ]; then
             echo "::notice::$new new label rows (50 or fewer): skipping this run."
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
@@ -280,7 +300,8 @@ jobs:
       - if: steps.count.outputs.run == 'true'
         name: Split, train, evaluate, fixture gate and promotion
         env:
-          FROM_SCRATCH: ${{ inputs.from_scratch || false }}
+          FROM_SCRATCH: ${{ inputs.from_scratch || steps.schedule.outputs.due == 'true' }}
+          REFRESH: ${{ steps.schedule.outputs.due == 'true' }}
           BOOTSTRAP_CHAMPION: ${{ inputs.bootstrap_champion || false }}
           REGISTRY: data/registry.json
           PUBLISH: 'true'
@@ -318,6 +339,23 @@ jobs:
           r2 cp --recursive --only-show-errors "$update" "$base/versions/$version/"
           r2 cp --only-show-errors data/champion-next.json "$base/current.json"
           echo "stored champion version $version"
+
+      # Only once the champion is stored: a from-scratch challenger that
+      # became the champion restarts the retrain cycle.
+      - if: steps.count.outputs.run == 'true'
+        name: Record a full retrain
+        run: |
+          python Training/retrain_schedule.py record \
+            --state data/state/retrain_state.json --today "$(date -u +%F)" \
+            --outcome data/run/outcome.json > data/retrain_record.json
+          if python -c 'import json, sys; sys.exit(0 if json.load(open("data/retrain_record.json"))["recorded"] else 1)'; then
+            aws --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+              s3 cp --only-show-errors data/state/retrain_state.json \
+              "s3://${R2_BUCKET}/training/state/retrain_state.json"
+            echo "recorded a full retrain"
+          else
+            echo "no full retrain to record"
+          fi
 
       - if: steps.count.outputs.run == 'true'
         name: Store the decision log in R2
