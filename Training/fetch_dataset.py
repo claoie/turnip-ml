@@ -54,14 +54,21 @@ build --out DIR --cache DIR
 
 Rare-trick hold-back
 --------------------
-A trick ships, with its metrics, only once at least MIN_CONTRIBUTORS
-distinct people have contributed it (TRAINING_DESIGN.md §6.2). Each
-export page carries the farm's count of distinct contributors per
-canonical name in CONTRIBUTOR_COUNTS_FIELD, an object of name -> count.
-A name's count is its minimum over the pages, a name absent from a page
-counting 0, and a page without the field counts every name 0: without
-a count, a trick is held back (fail closed). Unmapped tokens have no
-count, so they are held back too.
+A trick ships, with its metrics, only once enough distinct people have
+contributed it (TRAINING_DESIGN.md §6.2). The farm decides both numbers
+(BACKEND_DESIGN.md §1.2.27, §7.3), and every export page carries them:
+  trick_contributors   [{"canonical": name, "contributors": count}],
+                       distinct contributors per canonical trick under
+                       the current taxonomy; a trick missing from the
+                       list has 0
+  contributor_minimum  the count a trick needs: it trains iff
+                       contributors >= contributor_minimum
+Both are whole-export values, the same on every page. Read
+conservatively all the same: a trick's count is its minimum over the
+pages (absent from a page counts 0), the minimum is the greatest any
+page gives, and a page without either field holds every trick back
+(fail closed). Unmapped tokens have no count, so they are held back
+too. A malformed field is an error.
 
 A clip that carries any held-back name is held back whole: it leaves no
 trick entry (so no name, train count or holdout metric), and its window
@@ -159,11 +166,11 @@ PIPELINE_KEY_ENV = "TURNIP_PIPELINE_KEY"
 R2_ENV = ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET")
 
 HEX64_RE = re.compile(r"[0-9a-f]{64}")
-# Rare-trick hold-back (TRAINING_DESIGN.md §6.2): the export field with the
-# farm's per-name count of distinct contributors, and the count a name
-# needs before it trains and ships. *(Judgment call on 5.)*
-CONTRIBUTOR_COUNTS_FIELD = "trick_contributor_counts"
-MIN_CONTRIBUTORS = 5
+# Rare-trick hold-back (TRAINING_DESIGN.md §6.2): the export fields with
+# the farm's per-trick count of distinct contributors and the count a
+# trick needs before it trains and ships (BACKEND_DESIGN.md §1.2.27).
+TRICK_CONTRIBUTORS_FIELD = "trick_contributors"
+CONTRIBUTOR_MINIMUM_FIELD = "contributor_minimum"
 # A label's origin (BACKEND_DESIGN.md §1.2.18): typed by hand, picked from
 # the vocabulary's suggestions, or pre-filled by the trick model and kept.
 ORIGINS = ("typed", "vocabulary", "model")
@@ -204,6 +211,9 @@ class ExportPull:
     # Distinct contributors per canonical name, the minimum over the pages
     # (module docstring, "Rare-trick hold-back").
     contributor_counts: dict[str, int]
+    # The farm's hold-back threshold; None when a page lacked it, which
+    # holds every trick back.
+    contributor_minimum: int | None
 
 
 # -- export ------------------------------------------------------------------
@@ -334,19 +344,39 @@ def parse_taxonomy(i: int, entry: Any) -> tuple[str, str, int]:
     return raw, canonical, version
 
 
+def _is_count(n: Any) -> bool:
+    return isinstance(n, int) and not isinstance(n, bool) and n >= 0
+
+
 def parse_contributor_counts(page: dict[str, Any]) -> dict[str, int]:
-    """A page's per-name contributor counts; {} when the page has none."""
-    counts = page.get(CONTRIBUTOR_COUNTS_FIELD)
-    if counts is None:
+    """A page's per-trick contributor counts; {} when the page has none."""
+    entries = page.get(TRICK_CONTRIBUTORS_FIELD)
+    if entries is None:
         return {}
-    if not isinstance(counts, dict):
-        raise FetchError(f"export {CONTRIBUTOR_COUNTS_FIELD} must be an object")
-    for name, n in counts.items():
-        if not (name and isinstance(n, int) and not isinstance(n, bool) and n >= 0):
-            raise FetchError(
-                f"export {CONTRIBUTOR_COUNTS_FIELD} values must be counts >= 0"
-            )
-    return dict(counts)
+    where = f"export {TRICK_CONTRIBUTORS_FIELD}"
+    if not isinstance(entries, list):
+        raise FetchError(f"{where} must be an array")
+    counts: dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"canonical", "contributors"}:
+            raise FetchError(f"{where} entries must be {{canonical, contributors}}")
+        name, n = entry["canonical"], entry["contributors"]
+        if not (isinstance(name, str) and name and _is_count(n)):
+            raise FetchError(f"{where} entries need a name and a count >= 0")
+        if name in counts:
+            raise FetchError(f"{where} lists a trick twice")
+        counts[name] = n
+    return counts
+
+
+def parse_contributor_minimum(page: dict[str, Any]) -> int | None:
+    """A page's hold-back threshold; None when the page has none."""
+    minimum = page.get(CONTRIBUTOR_MINIMUM_FIELD)
+    if minimum is None:
+        return None
+    if not _is_count(minimum) or minimum < 1:
+        raise FetchError(f"export {CONTRIBUTOR_MINIMUM_FIELD} must be a count >= 1")
+    return int(minimum)
 
 
 def _min_counts(pages: list[dict[str, int]]) -> dict[str, int]:
@@ -424,6 +454,7 @@ class ExportClient:
         rows: list[LabelRow] = []
         taxonomy: set[tuple[str, str, int]] = set()
         counts: list[dict[str, int]] = []
+        minimums: list[int | None] = []
         cursor = since
         seen: set[str | None] = {since}
         while True:
@@ -449,13 +480,16 @@ class ExportClient:
             rows.extend(parse_row(offset + i, r) for i, r in enumerate(page["rows"]))
             taxonomy.update(parse_taxonomy(i, t) for i, t in enumerate(page_taxonomy))
             counts.append(parse_contributor_counts(page))
+            minimums.append(parse_contributor_minimum(page))
             if not page["rows"] or next_cursor is None:
                 break
             if next_cursor in seen:
                 raise FetchError("export cursor did not advance")
             seen.add(next_cursor)
             cursor = next_cursor
-        return ExportPull(rows, sorted(taxonomy), cursor, _min_counts(counts))
+        known = [m for m in minimums if m is not None]
+        minimum = max(known) if known and len(known) == len(minimums) else None
+        return ExportPull(rows, sorted(taxonomy), cursor, _min_counts(counts), minimum)
 
 
 # -- pose blobs ----------------------------------------------------------------
@@ -699,7 +733,10 @@ def _write_dataset(
                 clips_dropped += 1
                 continue
             rare = {
-                n for n in names if pull.contributor_counts.get(n, 0) < MIN_CONTRIBUTORS
+                n
+                for n in names
+                if pull.contributor_minimum is None
+                or pull.contributor_counts.get(n, 0) < pull.contributor_minimum
             }
             if rare:
                 # The whole clip: a combo window labeled with only its
@@ -758,10 +795,11 @@ def _write_dataset(
         # public and the token is a contributor's free text.
         "canonical_names": taxonomy.canonical_names,
         "export_cursor": pull.cursor,
-        # Names with fewer than MIN_CONTRIBUTORS contributors: never trained
-        # or published (TRAINING_DESIGN.md §6.2).
+        # Names with fewer than the farm's contributor_minimum contributors
+        # (null: no minimum, so every name): never trained or published
+        # (TRAINING_DESIGN.md §6.2).
         "held_back_names": sorted(held_back_names),
-        "min_contributors": MIN_CONTRIBUTORS,
+        "contributor_minimum": pull.contributor_minimum,
         "sample_ids": sample_ids,
     }
     (staging / "manifest.jsonl").write_text(

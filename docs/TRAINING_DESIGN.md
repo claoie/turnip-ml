@@ -383,15 +383,18 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   no per-example embeddings ship in a model. Models are retrained on a
   set schedule, so deleted data leaves within one cycle (§2.1).
 - **Rare-trick hold-back.** A trick, with its metrics, ships only once
-  at least 5 distinct people have contributed it
-  (`BACKEND_DESIGN.md` §8.1). *(Judgment call on 5, §10 Q12.)*
-  - The count comes from the farm: each export page carries
-    `trick_contributor_counts`, distinct contributors per canonical name.
-    A name's count is its minimum over the pages, and a name absent
-    from a page counts 0.
-  - Without a count a trick is held back (fail closed): an export
-    without the field trains no trick, and an unmapped token (§2.2) has
-    no count.
+  enough distinct people have contributed it (`BACKEND_DESIGN.md` §8.1).
+  - Both numbers come from the farm, which alone knows the accounts
+    (`BACKEND_DESIGN.md` §1.2.27, §7.3). Every export page carries
+    `trick_contributors`, distinct contributors per canonical trick
+    (a trick missing from it has 0), and `contributor_minimum`, the
+    count a trick needs (5, the farm's judgment call, §10 Q12). A trick
+    trains iff `contributors >= contributor_minimum`.
+  - Both are the same on every page, but read conservatively: a trick's
+    count is its minimum over the pages and the minimum is the greatest
+    any page gives.
+  - Fail closed: a page without either field holds every trick back,
+    and an unmapped token (§2.2) has no count.
   - `fetch_dataset.py build` holds back every clip carrying a name below
     the minimum, whole, combos included: no trick entry, so no name,
     `train_count` or holdout metric. Its window goes to the sample's
@@ -661,7 +664,7 @@ one review can clear.
     source (built on a source's earlier clips, scored on its later ones)
     is the closest offline proxy, and the contract's fixed clip-embedding
     rule makes that replay match the client.
-12. Rare-trick hold-back (§6.2) — 5 distinct contributors before a trick
-    ships is a starting point; the farm's `trick_contributor_counts`
-    field name must match its export. Open: the retrain schedule that
-    bounds how long deleted data stays in a model.
+12. Rare-trick hold-back (§6.2) — the farm's `contributor_minimum` of 5
+    distinct contributors before a trick ships is a starting point.
+    Open: the retrain schedule that bounds how long deleted data stays
+    in a model.

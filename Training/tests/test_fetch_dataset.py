@@ -107,11 +107,17 @@ ROWS = [
 ]
 
 
-# Every name in ROWS has enough contributors to train (MIN_CONTRIBUTORS).
+# The farm's hold-back threshold, and enough contributors for every name
+# in ROWS to train.
+MINIMUM = 5
 COUNTS = {
-    name: fetch_dataset.MIN_CONTRIBUTORS + 4
-    for name in ("cork", "gainer", "hook", "scoot", "mystery flip")
+    name: MINIMUM + 4 for name in ("cork", "gainer", "hook", "scoot", "mystery flip")
 }
+
+
+def contributors(counts):
+    """A {name: count} dict in the farm's trick_contributors form."""
+    return [{"canonical": n, "contributors": c} for n, c in sorted(counts.items())]
 
 
 class FakeExport:
@@ -124,11 +130,15 @@ class FakeExport:
         null_on_last_page=False,
         taxonomy=None,
         counts=COUNTS,
+        minimum=MINIMUM,
     ):
         self.rows = list(rows)
-        # The per-name contributor counts on every page; None leaves the
-        # field out; a callable maps the page's start index to the counts.
+        # trick_contributors and contributor_minimum on every page. None
+        # leaves the field out; a callable maps the page's start index to
+        # the value; a counts dict is sent in the farm's list form, any
+        # other counts value as it is.
         self.counts = counts
+        self.minimum = minimum
         self.page_size = page_size
         self.null_on_last_page = null_on_last_page
         # None: the mappings for the versions present on each page (the
@@ -154,7 +164,12 @@ class FakeExport:
         body = {"rows": page, "taxonomy": taxonomy, "next_cursor": next_cursor}
         counts = self.counts(start) if callable(self.counts) else self.counts
         if counts is not None:
-            body[fetch_dataset.CONTRIBUTOR_COUNTS_FIELD] = counts
+            if isinstance(counts, dict):
+                counts = contributors(counts)
+            body[fetch_dataset.TRICK_CONTRIBUTORS_FIELD] = counts
+        minimum = self.minimum(start) if callable(self.minimum) else self.minimum
+        if minimum is not None:
+            body[fetch_dataset.CONTRIBUTOR_MINIMUM_FIELD] = minimum
         return body
 
 
@@ -375,7 +390,7 @@ class BuildTest(FetchTestCase):
         self.assertEqual(meta["canonical_names"], ["cork", "gainer", "hook", "scoot"])
         self.assertEqual(meta["export_cursor"], "cur-5")
         self.assertEqual(meta["held_back_names"], [])
-        self.assertEqual(meta["min_contributors"], fetch_dataset.MIN_CONTRIBUTORS)
+        self.assertEqual(meta["contributor_minimum"], MINIMUM)
         log = (self.root / "dataset" / "unmapped_labels.log").read_text(
             encoding="utf-8"
         )
@@ -384,7 +399,7 @@ class BuildTest(FetchTestCase):
     def test_rare_trick_holds_back_its_whole_clip(self):
         # scoot is one contributor short: clip 1 (gainer + hook + scoot) is
         # held back whole, gainer and hook included.
-        counts = {**COUNTS, "scoot": fetch_dataset.MIN_CONTRIBUTORS - 1}
+        counts = {**COUNTS, "scoot": MINIMUM - 1}
         argv = [
             "build",
             "--out",
@@ -410,10 +425,39 @@ class BuildTest(FetchTestCase):
         self.assertNotIn("scoot", self.stdout.getvalue())
 
     def test_minimum_contributors_ship(self):
-        counts = {**COUNTS, "scoot": fetch_dataset.MIN_CONTRIBUTORS}
+        counts = {**COUNTS, "scoot": MINIMUM}
         stats = self.build(FakeExport(counts=counts))
         self.assertEqual(stats["clips_held_back"], 0)
         self.assertEqual(self.sample(SRC_A)["held_back_windows"], [])
+
+    def test_the_farms_minimum_decides(self):
+        # The same counts against a higher farm minimum hold scoot back.
+        counts = {**COUNTS, "scoot": MINIMUM}
+        stats = self.build(FakeExport(counts=counts, minimum=MINIMUM + 1))
+        self.assertEqual(stats["clips_held_back"], 1)
+        meta = json.loads((self.root / "dataset" / "dataset_manifest.json").read_text())
+        self.assertEqual(meta["contributor_minimum"], MINIMUM + 1)
+
+    def test_no_minimum_holds_every_trick_back(self):
+        stats = self.build(FakeExport(minimum=None))
+        self.assertEqual(stats["clips"], 0)
+        self.assertEqual(stats["clips_held_back"], 4)
+        meta = json.loads((self.root / "dataset" / "dataset_manifest.json").read_text())
+        self.assertIsNone(meta["contributor_minimum"])
+
+    def test_the_minimum_is_the_greatest_over_pages(self):
+        def minimum(start):
+            return 10 if start == 2 else MINIMUM
+
+        stats = self.build(FakeExport(minimum=minimum))
+        self.assertEqual(stats["clips"], 0)  # every count is MINIMUM + 4 = 9
+
+    def test_a_page_without_the_minimum_holds_every_trick_back(self):
+        def minimum(start):
+            return None if start == 4 else MINIMUM
+
+        stats = self.build(FakeExport(minimum=minimum))
+        self.assertEqual(stats["clips"], 0)
 
     def test_no_counts_hold_every_trick_back(self):
         # Fail closed: an export without the field trains no trick.
@@ -447,22 +491,32 @@ class BuildTest(FetchTestCase):
         self.assertEqual(stats["clips"], 0)
 
     def test_malformed_counts_fail_closed(self):
-        for bad in ([1, 2], {"cork": -1}, {"cork": "9"}, {"cork": True}, {"": 9}):
-            with self.subTest(bad=bad):
-                argv = [
-                    "build",
-                    "--out",
-                    str(self.root / "o"),
-                    "--cache",
-                    str(self.cache),
-                ]
+        good = {"canonical": "cork", "contributors": 9}
+        bad_counts = [
+            "cork",
+            [["cork", 9]],
+            [{**good, "contributors": -1}],
+            [{**good, "contributors": "9"}],
+            [{**good, "contributors": True}],
+            [{**good, "canonical": ""}],
+            [{**good, "extra": 1}],
+            [good, good],
+        ]
+        exports = [
+            (FakeExport(counts=lambda start, b=b: b), "trick_contributors")
+            for b in bad_counts
+        ] + [
+            (FakeExport(minimum=b), "contributor_minimum")
+            for b in (0, -1, "5", True, 2.5)
+        ]
+        argv = ["build", "--out", str(self.root / "o"), "--cache", str(self.cache)]
+        for export, field in exports:
+            with self.subTest(field=field):
                 code = fetch_dataset.main(
-                    argv, transport=FakeExport(counts=bad), blob_getter=self.blobs
+                    argv, transport=export, blob_getter=self.blobs
                 )
                 self.assertEqual(code, EXIT_ERROR)
-                self.assertIn(
-                    fetch_dataset.CONTRIBUTOR_COUNTS_FIELD, self.stderr.getvalue()
-                )
+                self.assertIn(field, self.stderr.getvalue())
                 self.assertFalse((self.root / "o").exists())
 
     def test_pin_is_the_farms_current_taxonomy_version(self):
