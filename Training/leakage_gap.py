@@ -202,10 +202,8 @@ def load_split_samples(
     train.load_samples never returns holdout samples (its poisoning
     defense) and predict.load_split_samples drops the tricks, so this
     reads them itself, with the same checks: each file holds its sample,
-    keypoints pass train.check_keypoints, tricks is a list
-    (train.build_dataset validates each entry when it labels windows), and
-    held_back_windows pass train.held_back_windows, so a held-back clip is
-    left out of the holdout windows as it is out of val's.
+    keypoints pass train.check_keypoints, and tricks is a list
+    (train.build_dataset validates each entry when it labels windows).
     """
     ids = sorted(sid for sid, part in split.items() if part == split_name)
     if not ids:
@@ -220,14 +218,7 @@ def load_split_samples(
         if not isinstance(tricks, list):
             _fail(f"{path}: missing 'tricks' list")
         keypoints = train.check_keypoints(rec.get("keypoints"), sid)
-        samples.append(
-            {
-                "sample_id": sid,
-                "keypoints": keypoints,
-                "tricks": tricks,
-                "held_back_windows": train.held_back_windows(rec),
-            }
-        )
+        samples.append({"sample_id": sid, "keypoints": keypoints, "tricks": tricks})
     return samples
 
 

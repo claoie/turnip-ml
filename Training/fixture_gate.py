@@ -11,10 +11,14 @@ Inputs
 ------
 --champion    fixture scores recorded for the current champion.
 --challenger  fixture scores for the challenger, from the same fixture set.
---ingested    JSON array of the source ids ingested since the last
+--ingested    JSON array of the ids ingested since the last
               watermark: the quarantine candidates. Plain id strings, so
               nothing account-shaped can ride along (training data carries
-              no account identifier).
+              no account identifier). The farm job now lists segment ids
+              (fetch_dataset.py count --out-segments); rows keep the
+              farm's source_id key, and report_quarantine.py refuses
+              segment ids until the farm can quarantine by segment
+              (TRAINING_DESIGN.md §7).
 --out         fresh per-run directory; quarantine.json is written here.
 --tolerance   absolute slack on the composite score. Default: 0.01.
 --registry    model-registry stand-in: a JSON array file each decision

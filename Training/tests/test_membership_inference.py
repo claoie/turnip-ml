@@ -28,7 +28,7 @@ import membership_inference as mi
 # window: tests place each sample's score by its x.
 CLASSES = ["background", "cork"]
 WINDOW = 2
-N_FEATURES = 68  # train.featurize_window: 17 joints x (x, y) x (mean, speed)
+N_FEATURES = 52  # train.featurize_window: 13 joints x (x, y) x (mean, speed)
 FRAMES = 4  # two windows per sample
 
 
@@ -98,7 +98,7 @@ class RunTest(unittest.TestCase):
             for i, x in enumerate(xs):
                 sid = f"{part}-{i:03d}"
                 split[sid] = part
-                frame = [[0.0, 0.0, 1.0] for _ in range(17)]
+                frame = [[0.0, 0.0, 1.0] for _ in range(13)]
                 frame[0] = [x, 0.0, 1.0]
                 sample = {
                     "sample_id": sid,

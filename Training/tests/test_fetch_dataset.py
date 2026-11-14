@@ -1,4 +1,4 @@
-"""Unit tests for Training/fetch_dataset.py.
+"""Unit tests for Training/fetch_dataset.py (the farm's segment export).
 
 Hermetic: a fake paginated export and a fake blob store, no network.
 Run with:  python -m unittest discover -s Training/tests -t .
@@ -22,14 +22,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import evaluate
 import fetch_dataset
 import predict
-import tkp1
+import tks1
 import train
 from fetch_dataset import EXIT_ERROR, EXIT_OK, BlobCache, ExportClient, FetchError
 
 FARM = "https://farm.example"
 KEY = "pipeline-secret"
-SRC_A, SRC_B, SRC_C = "a" * 64, "b" * 64, "c" * 64
-CLIP = {n: f"c11b0000-0000-4000-8000-{n:012d}" for n in range(1, 10)}
+SEG = {n: f"5e600000-0000-4000-8000-{n:012d}" for n in range(1, 10)}
 TAXONOMY = [
     {"raw": "cork", "canonical": "cork", "taxonomy_version": 1},
     {"raw": "corkscrew", "canonical": "cork", "taxonomy_version": 1},
@@ -39,52 +38,59 @@ TAXONOMY = [
 ]
 
 
-def pose(frames, seed):
-    """Deterministic keypoints; frame 2 is a gap."""
+def frames(n, seed):
+    """Deterministic 13-joint frames; frame 2 is a gap, joint 5 of frame 3
+    is missing."""
     out = []
-    for f in range(frames):
+    for f in range(n):
         if f == 2:
-            out.append([[0.0, 0.0, 0.0] for _ in range(17)])
+            out.append([[0.0, 0.0, 0.0] for _ in range(13)])
             continue
-        out.append(
-            [
-                [((seed + f + k) % 10) / 10, ((seed * k + f) % 7) / 7, 0.5 + k / 100]
-                for k in range(17)
-            ]
-        )
+        frame = [
+            [((seed + f + k) % 10) / 10 - 0.5, ((seed * k + f) % 7) / 7, 0.5 + k / 100]
+            for k in range(13)
+        ]
+        if f == 3:
+            frame[5] = [0.0, 0.0, 0.0]
+        out.append(frame)
     return out
 
 
-BLOBS = {
-    sid: tkp1.encode_gz(pose(40, seed))
-    for seed, sid in enumerate((SRC_A, SRC_B, SRC_C))
-}
+FRAME_COUNTS = {1: 30, 2: 20, 3: 20, 4: 15, 5: 40}
+BLOBS = {n: tks1.encode_gz(frames(count, n)) for n, count in FRAME_COUNTS.items()}
 
 
-def row(source, clip, name, start=5, end=15, version=1, **overrides):
+def key(n):
+    return f"segments/{SEG[n]}.tks1.gz"
+
+
+def segment(n, labels, start=5, end=15, bucket=0, **overrides):
+    """An export entry: labels are (trick_name, origin, taxonomy_version)."""
     data = {
-        "source_id": source,
-        "r2_key": f"poses/{source}.tkp1.gz",
-        "blob_sha256": hashlib.sha256(BLOBS[source]).hexdigest(),
-        "clip_id": CLIP[clip],
-        "start_frame": start,
-        "end_frame": end,
-        "trick_name": name,
-        "taxonomy_version": version,
-        # The farm's defaults: a typed name on a heuristic or manual clip.
-        "origin": "typed",
+        "segment_id": SEG[n],
+        "r2_key": key(n),
+        "blob_sha256": hashlib.sha256(BLOBS[n]).hexdigest() if n in BLOBS else "0" * 64,
+        "frame_count": FRAME_COUNTS.get(n, 20),
+        "window_start": start,
+        "window_end": end,
+        "split_bucket": bucket,
+        # The farm's defaults: typed names on a heuristic or manual clip.
         "proposal_model_version": None,
         "suggested_names": [],
         "suggestions_withheld": False,
+        "labels": [
+            {"trick_name": name, "origin": origin, "taxonomy_version": version}
+            for name, origin, version in labels
+        ],
     }
     data.update(overrides)
     return data
 
 
 MODEL = "trick-v1.2"
-WITH_MODEL = {"proposal_model_version": MODEL}
-# Clip 1: the model pre-filled two names; the user kept one, removed the
-# other and typed a combo. Clip 2: a blind clip, named from the vocabulary.
+# Segment 1: the model pre-filled two names; the user kept one, removed the
+# other and typed a combo. Segment 2: a blind clip, named from the
+# vocabulary.
 PROPOSED = {
     "proposal_model_version": MODEL,
     "suggested_names": ["gainer", "cork"],
@@ -96,19 +102,24 @@ BLIND = {
     "suggestions_withheld": True,
 }
 
-# Export order is the farm's cursor order, which interleaves sources.
-ROWS = [
-    row(SRC_B, 3, "Cork"),
-    row(SRC_A, 1, "hook - scoot (combo)", 20, 30, version=2, **PROPOSED),
-    row(SRC_C, 5, "Mystery Flip", 0, 40),
-    row(SRC_A, 1, "Gainer", 20, 30, origin="model", **PROPOSED),
-    row(SRC_A, 2, "corkscrew", origin="vocabulary", **BLIND),
-    row(SRC_B, 4, "(combo)", 30, 35),
+# Export order is the farm's (by id); the fake serves them unsorted so the
+# re-sort shows.
+SEGMENTS = [
+    segment(3, [("Cork", "typed", 1)], bucket=1),
+    segment(
+        1,
+        [("Gainer", "model", 1), ("hook - scoot (combo)", "typed", 2)],
+        start=5,
+        end=25,
+        **PROPOSED,
+    ),
+    segment(5, [("Mystery Flip", "typed", 1)], start=0, end=40, bucket=2),
+    segment(2, [("corkscrew", "vocabulary", 1)], **BLIND),
+    segment(4, [("(combo)", "typed", 1)], start=5, end=10, bucket=1),
 ]
 
-
 # The farm's hold-back threshold, and enough contributors for every name
-# in ROWS to train.
+# in SEGMENTS to train.
 MINIMUM = 5
 COUNTS = {
     name: MINIMUM + 4 for name in ("cork", "gainer", "hook", "scoot", "mystery flip")
@@ -125,43 +136,36 @@ class FakeExport:
 
     def __init__(
         self,
-        rows=ROWS,
+        segments=SEGMENTS,
         page_size=2,
         null_on_last_page=False,
-        taxonomy=None,
+        taxonomy=TAXONOMY,
         counts=COUNTS,
         minimum=MINIMUM,
     ):
-        self.rows = list(rows)
+        self.segments = list(segments)
+        self.page_size = page_size
+        self.null_on_last_page = null_on_last_page
+        self.taxonomy = taxonomy
         # trick_contributors and contributor_minimum on every page. None
         # leaves the field out; a callable maps the page's start index to
         # the value; a counts dict is sent in the farm's list form, any
         # other counts value as it is.
         self.counts = counts
         self.minimum = minimum
-        self.page_size = page_size
-        self.null_on_last_page = null_on_last_page
-        # None: the mappings for the versions present on each page (the
-        # contract as written); a list: that whole table on every page.
-        self.taxonomy = taxonomy
         self.requests = []
 
     def __call__(self, url, headers):
         self.requests.append((url, headers))
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
         start = int(query["since"][0].removeprefix("cur-")) + 1 if query else 0
-        page = self.rows[start : start + self.page_size]
+        page = self.segments[start : start + self.page_size]
         last = start + len(page) - 1
-        exhausted = last >= len(self.rows) - 1
+        exhausted = last >= len(self.segments) - 1
         next_cursor = f"cur-{last}" if page else None
         if exhausted and self.null_on_last_page:
             next_cursor = None
-        versions = {r["taxonomy_version"] for r in page}
-        if self.taxonomy is None:
-            taxonomy = [t for t in TAXONOMY if t["taxonomy_version"] in versions]
-        else:
-            taxonomy = self.taxonomy
-        body = {"rows": page, "taxonomy": taxonomy, "next_cursor": next_cursor}
+        body = {"segments": page, "taxonomy": self.taxonomy, "next_cursor": next_cursor}
         counts = self.counts(start) if callable(self.counts) else self.counts
         if counts is not None:
             if isinstance(counts, dict):
@@ -175,7 +179,7 @@ class FakeExport:
 
 class FakeBlobs:
     def __init__(self, blobs=None):
-        self.blobs = dict(blobs or {f"poses/{s}.tkp1.gz": b for s, b in BLOBS.items()})
+        self.blobs = dict(blobs or {key(n): b for n, b in BLOBS.items()})
         self.calls = []
 
     def __call__(self, r2_key):
@@ -207,8 +211,15 @@ class FetchTestCase(unittest.TestCase):
             client.pull(), BlobCache(self.cache, self.blobs), self.root / out
         )
 
-    def sample(self, source, out="dataset"):
-        path = self.root / out / "samples" / f"{source}.json"
+    def sample(self, n, out="dataset"):
+        path = self.root / out / "samples" / f"{SEG[n]}.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def has_sample(self, n, out="dataset"):
+        return (self.root / out / "samples" / f"{SEG[n]}.json").exists()
+
+    def manifest(self, out="dataset"):
+        path = self.root / out / "dataset_manifest.json"
         return json.loads(path.read_text(encoding="utf-8"))
 
     def tree(self, out):
@@ -219,12 +230,16 @@ class FetchTestCase(unittest.TestCase):
             if p.is_file()
         }
 
-    def assert_build_refused(self, rows):
+    def assert_build_refused(self, segments):
         out = f"refused-{len(list(self.root.glob('refused-*')))}"
         with self.assertRaises(FetchError):
-            self.build(FakeExport(rows), out=out)
+            self.build(FakeExport(segments), out=out)
         self.assertFalse((self.root / out).exists())
         self.assertEqual(list(self.root.glob(".*partial*")), [])
+
+    def main_build(self, export, out="ds"):
+        argv = ["build", "--out", str(self.root / out), "--cache", str(self.cache)]
+        return fetch_dataset.main(argv, transport=export, blob_getter=self.blobs)
 
 
 class BuildTest(FetchTestCase):
@@ -233,10 +248,10 @@ class BuildTest(FetchTestCase):
         self.assertEqual(
             stats,
             {
-                "samples": 3,
-                "clips": 4,
-                "clips_dropped_without_names": 1,
-                "clips_held_back": 0,
+                "samples": 4,
+                "segments": 5,
+                "segments_dropped_without_names": 1,
+                "segments_held_back": 0,
                 "names_held_back": 0,
                 "label_rows": 6,
                 "taxonomy_version": 2,
@@ -244,280 +259,105 @@ class BuildTest(FetchTestCase):
                 "cache_pruned": 0,
             },
         )
-        a = self.sample(SRC_A)
-        self.assertEqual(a["sample_id"], SRC_A)
+        one = self.sample(1)
         self.assertEqual(
-            set(a),
-            {"sample_id", "fps", "keypoints", "tricks", "held_back_windows", "clips"},
+            set(one),
+            {"sample_id", "fps", "keypoints", "split_bucket", "tricks", "clips"},
         )
-        self.assertEqual(a["held_back_windows"], [])
-        self.assertEqual(a["fps"], 10)
-        self.assertEqual(len(a["keypoints"]), 40)
-        self.assertEqual(len(a["keypoints"][0]), 17)
-        self.assertEqual(a["keypoints"][2], [[0.0, 0.0, 0.0]] * 17)  # gap kept
-        self.assertEqual(a["keypoints"], tkp1.decode_gz(BLOBS[SRC_A]).keypoints)
-        # Clip 1 carries a combo across two label rows: one trick entry per
-        # canonical name on the same window. Clip 2's alias is canonicalized.
+        self.assertEqual(one["sample_id"], SEG[1])
+        self.assertEqual(one["fps"], 10)
+        self.assertEqual(one["split_bucket"], 0)
+        self.assertEqual(one["keypoints"], tks1.decode_gz(BLOBS[1]))
+        self.assertEqual(one["keypoints"][2], [[0.0, 0.0, 0.0]] * 13)  # gap kept
+        # A combo across two labels: one entry per canonical name, all on the
+        # segment's clip window.
         self.assertEqual(
             [
                 (t["clip_id"], t["name"], t["start_frame"], t["end_frame"])
-                for t in a["tricks"]
+                for t in one["tricks"]
             ],
-            [
-                (CLIP[2], "cork", 5, 15),
-                (CLIP[1], "gainer", 20, 30),
-                (CLIP[1], "hook", 20, 30),
-                (CLIP[1], "scoot", 20, 30),
-            ],
+            [(SEG[1], n, 5, 25) for n in ("gainer", "hook", "scoot")],
         )
-        # Clip 4 ("(combo)") canonicalizes to nothing and is dropped.
-        self.assertEqual(
-            [t["clip_id"] for t in self.sample(SRC_B)["tricks"]], [CLIP[3]]
-        )
-        self.assertEqual(self.sample(SRC_C)["tricks"][0]["name"], "mystery flip")
+        self.assertEqual(self.sample(2)["tricks"][0]["name"], "cork")  # alias
+        self.assertEqual(self.sample(5)["tricks"][0]["name"], "mystery flip")
+        # Segment 4 ("(combo)") canonicalizes to nothing and is dropped.
+        self.assertFalse(self.has_sample(4))
 
     def test_samples_carry_provenance(self):
         self.build()
-        a, b = self.sample(SRC_A), self.sample(SRC_B)
-        # Each name keeps the origin of the raw label it came from; a combo
-        # label's origin covers every name it canonicalizes to.
+        one, two = self.sample(1), self.sample(2)
         self.assertEqual(
-            [(t["clip_id"], t["name"], t["origins"]) for t in a["tricks"]],
-            [
-                (CLIP[2], "cork", ["vocabulary"]),
-                (CLIP[1], "gainer", ["model"]),
-                (CLIP[1], "hook", ["typed"]),
-                (CLIP[1], "scoot", ["typed"]),
-            ],
+            {t["name"]: t["origins"] for t in one["tricks"]},
+            {"gainer": ["model"], "hook": ["typed"], "scoot": ["typed"]},
         )
-        # Clip-level provenance once per clip, as the farm sent it: the
-        # suggested names verbatim and in order, the removed "cork" included.
-        self.assertEqual(a["clips"], {CLIP[1]: PROPOSED, CLIP[2]: BLIND})
-        # The farm's defaults are carried too; the dropped clip 4 is not.
         self.assertEqual(
-            b["clips"],
+            one["clips"],
             {
-                CLIP[3]: {
-                    "proposal_model_version": None,
-                    "suggested_names": [],
+                SEG[1]: {
+                    "proposal_model_version": MODEL,
+                    "suggested_names": ["gainer", "cork"],
                     "suggestions_withheld": False,
                 }
             },
         )
-        self.assertEqual(b["tricks"][0]["origins"], ["typed"])
+        self.assertEqual(two["tricks"][0]["origins"], ["vocabulary"])
+        self.assertIs(two["clips"][SEG[2]]["suggestions_withheld"], True)
 
     def test_merged_names_keep_every_origin(self):
-        # Two raw labels on one clip canonicalize to "cork": the entry lists
-        # both origins, sorted; the policy for that is TRAINING_DESIGN.md
-        # §6.4's, not the dataset's.
-        rows = [
-            row(SRC_A, 1, "corkscrew", origin="model", **PROPOSED),
-            row(SRC_A, 1, "cork", origin="typed", **PROPOSED),
-            row(SRC_A, 1, "Gainer", origin="vocabulary", **PROPOSED),
-        ]
-        self.build(FakeExport(rows))
-        self.assertEqual(
-            [(t["name"], t["origins"]) for t in self.sample(SRC_A)["tricks"]],
-            [("cork", ["model", "typed"]), ("gainer", ["vocabulary"])],
-        )
+        # Two raw labels that canonicalize to one name merge their origins.
+        both = segment(3, [("Cork", "typed", 1), ("corkscrew", "vocabulary", 1)])
+        self.build(FakeExport([both]))
+        [entry] = self.sample(3)["tricks"]
+        self.assertEqual(entry["origins"], ["typed", "vocabulary"])
 
     def test_legitimate_provenance_is_accepted(self):
-        # Every shape the farm can export: a model-proposed window with no
-        # names above the pre-fill bar, blind or not; a typed name on a
-        # blind clip; a heuristic clip.
-        cases = {
-            "window-only": WITH_MODEL,
-            "blind-window-only": {**WITH_MODEL, "suggestions_withheld": True},
-            "typed-on-blind": BLIND,
-            "kept-suggestion": {"origin": "model", **PROPOSED},
+        for name, overrides in {
             "heuristic": {},
-        }
-        for name, provenance in cases.items():
-            with self.subTest(case=name):
-                self.build(FakeExport([row(SRC_A, 1, "cork", **provenance)]), out=name)
-                self.assertEqual(
-                    self.sample(SRC_A, out=name)["clips"][CLIP[1]],
-                    {
-                        "proposal_model_version": provenance.get(
-                            "proposal_model_version"
-                        ),
-                        "suggested_names": provenance.get("suggested_names", []),
-                        "suggestions_withheld": provenance.get(
-                            "suggestions_withheld", False
-                        ),
-                    },
-                )
+            "proposed": PROPOSED,
+            "blind": BLIND,
+            "model with no names": {"proposal_model_version": MODEL},
+        }.items():
+            with self.subTest(name):
+                origin = "model" if name == "proposed" else "typed"
+                entry = segment(3, [("Cork", origin, 1)], **overrides)
+                self.build(FakeExport([entry]), out=f"ok-{name}")
 
     def test_consumers_load_the_samples(self):
-        # train.py, predict.py and evaluate.py read fetch_dataset's samples,
-        # provenance and all.
         self.build()
         samples = self.root / "dataset" / "samples"
-        split = {SRC_A: "train", SRC_B: "val", SRC_C: "holdout"}
-        train_samples, val_samples = train.load_samples(samples, split)
-        self.assertEqual(
-            [s["sample_id"] for s in train_samples + val_samples], [SRC_A, SRC_B]
-        )
-        gt = evaluate.load_ground_truth(samples, sorted(split))
-        self.assertEqual(
-            gt[SRC_A],
-            [
-                (5, 15, frozenset({"cork"})),
-                (20, 30, frozenset({"gainer", "hook", "scoot"})),
-            ],
-        )
-        [holdout] = predict.load_split_samples(split, samples, "holdout")
-        self.assertEqual(holdout["sample_id"], SRC_C)
+        split = {SEG[1]: "train", SEG[2]: "train", SEG[3]: "val", SEG[5]: "holdout"}
+        tr, va = train.load_samples(samples, split)
+        self.assertEqual([s["sample_id"] for s in tr], [SEG[1], SEG[2]])
+        self.assertEqual(tr[0]["keypoints"].shape, (30, 13, 3))
+        self.assertEqual(len(va), 1)
+        gt = evaluate.load_ground_truth(samples, [SEG[5]])
+        self.assertEqual(gt[SEG[5]], [(0, 40, frozenset({"mystery flip"}))])
+        [held] = predict.load_split_samples(split, samples, "holdout")
+        self.assertEqual(held["tricks"], [])
 
     def test_manifests(self):
         self.build()
-        manifest = (self.root / "dataset" / "manifest.jsonl").read_text(
-            encoding="utf-8"
-        )
+        lines = (self.root / "dataset" / "manifest.jsonl").read_text().splitlines()
+        # Splits group by the farm's split_bucket, never by a source.
         self.assertEqual(
-            [json.loads(line) for line in manifest.splitlines()],
+            [json.loads(line) for line in lines],
             [
-                {"sample_id": SRC_A, "source_id": SRC_A},
-                {"sample_id": SRC_B, "source_id": SRC_B},
-                {"sample_id": SRC_C, "source_id": SRC_C},
+                {"sample_id": SEG[1], "source_id": "bucket-0"},
+                {"sample_id": SEG[2], "source_id": "bucket-0"},
+                {"sample_id": SEG[3], "source_id": "bucket-1"},
+                {"sample_id": SEG[5], "source_id": "bucket-2"},
             ],
         )
-        meta = json.loads((self.root / "dataset" / "dataset_manifest.json").read_text())
-        self.assertEqual(meta["sample_ids"], [SRC_A, SRC_B, SRC_C])
+        meta = self.manifest()
+        self.assertEqual(meta["sample_ids"], [SEG[1], SEG[2], SEG[3], SEG[5]])
         self.assertNotIn("cache_pruned", meta)  # describes the cache, not the data
         self.assertEqual(meta["taxonomy_version"], 2)
         # Curated names only: "mystery flip" trains but is no canonical name.
         self.assertEqual(meta["canonical_names"], ["cork", "gainer", "hook", "scoot"])
-        self.assertEqual(meta["export_cursor"], "cur-5")
         self.assertEqual(meta["held_back_names"], [])
         self.assertEqual(meta["contributor_minimum"], MINIMUM)
-        log = (self.root / "dataset" / "unmapped_labels.log").read_text(
-            encoding="utf-8"
-        )
+        log = (self.root / "dataset" / "unmapped_labels.log").read_text()
         self.assertEqual(log, "1\tmystery flip\n")
-
-    def test_rare_trick_holds_back_its_whole_clip(self):
-        # scoot is one contributor short: clip 1 (gainer + hook + scoot) is
-        # held back whole, gainer and hook included.
-        counts = {**COUNTS, "scoot": MINIMUM - 1}
-        argv = [
-            "build",
-            "--out",
-            str(self.root / "dataset"),
-            "--cache",
-            str(self.cache),
-        ]
-        code = fetch_dataset.main(
-            argv, transport=FakeExport(counts=counts), blob_getter=self.blobs
-        )
-        self.assertEqual(code, EXIT_OK)
-        stats = json.loads(self.stdout.getvalue())
-        self.assertEqual(stats["clips_held_back"], 1)
-        self.assertEqual(stats["names_held_back"], 1)
-        self.assertEqual(stats["clips"], 3)
-        a = self.sample(SRC_A)
-        self.assertEqual([t["clip_id"] for t in a["tricks"]], [CLIP[2]])
-        self.assertEqual(a["held_back_windows"], [[20, 30]])
-        self.assertNotIn(CLIP[1], a["clips"])
-        meta = json.loads((self.root / "dataset" / "dataset_manifest.json").read_text())
-        self.assertEqual(meta["held_back_names"], ["scoot"])
-        # Stdout carries counts, never the held-back name.
-        self.assertNotIn("scoot", self.stdout.getvalue())
-
-    def test_minimum_contributors_ship(self):
-        counts = {**COUNTS, "scoot": MINIMUM}
-        stats = self.build(FakeExport(counts=counts))
-        self.assertEqual(stats["clips_held_back"], 0)
-        self.assertEqual(self.sample(SRC_A)["held_back_windows"], [])
-
-    def test_the_farms_minimum_decides(self):
-        # The same counts against a higher farm minimum hold scoot back.
-        counts = {**COUNTS, "scoot": MINIMUM}
-        stats = self.build(FakeExport(counts=counts, minimum=MINIMUM + 1))
-        self.assertEqual(stats["clips_held_back"], 1)
-        meta = json.loads((self.root / "dataset" / "dataset_manifest.json").read_text())
-        self.assertEqual(meta["contributor_minimum"], MINIMUM + 1)
-
-    def test_no_minimum_holds_every_trick_back(self):
-        stats = self.build(FakeExport(minimum=None))
-        self.assertEqual(stats["clips"], 0)
-        self.assertEqual(stats["clips_held_back"], 4)
-        meta = json.loads((self.root / "dataset" / "dataset_manifest.json").read_text())
-        self.assertIsNone(meta["contributor_minimum"])
-
-    def test_the_minimum_is_the_greatest_over_pages(self):
-        def minimum(start):
-            return 10 if start == 2 else MINIMUM
-
-        stats = self.build(FakeExport(minimum=minimum))
-        self.assertEqual(stats["clips"], 0)  # every count is MINIMUM + 4 = 9
-
-    def test_a_page_without_the_minimum_holds_every_trick_back(self):
-        def minimum(start):
-            return None if start == 4 else MINIMUM
-
-        stats = self.build(FakeExport(minimum=minimum))
-        self.assertEqual(stats["clips"], 0)
-
-    def test_no_counts_hold_every_trick_back(self):
-        # Fail closed: an export without the field trains no trick.
-        stats = self.build(FakeExport(counts=None))
-        self.assertEqual(stats["clips"], 0)
-        self.assertEqual(stats["clips_held_back"], 4)
-        self.assertEqual(stats["names_held_back"], 5)
-        for source in (SRC_A, SRC_B, SRC_C):
-            self.assertEqual(self.sample(source)["tricks"], [])
-
-    def test_a_name_without_a_count_is_held_back(self):
-        counts = {n: c for n, c in COUNTS.items() if n != "mystery flip"}
-        self.build(FakeExport(counts=counts))
-        self.assertEqual(self.sample(SRC_C)["tricks"], [])
-        self.assertEqual(self.sample(SRC_C)["held_back_windows"], [[0, 40]])
-
-    def test_counts_are_the_minimum_over_pages(self):
-        # One page says cork has few contributors; the others say many.
-        def counts(start):
-            return {**COUNTS, "cork": 1} if start == 2 else COUNTS
-
-        self.build(FakeExport(counts=counts))
-        self.assertEqual(self.sample(SRC_B)["tricks"], [])
-        self.assertEqual(self.sample(SRC_B)["held_back_windows"], [[5, 15]])
-
-    def test_a_page_without_counts_holds_every_trick_back(self):
-        def counts(start):
-            return None if start == 4 else COUNTS
-
-        stats = self.build(FakeExport(counts=counts))
-        self.assertEqual(stats["clips"], 0)
-
-    def test_malformed_counts_fail_closed(self):
-        good = {"canonical": "cork", "contributors": 9}
-        bad_counts = [
-            "cork",
-            [["cork", 9]],
-            [{**good, "contributors": -1}],
-            [{**good, "contributors": "9"}],
-            [{**good, "contributors": True}],
-            [{**good, "canonical": ""}],
-            [{**good, "extra": 1}],
-            [good, good],
-        ]
-        exports = [
-            (FakeExport(counts=lambda start, b=b: b), "trick_contributors")
-            for b in bad_counts
-        ] + [
-            (FakeExport(minimum=b), "contributor_minimum")
-            for b in (0, -1, "5", True, 2.5)
-        ]
-        argv = ["build", "--out", str(self.root / "o"), "--cache", str(self.cache)]
-        for export, field in exports:
-            with self.subTest(field=field):
-                code = fetch_dataset.main(
-                    argv, transport=export, blob_getter=self.blobs
-                )
-                self.assertEqual(code, EXIT_ERROR)
-                self.assertIn(field, self.stderr.getvalue())
-                self.assertFalse((self.root / "o").exists())
 
     def test_pin_is_the_farms_current_taxonomy_version(self):
         # A curation-only bump: version 3 maps a raw string no label was
@@ -530,78 +370,45 @@ class BuildTest(FetchTestCase):
         stats = self.build(FakeExport(taxonomy=curated, counts=counts))
         self.assertEqual(stats["taxonomy_version"], 3)
         self.assertEqual(stats["unmapped_tokens"], 0)
-        self.assertEqual(self.sample(SRC_C)["tricks"][0]["name"], "mystery")
-        # The contract as written ships only the versions present in rows,
-        # so the pin falls back to the greatest version among them.
-        self.assertEqual(self.build(out="per-page")["taxonomy_version"], 2)
+        self.assertEqual(self.sample(5)["tricks"][0]["name"], "mystery")
 
     def test_byte_identical_across_page_sizes(self):
-        self.build(FakeExport(page_size=1), out="p1")
-        self.build(FakeExport(page_size=4), out="p4")
-        self.build(FakeExport(page_size=100), out="p100")
-        reference = self.tree("p1")
-        self.assertEqual(len(reference), 6)
-        for out in ("p4", "p100"):
-            self.assertEqual(self.tree(out), reference, out)
+        self.build(FakeExport(page_size=1), out="one")
+        self.build(FakeExport(page_size=10), out="ten")
+        self.assertEqual(self.tree("one"), self.tree("ten"))
 
     def test_null_cursor_on_the_last_page(self):
-        # A farm that answers null on the final partial page still yields
-        # the full dataset; only the recorded cursor lags one page behind.
-        self.build(FakeExport(page_size=4), out="ref")
-        self.build(FakeExport(page_size=4, null_on_last_page=True), out="null")
-        ref, null = self.tree("ref"), self.tree("null")
-        meta_ref = json.loads(ref.pop("dataset_manifest.json"))
-        meta_null = json.loads(null.pop("dataset_manifest.json"))
-        self.assertEqual(null, ref)
-        self.assertEqual(meta_ref.pop("export_cursor"), "cur-5")
-        self.assertEqual(meta_null.pop("export_cursor"), "cur-3")
-        self.assertEqual(meta_null, meta_ref)
+        export = FakeExport(page_size=10, null_on_last_page=True)
+        self.assertEqual(self.build(export)["samples"], 4)
+        self.assertEqual(len(export.requests), 1)
 
     def test_blobs_are_cached_by_r2_key(self):
         self.build(out="first")
-        self.assertEqual(len(self.blobs.calls), 3)
-        entry = self.cache / "poses" / f"{SRC_A}.tkp1.gz"
-        self.assertEqual(entry.read_bytes(), BLOBS[SRC_A])
+        self.assertEqual(len(self.blobs.calls), 4)
+        entry = self.cache / key(1)
+        self.assertEqual(entry.read_bytes(), BLOBS[1])
         self.build(out="second")
-        self.assertEqual(len(self.blobs.calls), 3)  # all served from cache
+        self.assertEqual(len(self.blobs.calls), 4)  # all served from cache
         # A corrupt cache entry is discarded and refetched.
         entry.write_bytes(b"corrupt")
         self.build(out="third")
-        self.assertEqual(self.blobs.calls[3:], [f"poses/{SRC_A}.tkp1.gz"])
-        self.assertEqual(entry.read_bytes(), BLOBS[SRC_A])
-
-    def test_recontributed_source_is_refetched(self):
-        self.build(out="first")
-        # The owner re-contributes SRC_A: same r2_key, new bytes and digest.
-        new_blob = tkp1.encode_gz(pose(40, 99))
-        self.blobs.blobs[f"poses/{SRC_A}.tkp1.gz"] = new_blob
-        digest = hashlib.sha256(new_blob).hexdigest()
-        rows = [
-            {**r, "blob_sha256": digest} if r["source_id"] == SRC_A else r for r in ROWS
-        ]
-        self.build(FakeExport(rows), out="second")
-        self.assertEqual(self.blobs.calls[3:], [f"poses/{SRC_A}.tkp1.gz"])
-        entry = self.cache / "poses" / f"{SRC_A}.tkp1.gz"
-        self.assertEqual(entry.read_bytes(), new_blob)
-        self.assertEqual(
-            self.sample(SRC_A, out="second")["keypoints"],
-            tkp1.decode_gz(new_blob).keypoints,
-        )
+        self.assertEqual(self.blobs.calls[4:], [key(1)])
+        self.assertEqual(entry.read_bytes(), BLOBS[1])
 
     def test_cache_is_pruned_to_the_pull(self):
         self.build(out="first")
-        poses = self.cache / "poses"
+        directory = self.cache / "segments"
         foreign = self.cache / "notes.txt"
         foreign.write_text("not ours")
-        (poses / "readme.md").write_text("not ours")
-        (poses / f"{SRC_A}.tkp1.gz.tmp").write_bytes(b"interrupted write")
-        # SRC_C was deleted farm-side, so it is absent from the next full pull.
-        rows = [r for r in ROWS if r["source_id"] != SRC_C]
-        stats = self.build(FakeExport(rows), out="second")
-        self.assertEqual(stats["cache_pruned"], 2)  # C's blob and the leftover
+        (directory / "readme.md").write_text("not ours")
+        (directory / f"{SEG[1]}.tks1.gz.tmp").write_bytes(b"interrupted write")
+        # Segment 5 was deleted farm-side, so it is absent from the next pull.
+        kept = [s for s in SEGMENTS if s["segment_id"] != SEG[5]]
+        stats = self.build(FakeExport(kept), out="second")
+        self.assertEqual(stats["cache_pruned"], 2)  # 5's blob and the leftover
         self.assertEqual(
-            sorted(p.name for p in poses.iterdir()),
-            sorted([f"{SRC_A}.tkp1.gz", f"{SRC_B}.tkp1.gz", "readme.md"]),
+            sorted(p.name for p in directory.iterdir()),
+            sorted([f"{SEG[n]}.tks1.gz" for n in (1, 2, 3)] + ["readme.md"]),
         )
         self.assertTrue(foreign.exists())
 
@@ -609,7 +416,7 @@ class BuildTest(FetchTestCase):
         self.build(out="first")
         with self.assertRaises(FetchError):
             self.build(FakeExport([]), out="second")
-        self.assertEqual(list((self.cache / "poses").glob("*.tkp1.gz")), [])
+        self.assertEqual(list((self.cache / "segments").glob("*.tks1.gz")), [])
 
     def test_failed_pull_never_prunes(self):
         self.build(out="first")
@@ -619,28 +426,35 @@ class BuildTest(FetchTestCase):
 
         with self.assertRaises(FetchError):
             self.build(broken, out="second")
-        self.assertEqual(len(list((self.cache / "poses").glob("*.tkp1.gz"))), 3)
+        self.assertEqual(len(list((self.cache / "segments").glob("*.tks1.gz"))), 4)
 
     def test_checksum_mismatch_fails_closed(self):
-        self.blobs.blobs[f"poses/{SRC_B}.tkp1.gz"] = BLOBS[SRC_A]
+        self.blobs.blobs[key(2)] = BLOBS[1]
         with self.assertRaises(FetchError):
             self.build()
         self.assertFalse((self.root / "dataset").exists())
-        self.assertFalse((self.cache / "poses" / f"{SRC_B}.tkp1.gz").exists())
+        self.assertFalse((self.cache / key(2)).exists())
 
     def test_undecodable_blob_fails_closed(self):
         bad = b"not gzip"
-        rows = [row(SRC_A, 1, "cork", blob_sha256=hashlib.sha256(bad).hexdigest())]
-        self.blobs.blobs[f"poses/{SRC_A}.tkp1.gz"] = bad
-        self.assert_build_refused(rows)
+        self.blobs.blobs[key(3)] = bad
+        self.assert_build_refused(
+            [
+                segment(
+                    3,
+                    [("Cork", "typed", 1)],
+                    blob_sha256=hashlib.sha256(bad).hexdigest(),
+                )
+            ]
+        )
 
-    def test_clip_past_the_pose_sequence(self):
-        self.assert_build_refused([row(SRC_A, 1, "cork", 30, 41)])
-        # Ending exactly at the last frame boundary is fine.
-        self.build(FakeExport([row(SRC_A, 1, "cork", 30, 40)]))
+    def test_frame_count_must_match_the_blob(self):
+        self.assert_build_refused(
+            [segment(3, [("Cork", "typed", 1)], frame_count=21, end=21)]
+        )
 
     def test_any_download_failure_fails_closed(self):
-        url = "https://acct.r2.example/bucket/poses/x?X-Amz-Signature=SECRET"
+        url = "https://acct.r2.example/bucket/segments/x?X-Amz-Signature=SECRET"
         for error in (KeyError("missing"), RuntimeError(url), OSError(url)):
             with self.subTest(error=type(error).__name__):
 
@@ -663,168 +477,221 @@ class BuildTest(FetchTestCase):
         self.assert_build_refused([])
 
 
-class RowValidationTest(FetchTestCase):
-    def test_malformed_rows(self):
+class HoldBackTest(FetchTestCase):
+    def test_a_rare_trick_holds_back_its_whole_segment(self):
+        # scoot is one contributor short: segment 1 (gainer + hook + scoot)
+        # is held back whole, gainer and hook included.
+        counts = {**COUNTS, "scoot": MINIMUM - 1}
+        self.assertEqual(self.main_build(FakeExport(counts=counts)), EXIT_OK)
+        stats = json.loads(self.stdout.getvalue())
+        self.assertEqual(stats["segments_held_back"], 1)
+        self.assertEqual(stats["names_held_back"], 1)
+        self.assertEqual(stats["samples"], 3)
+        self.assertFalse(self.has_sample(1, out="ds"))
+        self.assertEqual(self.manifest(out="ds")["held_back_names"], ["scoot"])
+        # Its blob is never fetched; stdout carries counts, never the name.
+        self.assertNotIn(key(1), self.blobs.calls)
+        self.assertNotIn("scoot", self.stdout.getvalue())
+
+    def test_minimum_contributors_ship(self):
+        stats = self.build(FakeExport(counts={**COUNTS, "scoot": MINIMUM}))
+        self.assertEqual(stats["segments_held_back"], 0)
+        self.assertTrue(self.has_sample(1))
+
+    def test_the_farms_minimum_decides(self):
+        counts = {**COUNTS, "scoot": MINIMUM}
+        stats = self.build(FakeExport(counts=counts, minimum=MINIMUM + 1))
+        self.assertEqual(stats["segments_held_back"], 1)
+        self.assertEqual(self.manifest()["contributor_minimum"], MINIMUM + 1)
+
+    def test_no_minimum_holds_every_trick_back(self):
+        stats = self.build(FakeExport(minimum=None))
+        self.assertEqual(stats["samples"], 0)
+        self.assertEqual(stats["segments_held_back"], 4)
+        self.assertIsNone(self.manifest()["contributor_minimum"])
+
+    def test_the_minimum_is_the_greatest_over_pages(self):
+        def minimum(start):
+            return 10 if start == 2 else MINIMUM
+
+        stats = self.build(FakeExport(minimum=minimum))
+        self.assertEqual(stats["samples"], 0)  # every count is MINIMUM + 4 = 9
+
+    def test_a_page_without_the_minimum_holds_every_trick_back(self):
+        def minimum(start):
+            return None if start == 4 else MINIMUM
+
+        self.assertEqual(self.build(FakeExport(minimum=minimum))["samples"], 0)
+
+    def test_no_counts_hold_every_trick_back(self):
+        stats = self.build(FakeExport(counts=None))
+        self.assertEqual(stats["samples"], 0)
+        self.assertEqual(stats["names_held_back"], 5)
+
+    def test_a_name_without_a_count_is_held_back(self):
+        counts = {n: c for n, c in COUNTS.items() if n != "mystery flip"}
+        self.build(FakeExport(counts=counts))
+        self.assertFalse(self.has_sample(5))
+        self.assertTrue(self.has_sample(3))
+
+    def test_counts_are_the_minimum_over_pages(self):
+        # One page says cork has few contributors; the others say many.
+        def counts(start):
+            return {**COUNTS, "cork": 1} if start == 2 else COUNTS
+
+        self.build(FakeExport(counts=counts))
+        self.assertFalse(self.has_sample(2))  # corkscrew -> cork
+        self.assertFalse(self.has_sample(3))
+        self.assertTrue(self.has_sample(1))
+
+    def test_a_page_without_counts_holds_every_trick_back(self):
+        def counts(start):
+            return None if start == 4 else COUNTS
+
+        self.assertEqual(self.build(FakeExport(counts=counts))["samples"], 0)
+
+    def test_malformed_counts_fail_closed(self):
+        good = {"canonical": "cork", "contributors": 9}
+        bad_counts = [
+            "cork",
+            [["cork", 9]],
+            [{**good, "contributors": -1}],
+            [{**good, "contributors": "9"}],
+            [{**good, "contributors": True}],
+            [{**good, "canonical": ""}],
+            [{**good, "extra": 1}],
+            [good, good],
+        ]
+        exports = [
+            (FakeExport(counts=lambda start, b=b: b), "trick_contributors")
+            for b in bad_counts
+        ] + [
+            (FakeExport(minimum=b), "contributor_minimum")
+            for b in (0, -1, "5", True, 2.5)
+        ]
+        for i, (export, field) in enumerate(exports):
+            with self.subTest(field=field, case=i):
+                self.stderr.truncate(0)
+                self.assertEqual(self.main_build(export, out=f"o{i}"), EXIT_ERROR)
+                self.assertIn(field, self.stderr.getvalue())
+                self.assertFalse((self.root / f"o{i}").exists())
+
+
+class SegmentValidationTest(FetchTestCase):
+    def test_malformed_segments(self):
+        cork = [("Cork", "typed", 1)]
         cases = {
-            "source-id": row(SRC_A, 1, "cork", source_id="A" * 64),
-            "r2-key": row(SRC_A, 1, "cork", r2_key=f"poses/{SRC_B}.tkp1.gz"),
-            "r2-key-path": row(SRC_A, 1, "cork", r2_key=f"../poses/{SRC_A}.tkp1.gz"),
-            "sha": row(SRC_A, 1, "cork", blob_sha256=None),
-            "clip-not-uuid": row(SRC_A, 1, "cork", clip_id="clip-1"),
-            "clip-uppercase": row(SRC_A, 1, "cork", clip_id=CLIP[1].upper()),
-            "bool-frame": row(SRC_A, 1, "cork", start_frame=True),
-            "empty-window": row(SRC_A, 1, "cork", 10, 10),
-            "negative-start": row(SRC_A, 1, "cork", -1, 10),
-            "empty-name": row(SRC_A, 1, "  "),
-            "version-zero": row(SRC_A, 1, "cork", version=0),
-            # Training data carries no account identifier, at the boundary.
-            "carries-user-id": row(SRC_A, 1, "cork", user_id="user-1"),
-            "carries-null-user-id": row(SRC_A, 1, "cork", user_id=None),
+            "not an object": [],
+            "missing field": {
+                k: v for k, v in segment(3, cork).items() if k != "split_bucket"
+            },
+            "segment_id not a uuid": segment(3, cork, segment_id="seg-3"),
+            "segment_id upper case": segment(3, cork, segment_id=SEG[3].upper()),
+            "r2_key elsewhere": segment(3, cork, r2_key=f"poses/{SEG[3]}.tks1.gz"),
+            "blob_sha256": segment(3, cork, blob_sha256="ABC"),
+            "window reversed": segment(3, cork, start=10, end=5),
+            "window past the segment": segment(3, cork, start=5, end=21),
+            "window negative": segment(3, cork, start=-1, end=5),
+            "window not ints": segment(3, cork, start=5.0, end=15),
+            "frame_count bool": segment(3, cork, frame_count=True),
+            "split_bucket 10": segment(3, cork, bucket=10),
+            "split_bucket str": segment(3, cork, bucket="1"),
+            "no labels": segment(3, []),
+            "labels unsorted": segment(
+                3, [("gainer", "typed", 1), ("Cork", "typed", 1)]
+            ),
+            "label twice": segment(3, [("Cork", "typed", 1), ("Cork", "typed", 1)]),
+            "blank name": segment(3, [(" ", "typed", 1)]),
+            "version 0": segment(3, [("Cork", "typed", 0)]),
+            "bad origin": segment(3, [("Cork", "suggested", 1)]),
+            "label extra key": {
+                **segment(3, cork),
+                "labels": [{**segment(3, cork)["labels"][0], "x": 1}],
+            },
         }
-        for name, data in cases.items():
-            with self.subTest(case=name):
-                self.assert_build_refused([data])
-        missing = row(SRC_A, 1, "cork")
-        del missing["blob_sha256"]
-        self.assert_build_refused([missing])
+        for name, entry in cases.items():
+            with self.subTest(name):
+                self.assert_build_refused([entry])
+
+    def test_identifying_fields_are_refused(self):
+        for field in ("user_id", "source_id"):
+            with self.subTest(field):
+                entry = segment(3, [("Cork", "typed", 1)], **{field: "a" * 64})
+                self.assert_build_refused([entry])
 
     def test_malformed_provenance(self):
+        cork = [("Cork", "typed", 1)]
         cases = {
-            "origin-unknown": {"origin": "suggested"},
-            "origin-cased": {"origin": "Typed"},
-            "origin-null": {"origin": None},
-            "origin-list": {"origin": ["typed"]},
-            "version-empty": {"proposal_model_version": ""},
-            "version-int": {"proposal_model_version": 12},
-            "names-null": {"suggested_names": None},
-            "names-string": {"suggested_names": "cork", **WITH_MODEL},
-            "names-int-element": {"suggested_names": [1], **WITH_MODEL},
-            "names-null-element": {"suggested_names": [None], **WITH_MODEL},
-            "names-empty-element": {"suggested_names": [""], **WITH_MODEL},
-            "withheld-null": {"suggestions_withheld": None},
-            "withheld-int": {"suggestions_withheld": 0},
-            "withheld-string": {"suggestions_withheld": "false"},
-            # The farm's clips_suggestions_need_model CHECK.
-            "names-without-model": {"suggested_names": ["cork"]},
-            "blind-without-model": {"suggestions_withheld": True},
-            # POST /api/clips refuses a kept suggestion nobody was shown.
-            "model-origin-without-model": {"origin": "model"},
-            "model-origin-on-blind": {"origin": "model", **BLIND},
+            "version not a string": segment(3, cork, proposal_model_version=7),
+            "version empty": segment(3, cork, proposal_model_version=""),
+            "names not a list": segment(
+                3, cork, suggested_names="cork", proposal_model_version=MODEL
+            ),
+            "blank name": segment(
+                3, cork, suggested_names=[""], proposal_model_version=MODEL
+            ),
+            "withheld not bool": segment(
+                3, cork, suggestions_withheld=1, proposal_model_version=MODEL
+            ),
+            "names without model": segment(3, cork, suggested_names=["cork"]),
+            "blind without model": segment(3, cork, suggestions_withheld=True),
+            "model origin without model": segment(3, [("Cork", "model", 1)]),
+            "model origin on blind clip": segment(3, [("Cork", "model", 1)], **BLIND),
         }
-        for name, provenance in cases.items():
-            with self.subTest(case=name):
-                self.assert_build_refused([row(SRC_A, 1, "cork", **provenance)])
-        for field in (
-            "origin",
-            "proposal_model_version",
-            "suggested_names",
-            "suggestions_withheld",
-        ):
-            with self.subTest(missing=field):
-                missing = row(SRC_A, 1, "cork")
-                del missing[field]
-                self.assert_build_refused([missing])
+        for name, entry in cases.items():
+            with self.subTest(name):
+                self.assert_build_refused([entry])
 
-    def test_malformed_provenance_fails_count_too(self):
-        export = FakeExport([row(SRC_A, 1, "cork", origin="suggested")])
-        argv = ["count", "--out-state", str(self.root / "o")]
-        self.assertEqual(fetch_dataset.main(argv, transport=export), EXIT_ERROR)
-        self.assertFalse((self.root / "o").exists())
-
-    def test_rows_that_disagree(self):
-        cases = {
-            "source-blob": [
-                row(SRC_A, 1, "cork"),
-                row(SRC_A, 2, "hook", blob_sha256="f" * 64),
-            ],
-            "clip-window": [row(SRC_A, 1, "cork", 5, 15), row(SRC_A, 1, "hook", 5, 16)],
-            "duplicate-label": [row(SRC_A, 1, "cork"), row(SRC_A, 1, "cork")],
-            "clip-two-sources": [row(SRC_A, 1, "cork"), row(SRC_B, 1, "hook")],
-            # A clip's provenance is one clips row, repeated on each label.
-            "clip-model-version": [
-                row(SRC_A, 1, "cork", **PROPOSED),
-                row(SRC_A, 1, "hook", **{**PROPOSED, "proposal_model_version": "v2"}),
-            ],
-            "clip-suggested-names": [
-                row(SRC_A, 1, "cork", **PROPOSED),
-                row(SRC_A, 1, "hook", **{**PROPOSED, "suggested_names": ["gainer"]}),
-            ],
-            "clip-suggested-order": [
-                row(SRC_A, 1, "cork", **PROPOSED),
-                row(
-                    SRC_A,
-                    1,
-                    "hook",
-                    **{**PROPOSED, "suggested_names": ["cork", "gainer"]},
-                ),
-            ],
-            "clip-withheld": [
-                row(SRC_A, 1, "cork", **PROPOSED),
-                row(SRC_A, 1, "hook", **{**PROPOSED, "suggestions_withheld": True}),
-            ],
-        }
-        for name, rows in cases.items():
-            with self.subTest(case=name):
-                self.assert_build_refused(rows)
+    def test_a_segment_served_twice_fails_closed(self):
+        self.assert_build_refused([SEGMENTS[0], SEGMENTS[2], SEGMENTS[0]])
 
     def test_malformed_taxonomy(self):
-        def export(url, headers):
-            return {
-                "rows": [row(SRC_A, 1, "cork")],
-                "taxonomy": [
-                    {"raw": "cork", "canonical": "Cork", "taxonomy_version": 1}
-                ],
-                "next_cursor": None,
-            }
-
+        bad = [{"raw": "cork", "canonical": "Cork", "taxonomy_version": 1}]
         with self.assertRaises(FetchError):
-            self.build(export)
+            self.build(FakeExport(taxonomy=bad))
 
 
 class PaginationTest(FetchTestCase):
     def test_requests_carry_the_key_and_the_cursor(self):
-        export = FakeExport(page_size=4)
+        export = FakeExport(page_size=3)
         pull = ExportClient(FARM + "/", KEY, export).pull()
-        self.assertEqual(len(pull.rows), 6)
-        urls = [url for url, _ in export.requests]
+        self.assertEqual(len(pull.segments), 5)
         self.assertEqual(
-            urls,
+            [s.segment_id for s in pull.segments], sorted(SEG[n] for n in range(1, 6))
+        )
+        self.assertEqual(
+            [url for url, _ in export.requests],
             [
                 f"{FARM}/api/labels/export",
-                f"{FARM}/api/labels/export?since=cur-3",
-                f"{FARM}/api/labels/export?since=cur-5",
+                f"{FARM}/api/labels/export?since=cur-2",
+                f"{FARM}/api/labels/export?since=cur-4",
             ],
         )
         self.assertEqual(export.requests[0][1]["Authorization"], f"Bearer {KEY}")
-
-    def test_cursor_is_url_encoded(self):
-        export = FakeExport()
-        with contextlib.suppress(Exception):
-            ExportClient(FARM, KEY, export).pull(since="a b&c=d")
-        self.assertEqual(
-            export.requests[0][0], f"{FARM}/api/labels/export?since=a+b%26c%3Dd"
-        )
 
     def test_stuck_or_cycling_cursor(self):
         for cursors in (["x", "x"], ["x", "y", "x"]):
             with self.subTest(cursors=cursors):
                 pages = iter(cursors)
+                entries = iter(SEGMENTS)
 
-                def export(url, headers, pages=pages):
-                    return {"rows": [row(SRC_A, 1, "cork")], "next_cursor": next(pages)}
+                def export(url, headers, pages=pages, entries=entries):
+                    return {"segments": [next(entries)], "next_cursor": next(pages)}
 
                 with self.assertRaises(FetchError):
                     ExportClient(FARM, KEY, export).pull()
 
     def test_malformed_pages(self):
+        entry = SEGMENTS[0]
         for page in (
             [],
-            {"rows": {}},
-            {"rows": [], "taxonomy": {}},
-            {"rows": [row(SRC_A, 1, "cork")], "next_cursor": 7},
-            {"rows": [row(SRC_A, 1, "cork")], "next_cursor": ""},
+            {"segments": {}},
+            {"rows": [entry]},
+            {"segments": [], "taxonomy": {}},
+            {"segments": [entry], "next_cursor": 7},
+            {"segments": [entry], "next_cursor": ""},
         ):
-            with self.subTest(page=page), self.assertRaises(FetchError):
+            with self.subTest(page=str(page)[:40]), self.assertRaises(FetchError):
                 ExportClient(FARM, KEY, lambda url, headers, p=page: p).pull()
 
     def test_url_must_be_https_unless_local(self):
@@ -863,124 +730,106 @@ class HttpTest(unittest.TestCase):
             fetch_dataset.http_get_json(FARM, {})
 
 
-class MainTest(FetchTestCase):
-    def test_count_then_count_again_from_the_stored_watermark(self):
-        export = FakeExport(page_size=4)
-        state = self.root / "state.json"
-        code = fetch_dataset.main(
-            ["count", "--out-state", str(state)], transport=export
-        )
-        self.assertEqual(code, EXIT_OK)
-        self.assertEqual(
-            json.loads(self.stdout.getvalue()), {"new_labels": 6, "changed_sources": 3}
-        )
-        self.assertEqual(json.loads(state.read_text()), {"watermark": "cur-5"})
-
-        export.rows.append(row(SRC_C, 6, "hook", 20, 30))
+class CountTest(FetchTestCase):
+    def count(self, export, state=None, segments_out=None):
+        argv = ["count", "--out-state", str(self.root / "new_state.json")]
+        if state is not None:
+            argv += ["--state", str(state)]
+        if segments_out is not None:
+            argv += ["--out-segments", str(segments_out)]
         self.stdout.truncate(0)
         self.stdout.seek(0)
-        newer = self.root / "newer.json"
-        code = fetch_dataset.main(
-            ["count", "--state", str(state), "--out-state", str(newer)],
-            transport=export,
-        )
-        self.assertEqual(code, EXIT_OK)
-        self.assertEqual(
-            json.loads(self.stdout.getvalue()), {"new_labels": 1, "changed_sources": 1}
-        )
-        self.assertEqual(json.loads(newer.read_text()), {"watermark": "cur-6"})
+        code = fetch_dataset.main(argv, transport=export)
+        return code, (json.loads(self.stdout.getvalue()) if code == EXIT_OK else None)
 
-    def test_count_lists_the_changed_sources(self):
-        export = FakeExport(page_size=4)
-        export.rows.append(row(SRC_C, 6, "hook", 20, 30))
-        state = self.root / "state.json"
-        state.write_text('{"watermark": "cur-3"}')
-        sources = self.root / "run" / "ingested.json"
-        argv = ["count", "--state", str(state), "--out-state", str(self.root / "o")]
-        code = fetch_dataset.main([*argv, "--out-sources", str(sources)], export)
+    def test_first_run_counts_everything(self):
+        new = self.root / "new.json"
+        code, result = self.count(FakeExport(), segments_out=new)
         self.assertEqual(code, EXIT_OK)
-        # Rows 4..6 changed: SRC_A's clip 2 (relabel of an old source), SRC_B's
-        # clip 4 and SRC_C's new clip; one id each, sorted.
-        self.assertEqual(json.loads(sources.read_text()), [SRC_A, SRC_B, SRC_C])
+        self.assertEqual(result, {"new_segments": 5, "new_labels": 6})
         self.assertEqual(
-            json.loads(self.stdout.getvalue()), {"new_labels": 3, "changed_sources": 3}
+            json.loads(new.read_text()), sorted(SEG[n] for n in range(1, 6))
         )
-        self.assertNotIn(SRC_A, self.stdout.getvalue())
+        state = json.loads((self.root / "new_state.json").read_text())
+        self.assertEqual(state, {"segment_ids": sorted(SEG[n] for n in range(1, 6))})
 
-    def test_count_with_nothing_new_lists_no_sources(self):
+    def test_only_segments_absent_from_the_state_are_new(self):
+        self.count(FakeExport(SEGMENTS[:3]))
         state = self.root / "state.json"
-        state.write_text('{"watermark": "cur-5"}')
-        sources = self.root / "ingested.json"
-        argv = ["count", "--state", str(state), "--out-state", str(self.root / "o")]
-        code = fetch_dataset.main([*argv, "--out-sources", str(sources)], FakeExport())
+        (self.root / "new_state.json").rename(state)
+        # Segment 2 is new; segment 3 was re-cut away (absent, not new).
+        later = [SEGMENTS[1], SEGMENTS[2], SEGMENTS[3]]
+        new = self.root / "new.json"
+        code, result = self.count(FakeExport(later), state=state, segments_out=new)
         self.assertEqual(code, EXIT_OK)
-        self.assertEqual(json.loads(sources.read_text()), [])
+        self.assertEqual(result, {"new_segments": 1, "new_labels": 1})
+        self.assertEqual(json.loads(new.read_text()), [SEG[2]])
 
-    def test_count_with_nothing_new_keeps_the_watermark(self):
+    def test_nothing_new(self):
+        self.count(FakeExport())
         state = self.root / "state.json"
-        state.write_text('{"watermark": "cur-5"}')
-        out = self.root / "out.json"
-        code = fetch_dataset.main(
-            ["count", "--state", str(state), "--out-state", str(out)],
-            transport=FakeExport(),
-        )
+        (self.root / "new_state.json").rename(state)
+        new = self.root / "new.json"
+        code, result = self.count(FakeExport(), state=state, segments_out=new)
         self.assertEqual(code, EXIT_OK)
-        self.assertEqual(
-            json.loads(self.stdout.getvalue()), {"new_labels": 0, "changed_sources": 0}
-        )
-        self.assertEqual(json.loads(out.read_text()), {"watermark": "cur-5"})
+        self.assertEqual(result, {"new_segments": 0, "new_labels": 0})
+        self.assertEqual(json.loads(new.read_text()), [])
+
+    def test_a_state_from_before_segments_counts_everything(self):
+        state = self.root / "state.json"
+        state.write_text('{"watermark": "old-row-cursor"}')
+        code, result = self.count(FakeExport(), state=state)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(result["new_segments"], 5)
 
     def test_malformed_state_file(self):
-        for content in ("not json", "{}", '{"watermark": 5}', '{"watermark": ""}'):
+        for content in (
+            "not json",
+            "{}",
+            '{"segment_ids": "x"}',
+            '{"segment_ids": ["not-a-uuid"]}',
+            '{"segment_ids": [], "watermark": null}',
+        ):
             with self.subTest(state=content):
                 state = self.root / "state.json"
                 state.write_text(content)
-                code = fetch_dataset.main(
-                    [
-                        "count",
-                        "--state",
-                        str(state),
-                        "--out-state",
-                        str(self.root / "o"),
-                    ],
-                    transport=FakeExport(),
-                )
-                self.assertEqual(code, EXIT_ERROR)
+                self.assertEqual(self.count(FakeExport(), state=state)[0], EXIT_ERROR)
 
+    def test_malformed_provenance_fails_count_too(self):
+        bad = segment(3, [("Cork", "suggested", 1)])
+        self.assertEqual(self.count(FakeExport([bad]))[0], EXIT_ERROR)
+        self.assertFalse((self.root / "new_state.json").exists())
+
+
+class MainTest(FetchTestCase):
     def test_build_via_main_prints_counts_only(self):
-        argv = ["build", "--out", str(self.root / "ds"), "--cache", str(self.cache)]
-        code = fetch_dataset.main(argv, transport=FakeExport(), blob_getter=self.blobs)
-        self.assertEqual(code, EXIT_OK)
-        self.assertEqual(json.loads(self.stdout.getvalue())["samples"], 3)
+        self.assertEqual(self.main_build(FakeExport()), EXIT_OK)
+        self.assertEqual(json.loads(self.stdout.getvalue())["samples"], 4)
         output = self.stdout.getvalue() + self.stderr.getvalue()
         for secret in ("Mystery", "corkscrew", "cur-", KEY, MODEL, "vocabulary"):
             self.assertNotIn(secret, output)
+        for segment_id in SEG.values():
+            self.assertNotIn(segment_id, output)
 
     def test_malformed_provenance_exits_2_without_leaking(self):
         cases = {
-            "origin": {"origin": "leaked-origin"},
-            "version": {"proposal_model_version": ["leaked-version"]},
-            "names": {"suggested_names": ["leaked-name"]},  # no proposing model
+            "origin": segment(3, [("Cork", "leaked-origin", 1)]),
+            "version": segment(3, [("Cork", "typed", 1)], proposal_model_version=[1]),
+            "names": segment(3, [("Cork", "typed", 1)], suggested_names=["leaked"]),
         }
-        argv = ["build", "--out", str(self.root / "ds"), "--cache", str(self.cache)]
-        for name, provenance in cases.items():
+        for i, (name, entry) in enumerate(cases.items()):
             with self.subTest(case=name):
                 self.stderr.truncate(0)
                 self.stderr.seek(0)
-                export = FakeExport([row(SRC_A, 1, "cork", **provenance)])
-                code = fetch_dataset.main(
-                    argv, transport=export, blob_getter=self.blobs
-                )
+                code = self.main_build(FakeExport([entry]), out=f"ds{i}")
                 self.assertEqual(code, EXIT_ERROR)
-                self.assertIn("export row 0", self.stderr.getvalue())
+                self.assertIn("export segment 0", self.stderr.getvalue())
                 self.assertNotIn("leaked", self.stderr.getvalue())
                 self.assertEqual(self.stdout.getvalue(), "")
 
     def test_build_failure_exits_2_without_leaking(self):
-        self.blobs.blobs[f"poses/{SRC_B}.tkp1.gz"] = BLOBS[SRC_A]
-        argv = ["build", "--out", str(self.root / "ds"), "--cache", str(self.cache)]
-        code = fetch_dataset.main(argv, transport=FakeExport(), blob_getter=self.blobs)
-        self.assertEqual(code, EXIT_ERROR)
+        self.blobs.blobs[key(2)] = BLOBS[1]
+        self.assertEqual(self.main_build(FakeExport()), EXIT_ERROR)
         self.assertIn("blob_sha256", self.stderr.getvalue())
         for secret in ("Mystery", KEY):
             self.assertNotIn(secret, self.stderr.getvalue())
@@ -1008,32 +857,29 @@ class MainTest(FetchTestCase):
             "R2_ACCOUNT_ID": "acct",
             "R2_ACCESS_KEY_ID": "key-id",
             "R2_SECRET_ACCESS_KEY": "SECRET",
-            "R2_BUCKET": "poses-bucket",
+            "R2_BUCKET": "segments-bucket",
         }
         client = mock.MagicMock()
-        client.get_object.return_value = {"Body": io.BytesIO(BLOBS[SRC_A])}
+        client.get_object.return_value = {"Body": io.BytesIO(BLOBS[1])}
         with (
             mock.patch.dict(os.environ, env),
             mock.patch("boto3.client", return_value=client) as make_client,
         ):
             get = fetch_dataset.r2_getter_from_env()
-            self.assertEqual(get(f"poses/{SRC_A}.tkp1.gz"), BLOBS[SRC_A])
+            self.assertEqual(get(key(1)), BLOBS[1])
             client.get_object.side_effect = ClientError(
                 {"Error": {"Code": "NoSuchKey", "Message": "SECRET detail"}},
                 "GetObject",
             )
             with self.assertRaisesRegex(FetchError, "ClientError") as ctx:
-                get(f"poses/{SRC_B}.tkp1.gz")
+                get(key(2))
         self.assertNotIn("SECRET", str(ctx.exception))
-        kwargs = make_client.call_args.kwargs
         self.assertEqual(make_client.call_args.args, ("s3",))
         self.assertEqual(
-            kwargs["endpoint_url"], "https://acct.r2.cloudflarestorage.com"
+            make_client.call_args.kwargs["endpoint_url"],
+            "https://acct.r2.cloudflarestorage.com",
         )
-        self.assertEqual(kwargs["region_name"], "auto")
-        client.get_object.assert_called_with(
-            Bucket="poses-bucket", Key=f"poses/{SRC_B}.tkp1.gz"
-        )
+        client.get_object.assert_called_with(Bucket="segments-bucket", Key=key(2))
 
     @unittest.skipIf(importlib.util.find_spec("boto3"), "boto3 is installed")
     def test_r2_getter_requires_boto3(self):

@@ -31,9 +31,11 @@ window whose label is not one of the model's classes has no such
 probability and is left out; the block counts them. A sample's score is
 the mean over its windows.
 
-A sample is one source in the farm's dataset (fetch_dataset.py writes
-one sample per source), and the splitter keeps a source's samples in one
-split, so members and non-members are sources, as the design asks.
+A sample is one segment in the farm's dataset (fetch_dataset.py writes
+one sample per segment), and the splitter keeps every segment of a split
+bucket in one split, so a session is on one side. Members and
+non-members are therefore segments; the code and the report call them
+sources, as they were before the switch to segments.
 
 The attack's power is the ROC AUC of those scores, members against
 non-members: the probability that a random training source scores above

@@ -72,7 +72,7 @@ class CheckpointTest(unittest.TestCase):
     def test_an_extra_key_fails(self) -> None:
         for name, value in (
             ("train_embeddings", np.zeros((10, N_FEATURES))),
-            ("pose_window", np.zeros((8, 17, 3))),
+            ("pose_window", np.zeros((8, 13, 3))),
         ):
             with self.subTest(name), self.assertRaises(rc.ReleaseCheckError) as cm:
                 rc.check_checkpoint(self.raw(**{name: value}))

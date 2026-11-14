@@ -13,23 +13,25 @@ Inputs
 
 Model I/O (docs/MODEL_CONTRACT.md §3)
 -------------------------------------
-Input  `pose`: float32 [T, 52], the canonical 10 Hz sequence: per frame
-       17 x (x, y, confidence) in MoveNet-17 order, then the gap
-       indicator. window_frames <= T <= tkp1.MAX_FRAMES. The baseline
-       reads x and y only; confidence and the gap channel are accepted
+Input  `pose`: float32 [T, 40], the take after the segment transform
+       (contract §3.6, Training/segment_transform.py): per frame 13
+       joints x (x, y, confidence) in TKS1 order, then the gap
+       indicator. window_frames <= T <= tkp1.MAX_FRAMES. A joint is
+       present iff its confidence is > 0; the gap channel is accepted
        so the input matches the contract the production model will read.
 Output `window_probs`: float32 [N, C], N = (T - window_frames) //
        window_stride + 1. Row i is the softmax over `classes` for the
        window covering frames [i * window_stride, i * window_stride +
-       window_frames), the same windows and features as train.py.
+       window_frames), the same windows and features as train.py
+       (train.featurize_window: per-joint mean position about the
+       window's root, then per-joint mean speed over present pairs).
        Decoding windows into segments is the client's step (contract
        §3.2.1); the manifest's output_desc (`descriptors`) carries the
        window parameters and the class list it needs.
-Output `window_embeddings`: float32 [N, 68], the same windows as
+Output `window_embeddings`: float32 [N, 52], the same windows as
        `window_probs`. Row i is that window's standardized features,
-       what the softmax-linear head reads: per-joint mean x/y position,
-       then per-joint mean absolute frame-to-frame x/y change, centered
-       by feat_mean and scaled by 1 / feat_std, in fp32. Only the
+       what the softmax-linear head reads: train.featurize_window's 52
+       values, centered by feat_mean and scaled by 1 / feat_std, in fp32. Only the
        client's on-device personal layer reads it (contract §3.2.2,
        §3.5), from output_desc.embedding. It is comparable within one
        model version only: every retrain refits feat_mean and feat_std.
@@ -65,21 +67,26 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import segment_transform
 import tkp1
+import tks1
 import train
 
 PACKAGE_NAME = "TrickDetector.mlpackage"
 INPUT_NAME = "pose"
 OUTPUT_NAME = "window_probs"
 EMBEDDING_NAME = "window_embeddings"
-INPUT_CHANNELS = tkp1.KEYPOINT_COUNT * tkp1.CHANNELS + 1  # + gap indicator: 52
-N_FEATURES = 2 * 2 * tkp1.KEYPOINT_COUNT  # mean position + mean speed: 68
+INPUT_CHANNELS = tks1.KEYPOINT_COUNT * tks1.CHANNELS + 1  # + gap indicator: 40
+N_FEATURES = 2 * 2 * tks1.KEYPOINT_COUNT  # mean position + mean speed: 52
+# Below this fraction of a window's frames with both hips, the window has no
+# root (train.featurize_window: root 0). Smaller than 1 / any window length.
+ROOT_PRESENCE_FLOOR = 1e-3
 # Default T the runtime pre-allocates for: a 60 s source (or one window,
 # if a window is longer).
 DEFAULT_FRAMES = 600
 # The classifier head runs in fp32: standardizing divides by feat_std,
 # which can be small enough that fp16 overflows (65504) or keeps too few
-# bits of the quotient. Everything before it (pose values in [0, 1],
+# bits of the quotient. Everything before it (pose values in torso lengths,
 # window means) runs in fp16. The embedding output reads standardize_scale
 # through an fp32 identity, since a MIL program's output takes its op's
 # name (ct.convert ignores `outputs` names for one).
@@ -136,10 +143,12 @@ def load_model(path: Path) -> dict[str, Any]:
 def descriptors(ckpt: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """The manifest's input_desc and output_desc for this model."""
     input_desc = {
-        "format": "TKP1",
-        "format_version": tkp1.FORMAT_VERSION,
-        "sample_rate_hz": tkp1.CANONICAL_RATE_HZ,
-        "keypoint_count": tkp1.KEYPOINT_COUNT,
+        "format": "TKS1",
+        "format_version": tks1.FORMAT_VERSION,
+        "sample_rate_hz": tks1.CANONICAL_RATE_HZ,
+        "keypoint_count": tks1.KEYPOINT_COUNT,
+        "joints": list(segment_transform.JOINTS),
+        "transform": "MODEL_CONTRACT.md §3.6",
         "features": ["x", "y", "confidence", "gap_indicator"],
         "input_name": INPUT_NAME,
         "shape": ["T", INPUT_CHANNELS],
@@ -178,48 +187,96 @@ def build_mlmodel(ckpt: dict[str, Any]) -> Any:
         ) from e
 
     W, S = ckpt["window_frames"], ckpt["window_stride"]
-    weight = np.asarray(ckpt["W"], dtype=np.float32).T  # [C, 68]
+    weight = np.asarray(ckpt["W"], dtype=np.float32).T  # [C, 52]
     bias = np.asarray(ckpt["b"], dtype=np.float32)
     mean = np.asarray(ckpt["feat_mean"], dtype=np.float32)
     # Multiply by 1 / std (fp32) rather than divide: the converter rewrites
     # a division by a constant into exactly this multiply, under its own
     # name, which would drop it out of FP32_OPS.
     inv_std = (1.0 / np.asarray(ckpt["feat_std"], dtype=np.float64)).astype(np.float32)
-    n_xy = 2 * tkp1.KEYPOINT_COUNT
+    J = tks1.KEYPOINT_COUNT
+    left, right = train.HIP_JOINTS
+
+    def windows(x: Any, kernel: int) -> Any:
+        """[1, channels, T] -> the per-window mean, [1, channels, N]."""
+        return mb.avg_pool(x=x, kernel_sizes=[kernel], strides=[S], pad_type="valid")
+
+    def channels_last(x: Any, width: int) -> Any:
+        """[T, ...] -> [1, width, T] for avg_pool."""
+        return mb.expand_dims(
+            x=mb.transpose(x=mb.reshape(x=x, shape=[-1, width]), perm=[1, 0]),
+            axes=[0],
+        )
+
+    def rows(x: Any) -> Any:
+        """[1, width, N] -> [N, width]."""
+        return mb.transpose(x=mb.squeeze(x=x, axes=[0]), perm=[1, 0])
 
     @mb.program(
         input_specs=[mb.TensorSpec(shape=(get_new_symbol(), INPUT_CHANNELS))],
         opset_version=ct.target.iOS15,
     )
     def program(pose: Any) -> Any:
-        # [T, 52] -> x, y per joint as [T, 34], joint-major like
-        # train.featurize_window's pos.mean(axis=0).ravel().
+        # The window features of train.featurize_window, as window means.
         kp = mb.slice_by_index(
             x=pose, begin=[0, 0], end=[0, INPUT_CHANNELS - 1], end_mask=[True, False]
         )
-        kp = mb.reshape(x=kp, shape=[-1, tkp1.KEYPOINT_COUNT, tkp1.CHANNELS])
+        kp = mb.reshape(x=kp, shape=[-1, J, tks1.CHANNELS])  # [T, J, 3]
         xy = mb.slice_by_index(
             x=kp, begin=[0, 0, 0], end=[0, 0, 2], end_mask=[True, True, False]
-        )
-        seq = mb.transpose(x=mb.reshape(x=xy, shape=[-1, n_xy]), perm=[1, 0])
-        seq = mb.expand_dims(x=seq, axes=[0])  # [1, 34, T]
-        # Window i = frames [i*S, i*S + W): mean position over its W frames,
-        # mean |velocity| over its W - 1 frame differences.
-        pos = mb.avg_pool(x=seq, kernel_sizes=[W], strides=[S], pad_type="valid")
+        )  # [T, J, 2]
+        conf = mb.slice_by_index(
+            x=kp, begin=[0, 0, 2], end=[0, 0, 3], end_mask=[True, True, False]
+        )  # [T, J, 1]
+        present = mb.cast(x=mb.greater(x=conf, y=0.0), dtype="fp32")  # [T, J, 1]
+
+        def joint(x: Any, j: int) -> Any:
+            return mb.slice_by_index(
+                x=x, begin=[0, j, 0], end=[0, j + 1, 0], end_mask=[True, False, True]
+            )
+
+        hips = mb.mul(x=joint(present, left), y=joint(present, right))  # [T, 1, 1]
+        root = mb.mul(
+            x=mb.mul(x=mb.add(x=joint(xy, left), y=joint(xy, right)), y=0.5), y=hips
+        )  # [T, 1, 2], 0 where a hip is missing
+
+        pos_mean = rows(windows(channels_last(xy, 2 * J), W))  # [N, 2J]
+        present_mean = rows(windows(channels_last(present, J), W))  # [N, J]
+        root_mean_masked = rows(windows(channels_last(root, 2), W))  # [N, 2]
+        hips_mean = rows(windows(channels_last(hips, 1), W))  # [N, 1]
+        root_mean = mb.real_div(
+            x=root_mean_masked, y=mb.maximum(x=hips_mean, y=ROOT_PRESENCE_FLOOR)
+        )  # [N, 2]; 0 without hips
+
+        # (position - root) where present, averaged: pos_mean - root * presence.
+        offset = mb.mul(
+            x=mb.expand_dims(x=root_mean, axes=[1]),
+            y=mb.expand_dims(x=present_mean, axes=[2]),
+        )  # [N, J, 2]
+        centered = mb.sub(
+            x=mb.reshape(x=pos_mean, shape=[-1, J, 2]), y=offset
+        )  # [N, J, 2]
+        centered = mb.reshape(x=centered, shape=[-1, 2 * J])
+
+        # Speed over frame pairs where the joint is present in both frames.
         nxt = mb.slice_by_index(
-            x=seq, begin=[0, 0, 1], end=[0, 0, 0], end_mask=[True, True, True]
+            x=xy, begin=[1, 0, 0], end=[0, 0, 0], end_mask=[True, True, True]
         )
         prv = mb.slice_by_index(
-            x=seq, begin=[0, 0, 0], end=[0, 0, -1], end_mask=[True, True, False]
+            x=xy, begin=[0, 0, 0], end=[-1, 0, 0], end_mask=[False, True, True]
         )
-        speed = mb.avg_pool(
-            x=mb.abs(x=mb.sub(x=nxt, y=prv)),
-            kernel_sizes=[W - 1],
-            strides=[S],
-            pad_type="valid",
-        )
-        feat = mb.concat(values=[pos, speed], axis=1)  # [1, 68, N]
-        feat = mb.transpose(x=mb.squeeze(x=feat, axes=[0]), perm=[1, 0])  # [N, 68]
+        both = mb.mul(
+            x=mb.slice_by_index(
+                x=present, begin=[1, 0, 0], end=[0, 0, 0], end_mask=[True, True, True]
+            ),
+            y=mb.slice_by_index(
+                x=present, begin=[0, 0, 0], end=[-1, 0, 0], end_mask=[False, True, True]
+            ),
+        )  # [T-1, J, 1]
+        moves = mb.mul(x=mb.abs(x=mb.sub(x=nxt, y=prv)), y=both)  # [T-1, J, 2]
+        speed = rows(windows(channels_last(moves, 2 * J), W - 1))  # [N, 2J]
+
+        feat = mb.concat(values=[centered, speed], axis=1)  # [N, 52]
         feat = mb.sub(x=feat, y=mean, name="standardize_center")
         feat = mb.mul(x=feat, y=inv_std, name="standardize_scale")
         logits = mb.linear(x=feat, weight=weight, bias=bias, name="logits")

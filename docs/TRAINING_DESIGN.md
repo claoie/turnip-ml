@@ -16,25 +16,32 @@ what those PRs implement, it says so explicitly.
 
 - Only **confirmed** clips + labels. The farm has no draft/pending clip
   lifecycle (master plan §1–§2), so everything reachable via
-  `GET /api/labels/export?since=` is training-eligible by construction.
-- Privacy posture: pose keypoints (pose format) + labels only. Never
-  video, and no account identifier: the farm links a contribution to an
-  account only internally, until 30 days after its last write, and
-  never exports that link (master plan §1; `BACKEND_DESIGN.md`
-  §1.2.17). That makes the data de-linked and hard to re-identify, not
-  anonymous: a pose sequence can still be matched to a video of the same
-  clip (`BACKEND_DESIGN.md` §9 Q9).
-- *Proposed (farm privacy plan, `BACKEND_DESIGN.md` §8.1; not built):*
-  the farm keeps the account link until deletion instead of 30 days,
-  still never exported, and cuts short transformed segments at ingest
-  (hip-centered, scaled to a standard body, one head point, light
-  noise). Training would then read segments, not whole-session pose,
-  and §2.2 and §2.5 need revisiting when that lands.
-- The export excludes quarantined sources (master plan §4) and presents
-  one **(source, clip, canonical trick name)** row per label — see §2.2.
-- Each row also carries the label's provenance (`BACKEND_DESIGN.md`
-  §1.2.18): its `origin` (`typed` | `vocabulary` | `model`), and the
-  clip's `proposal_model_version`, `suggested_names` and
+  `GET /api/labels/export` is training-eligible by construction.
+- **Segments, never whole-session pose** (`BACKEND_DESIGN.md` §1.2.24,
+  `POSE_FORMAT.md` §12). The export serves one **segment** per labeled
+  clip: the clip window plus 0.5 s (5 frames) of context on each side,
+  re-targeted onto a standard body. It is hip-centered and scaled by
+  the median torso length; every bone is set to a standard length along
+  its observed direction; keypoints 0–4 collapse to one head point; and
+  light noise is added. The blob is `TKS1`: 13 joints at 10 Hz, in
+  torso lengths (`Training/tks1.py`). The farm keeps at most one segment
+  per clip, never two of a source that overlap or lie within 1 s, so a
+  session can't be stitched back together.
+- Privacy posture: segments + labels only. Never video, and no account
+  or source identifier: a segment carries a fresh random id, no
+  timestamp, and a `split_bucket` (0–9, the same for every segment of
+  one source) so splits can keep a session on one side without knowing
+  which session it was. The farm links a segment to its source only
+  internally, and deletes that link with the source and the account
+  (`BACKEND_DESIGN.md` §1.2.24). That makes the data de-linked and hard
+  to re-identify, not anonymous: a segment can still be matched to a
+  video of the same clip (`BACKEND_DESIGN.md` §9 Q9).
+- The export excludes segments of quarantined sources (master plan §4)
+  and presents one entry per segment with its clip window and every
+  label on it — see §2.2.
+- Each segment also carries its labels' provenance (`BACKEND_DESIGN.md`
+  §1.2.18): each label's `origin` (`typed` | `vocabulary` | `model`),
+  and the clip's `proposal_model_version`, `suggested_names` and
   `suggestions_withheld`. Training will use them to measure and limit the
   model learning from its own suggestions (§6.4, proposed — not yet
   implemented, turnip-ml#40).
@@ -46,25 +53,31 @@ what those PRs implement, it says so explicitly.
 
 ### 2.1 Export and watermarking
 
-- **Change detection.** The nightly job first pulls
-  `GET /api/labels/export?since=<watermark>` and proceeds only when the
-  new label rows exceed 50 (master plan §6). The watermark is the
-  export cursor (the farm's opaque `next_cursor`) of the last successful
-  run, stored in the training workspace (not in the farm). It advances
-  only when a run completes.
+- **Change detection.** Segment ids are random and the export's cursor
+  is only a page position, so change is read from the ids themselves.
+  The watermark is the last successful run's set of segment ids, stored
+  in the training workspace (not in the farm). The nightly job pulls
+  the export (entries only, no blobs), counts the labels on segments
+  whose id is not in the watermark, and proceeds only when they exceed
+  50 (master plan §6). Any clip or label edit re-cuts its source's
+  segments under fresh ids, so a relabel counts as new, as an upload
+  does. The watermark advances only when a run completes. A watermark
+  from before segments (an export cursor) counts every segment as new
+  once.
 - **Dataset pull.** The dataset itself is always built from a **full
-  pull** (no `since`). The export carries no deletions
-  (`BACKEND_DESIGN.md` §6): a source deleted by its owner, by account
-  deletion, or by a quarantine purge, and a label dropped when a clip's
-  label set is replaced, simply stop appearing. A dataset accumulated
-  from incremental pulls would keep training on deleted data.
-- **Row contents.** Each row carries the pose-blob R2 reference and its
-  digest, the clip window, the raw label string, the
-  `taxonomy_version` in effect at label time, and the provenance fields
-  (§1). There is no account identifier.
-- **Blob cache.** Pose blobs may be cached locally, keyed by `r2_key`
+  pull**. The export carries no deletions (`BACKEND_DESIGN.md` §6): a
+  segment whose source was deleted by its owner or purged from
+  quarantine, or that was re-cut, simply stops appearing. A dataset
+  accumulated from incremental pulls would keep training on deleted
+  data.
+- **Entry contents.** Each segment carries its `TKS1` blob's R2
+  reference and digest, its frame count, the clip window inside it, its
+  `split_bucket`, the clip's provenance, and its labels (raw name,
+  `origin`, `taxonomy_version`). There is no account or source
+  identifier; an entry carrying a `user_id` or `source_id` is refused.
+- **Blob cache.** Segment blobs may be cached locally, keyed by `r2_key`
   and verified against `blob_sha256`. After each full pull, every
-  cached blob whose source is absent from the pull is deleted.
+  cached blob whose segment is absent from the pull is deleted.
 - **Scheduled retrain.** A full pull keeps deleted data out of new
   training, but the nightly run fine-tunes the champion, whose weights
   carry everything it was ever trained on, and it runs only past 50 new
@@ -111,7 +124,7 @@ Deterministic pipeline per label string:
    as the canonical name and are appended to a curation queue
    (`unmapped_labels.log`) for later taxonomy work. They train only if
    the farm's contributor counts cover them; otherwise the rare-trick
-   hold-back (§6.2) holds their clips back. Rationale: failing
+   hold-back (§6.2) holds their segments back. Rationale: failing
    closed on unmapped names would starve early training when the
    vocabulary is still growing; the log feeds the taxonomy curation loop
    (master plan §9, open question 1). A model trained on an unmapped
@@ -119,18 +132,19 @@ Deterministic pipeline per label string:
    is a contributor's free text (`MODEL_CONTRACT.md` §1), so publishing
    waits until the taxonomy maps it.
 
-Clip → Label shape (decided): the farm stores **one label row per
-`(clip_id, trick_name)`** (`BACKEND_DESIGN.md` §1.1) — one-to-many at
-every level (Source → Clip → Label). The export is already
-label-granular (§1), so the dataset builder consumes one
-`(clip_id, raw trick name)` row per export row and canonicalizes each
-through `label_taxonomy` at the pinned `taxonomy_version` (above).
+Segment → Label shape (decided): the farm stores **one label row per
+`(clip_id, trick_name)`** (`BACKEND_DESIGN.md` §1.1), and each segment
+carries its clip's whole label set, sorted, never empty. The dataset
+builder canonicalizes every raw name of a segment through
+`label_taxonomy` at the pinned `taxonomy_version` (above) and writes one
+trick entry per canonical name, all on the segment's clip window. A
+segment whose names all canonicalize to nothing is dropped.
 
 ### 2.3 Training targets
 
-- One **segment** per confirmed clip window: `(start_frame, end_frame)`
-  in source-frame coordinates (absolute indices into the source's
-  canonical 10 Hz pose sequence).
+- One **target segment** per training segment: its clip window
+  `(window_start, window_end)`, in the segment's own 10 Hz frames. The
+  frames outside it are the segment's context.
 - Multi-label: a combo clip with N canonical names becomes one segment
   with an N-hot target vector over the canonical vocabulary (vocabulary
   size fixed at the pinned `taxonomy_version`).
@@ -139,32 +153,54 @@ through `label_taxonomy` at the pinned `taxonomy_version` (above).
 
 ### 2.4 Gap handling
 
-- pose-format gap frames (all-zero confidence) are **missing data**. They break
-  interpolation and are never synthesized across (master plan §3).
-- Input features per frame: 17×3 `(x, y, confidence)` **plus one binary
-  gap-indicator channel** = 52 dims per frame. The indicator lets the
-  model distinguish "athlete at origin" from "no observation".
+- Gap frames (all-zero confidence; in a segment, any frame missing a
+  hip) are **missing data**, as are missing joints (one joint's
+  confidence 0, e.g. its parent was not seen). They break interpolation
+  and are never synthesized across (master plan §3).
+- Input per frame: the 13 `TKS1` joints × `(x, y, confidence)` **plus
+  one binary gap-indicator channel** = 40 dims per frame
+  (`MODEL_CONTRACT.md` §3.6). The indicator lets the model distinguish
+  "athlete at the root" from "no observation".
+- The baseline's window features (`train.featurize_window`) read joints
+  only where present: positions about the window's root (the mean hip
+  midpoint over frames with both hips), and speeds over frame pairs
+  where the joint is present in both. They don't depend on where the
+  sequence was centered, so the farm's per-segment center and the
+  client's per-take center give the same features
+  (`MODEL_CONTRACT.md` §3.6.2).
 - Loss masking: any frame-level auxiliary loss ignores gap frames.
   Segment-level targets are unaffected — a labeled window may contain
   gaps; the label still applies to the window.
-- Sequences are consumed at full source length in the dataset. Windowing,
-  if needed for memory, is an architecture/training detail, not a
-  dataset one.
+- Segments are consumed whole in the dataset. Windowing is an
+  architecture/training detail, not a dataset one.
 
 ### 2.5 Background negatives
 
-- Non-labeled regions of contributed sources serve as background
-  negatives (master plan §6).
-- **Judgment call:** exclude a ±2 s margin around every labeled window
-  from the background pool. Boundaries are where labelers disagree, and
-  training on them as hard negatives injects label noise. The margin
-  width is a config constant to be tuned empirically.
+- Background negatives come only from each segment's **context
+  frames**: the farm exports nothing of a session outside its segments
+  (§1). A window is background when the clip window covers less than
+  half of it (`train.label_for_window`), so a background window lies
+  mostly in context.
+- Context is 5 frames on each side, so a window must be shorter than 10
+  frames for a background window to exist at all. The pipeline configs
+  use 8-frame windows at stride 4 *(judgment call)*: about one
+  background window per segment end.
+- **The ±2 s margin no longer applies** (`background_margin_seconds =
+  0` in the pipeline configs): every context frame is within 0.5 s of
+  the clip, so any margin would leave no background. Boundaries are
+  where labelers disagree, so these background windows carry some of
+  the label noise the margin used to keep out. The margin stays a config
+  constant for data that has longer unlabeled stretches, such as the
+  smoke fixture.
 
 ### 2.6 Splits (aligns with PR #17)
 
-- Grouped by `source_id`, target 80/10/10 train/val/holdout: all clips
-  of one source land in one split. (PR #17 groups by `user_id`; it
-  needs to group by `source_id`.)
+- Grouped by the farm's `split_bucket`, target 80/10/10
+  train/val/holdout: every segment of one source has the same bucket, so
+  a session lands in one split. `fetch_dataset.py` writes the bucket as
+  the manifest's group (`source_id = "bucket-<n>"`), which
+  `split_dataset.py` groups by. There are 10 buckets, so a split takes
+  whole tenths of the data, and the ratios hold only to that grain.
 - **Person leakage is a measured risk.** The export carries no account
   identifier (§1), so one person's different videos can land in both
   train and val. With few contributors this is not a rounding error:
@@ -188,13 +224,17 @@ through `label_taxonomy` at the pinned `taxonomy_version` (above).
 - Deterministic: seeded RNG, sorted ids, byte-identical `split.json`
   (PR #17's `split_dataset.py` is the implementation).
 - Admin-curated holdout pinning: a pinned sample id pulls its whole
-  source into holdout — the poisoning-defense anchor. The holdout set
-  stays admin-curated (master plan §6), composed as above.
+  group into holdout — the poisoning-defense anchor. With segments a
+  sample id is a segment id, which changes whenever its source is
+  re-cut, and its group is a whole split bucket, about a tenth of all
+  contributions. Pinning therefore no longer selects the admin-curated
+  footage (§10 Q13). The holdout set stays admin-curated in intent
+  (master plan §6), composed as above.
 - The holdout split is **never loaded for training** — enforced at load
   time by the training script (PR #18), not by convention.
-- The dataset manifest (sample ids, split assignment, taxonomy_version,
-  export watermark, split seed) is written next to the dataset; a
-  training run is reproducible from the manifest alone.
+- The dataset manifest (sample ids, taxonomy_version, held-back names)
+  and the split (split assignment, split seed) are written next to the
+  dataset; a training run is reproducible from them alone.
 
 ### 2.7 Class balance
 
@@ -288,13 +328,14 @@ descriptor (`MODEL_CONTRACT.md` §3.2.2).
 
 Nightly pipeline order:
 
-1. Count new labels since the watermark; when they exceed 50, take a
-   full pull of `GET /api/labels/export` and prune the blob cache
-   (§2.1).
+1. Count the labels on segments new since the watermark; when they
+   exceed 50, take a full pull of `GET /api/labels/export` and prune the
+   blob cache (§2.1).
 2. Build the dataset (§2): canonicalize at the pinned
-   `taxonomy_version`, expand to (clip, name) pairs, attach gap-masked
-   pose-format sequences, sample background negatives.
-3. Split deterministically by `source_id` (§2.6).
+   `taxonomy_version`, hold back rare tricks (§6.2), write one sample per
+   segment with its `TKS1` frames and (segment, name) entries;
+   background comes from the segments' context frames.
+3. Split deterministically by `split_bucket` (§2.6).
 4. Train the challenger on the train split, initializing from the
    current champion (`init_checkpoint` — the standing fine-tune path;
    from-scratch training is the exception: architecture change or
@@ -392,20 +433,22 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   the model, so treating it as anonymous needs evidence
   (`BACKEND_DESIGN.md` §9 Q8, EDPB Opinion 28/2024). The holdout report
   carries a membership-inference check (`Training/membership_inference.py`):
-  can the model's outputs tell training sources from holdout sources
-  better than chance?
+  can the model's outputs tell training data from holdout data better
+  than chance? The unit is a sample, which is one segment of farm data
+  (the code calls it a source).
   - **Attack:** a confidence attack (Yeom et al., 2018). Each window
     scores the model's probability for its true label, windowed and
-    standardized as training saw it; a source scores the mean over its
+    standardized as training saw it; a segment scores the mean over its
     windows. A window whose label the model has no class for is left
     out and counted.
-  - **Measure:** the ROC AUC of training-source scores against
-    holdout-source scores. 0.5 is chance.
-  - **Pass** iff AUC ≤ 0.60 and each side has at least 20 sources.
-    *(Judgment call on both, §10 Q6.)* With 20 holdout sources a model
-    that leaks nothing still scores above 0.60 in about 7% of runs;
-    fewer sources give no evidence either way, so the check fails
-    rather than pass on noise.
+  - **Measure:** the ROC AUC of training-segment scores against
+    holdout-segment scores. 0.5 is chance.
+  - **Pass** iff AUC ≤ 0.60 and each side has at least 20 segments.
+    *(Judgment call on both, §10 Q6.)* With 20 independent holdout
+    segments a model that leaks nothing still scores above 0.60 in about
+    7% of runs; fewer give no evidence either way, so the check fails
+    rather than pass on noise. Segments of one source are not
+    independent, so the real chance spread is somewhat wider.
   - The holdout's people are outside the contributor pool (§2.6), so a
     model that learned individuals fails as well as one that memorized
     sources. That errs on the side of failing.
@@ -443,15 +486,13 @@ estimation is MoveNet's job, and fine-tuning it is off the table
     any page gives.
   - Fail closed: a page without either field holds every trick back,
     and an unmapped token (§2.2) has no count.
-  - `fetch_dataset.py build` holds back every clip carrying a name below
-    the minimum, whole, combos included: no trick entry, so no name,
-    `train_count` or holdout metric. Its window goes to the sample's
-    `held_back_windows`, and training drops every window that overlaps
-    one or lies within the §2.5 margin of one, so the trick trains
-    neither as a name nor as background.
+  - `fetch_dataset.py build` holds back every segment carrying a name
+    below the minimum, whole, combos included. No sample is written for
+    it, so the trick has no name, `train_count` or holdout metric, and
+    its context frames don't train as background either.
   - `dataset_manifest.json` lists the held-back names, and
     `publish_model.py` refuses a model that names one. Logs carry only
-    how many names and clips were held back.
+    how many names and segments were held back.
 
 ### 6.3 Fixture regression gate (anti-poisoning)
 
@@ -607,6 +648,16 @@ On fixture regression (master plan §6), in order:
      `Training/report_quarantine.py` (`POST /api/quarantine`, at most
      10000 ids per request) and holds the watermark until the farm has
      accepted every request (§5).
+   - **With segments this step is blocked.** The export carries no
+     source ids (§1), so the list holds the new **segment** ids
+     (`fetch_dataset.py count --out-segments`, §2.1), and
+     `POST /api/quarantine` takes source ids only.
+     `report_quarantine.py` refuses a segment id with a message that
+     says so. A regression therefore still skips promotion and writes
+     `quarantine.json`, but the run fails at the send and the watermark
+     holds, so every later run lists those segments again. Unblocking
+     it needs the farm to quarantine by segment id, resolving each
+     through `segment_sources` to its source (§10 Q14).
 3. **Training exclusion:** the export excludes sources with an
    unresolved quarantine row (`resolution IS NULL`) or
    `resolution='purged'`; `resolution='released'` rows are re-included.
@@ -690,10 +741,11 @@ one review can clear.
 - `taxonomy_version` itself is a monotonic int, bumped when canonical
   names are added or changed (master plan §2).
 - **What a promoted model publishes beyond its artifact:** its
-  `name_metrics` (§6.1) and `training_source_ids`, the `source_id`s of
-  its train split, both sent with `POST /api/models`. The farm turns
-  the list into each owner's `trained_in` (`BACKEND_DESIGN.md`
-  §1.2.20). The registry keeps both per version, so a rollback
+  `name_metrics` (§6.1) and `training_segment_ids`, the segment ids of
+  its train split, both sent with `POST /api/models`. The farm maps the
+  segments still linked to a source through `segment_sources`, and
+  turns them into each owner's `trained_in` (`BACKEND_DESIGN.md`
+  §1.2.20, §7.3); a de-linked or re-cut segment matches nothing. The registry keeps both per version, so a rollback
   re-sends the re-promoted champion's own list (§8).
 
 ## 10. Open questions
@@ -709,7 +761,7 @@ one review can clear.
 5. Promotion metric for the production architecture (§8) — segment
    composite vs window accuracy.
 6. Membership-inference check (§6.2) — a confidence attack, passing at
-   AUC ≤ 0.60 with at least 20 sources a side, is a starting point. A
+   AUC ≤ 0.60 with at least 20 segments a side, is a starting point. A
    stronger attack (shadow models, per-window rather than per-source
    scores) or val sources as the non-members, which share the
    contributor pool, may replace it.
@@ -735,3 +787,18 @@ one review can clear.
     that replaces the champion unless it is more than 2% worse. Open:
     what to do when a gate keeps refusing the refresh, beyond retrying
     nightly.
+13. Admin-curated holdout with segments (§2.6) — a pinned sample id is
+    now a segment id, which changes on every re-cut, and it pulls a
+    whole split bucket (about a tenth of all data) into holdout. The
+    curated holdout footage needs a way to be named that survives
+    re-cuts, such as a farm-side holdout flag carried as its own bucket.
+14. Quarantine with segments (§7) — `POST /api/quarantine` takes source
+    ids, and segments carry none, so a fixture regression can no longer
+    be quarantined: the run fails at the send and the watermark holds.
+    It needs the farm to accept segment ids and resolve them to sources
+    through `segment_sources`.
+15. Windows on segments (§2.5) — 8-frame windows at stride 4 are the
+    largest that leave any background in a segment's 5 frames of
+    context. Longer context from the farm, or background segments cut
+    from unlabeled stretches, would let windows grow back to 16 frames
+    and the margin return.

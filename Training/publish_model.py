@@ -49,7 +49,11 @@ effect, so a bad run uploads nothing.
    first; a failure is an error before anything is uploaded or written.
 2. Version: GET /api/models/current (public). If the current model is
    already this artifact (same sha256), it was published before, by a run
-   whose answer was lost, and nothing more happens. Otherwise 404
+   whose answer was lost, and nothing more happens. If its
+   input_desc.format differs from this model's (TKP1 -> TKS1, the switch
+   to segments), clients that can't feed the new input must skip it: the
+   publish needs MIN_CLIENT_VERSION and bumps the major version
+   (MODEL_CONTRACT.md §5); without MIN_CLIENT_VERSION it is an error. Otherwise 404
    NO_MODEL -> trick-v1.0; trick-v<M>.<m> (a rollback's -rb<N> suffix
    included) -> trick-v<M>.<m+1>, or trick-v<M+1>.0 with --major.
 3. Upload the artifact to models/<version>.mlpackage.zip and the holdout
@@ -60,7 +64,9 @@ effect, so a bad run uploads nothing.
    holding the same bytes is kept (a retry after a failed publish). Each
    object is read back and its sha256 checked; a mismatch is an error.
 4. POST /api/models with the manifest fields, name_metrics and
-   training_source_ids (the train split's sources). The farm sets
+   training_segment_ids (the train split's segments; the farm maps them
+   to their sources through segment_sources, BACKEND_DESIGN.md §7.3, and
+   takes at most 100000). The farm sets
    model_type and promoted_at. 409 VERSION_EXISTS is an error: bump the
    version instead. When the answer is lost (a transport failure, a 5xx,
    a malformed body), GET /api/models/current decides: this version with
@@ -77,8 +83,8 @@ Exit codes: 0 = published (or already published), 2 = error (fail
 closed; nothing is published unless the farm has the model).
 
 Privacy: stdout and stderr carry the version, sizes and counts only,
-never URLs, keys, source ids, trick names or farm error text. The
-training source ids go to the farm and to the private run record,
+never URLs, keys, segment ids, trick names or farm error text. The
+training segment ids go to the farm and to the private run record,
 nowhere else.
 """
 
@@ -103,12 +109,12 @@ import release_checks
 import train
 from fetch_dataset import (
     FARM_URL_ENV,
-    HEX64_RE,
     PIPELINE_KEY_ENV,
     FetchError,
     _write_atomic,
     farm_url_allowed,
     farm_urlopen,
+    is_segment_id,
     r2_client_from_env,
 )
 from split_dataset import _read_jsonl
@@ -127,6 +133,8 @@ VERSION_RE = re.compile(r"trick-v([0-9]+)\.([0-9]+)(?:-rb[0-9]+)?")
 ARTIFACT_NAME = export_coreml.PACKAGE_NAME + ".zip"
 ARTIFACT_TYPE = "application/zip"
 REPORT_TYPE = "application/json"
+# POST /api/models takes at most this many training_segment_ids.
+MAX_TRAINING_SEGMENTS = 100000
 
 # (method, url, headers, body) -> (HTTP status, parsed JSON body or None)
 Transport = Callable[[str, str, dict[str, str], bytes | None], tuple[int, Any]]
@@ -159,8 +167,8 @@ def _read_json(path: Path) -> Any:
         raise PublishError(f"cannot read {path}: {e}") from e
 
 
-def training_source_ids(split_path: Path, manifest_path: Path) -> list[str]:
-    """The sources of the train split: what the model trained on."""
+def training_segment_ids(split_path: Path, manifest_path: Path) -> list[str]:
+    """The segments of the train split: what the model trained on."""
     split = _read_json(split_path)
     if not isinstance(split, dict):
         raise PublishError(f"{split_path} must be an object of sample -> split")
@@ -168,27 +176,24 @@ def training_source_ids(split_path: Path, manifest_path: Path) -> list[str]:
         records = _read_jsonl(str(manifest_path))
     except (OSError, ValueError) as e:
         raise PublishError(f"cannot read {manifest_path}: {e}") from e
-    sources = {
-        str(rec.get("sample_id")): rec.get("source_id")
-        for rec in records
-        if isinstance(rec, dict)
-    }
+    listed = {str(rec.get("sample_id")) for rec in records if isinstance(rec, dict)}
     train_ids = sorted(sid for sid, part in split.items() if part == "train")
     if not train_ids:
         raise PublishError(f"{split_path} has no train samples")
-    missing = sum(1 for sid in train_ids if sid not in sources)
+    missing = sum(1 for sid in train_ids if sid not in listed)
     if missing:
         raise PublishError(f"{missing} train samples are not in {manifest_path}")
-    ids: set[str] = set()
-    for sid in train_ids:
-        source = sources[sid]
-        if not isinstance(source, str) or HEX64_RE.fullmatch(source) is None:
-            raise PublishError(
-                "training sources must be farm source ids (64 lowercase hex): "
-                "only a dataset fetched from the farm can be published"
-            )
-        ids.add(source)
-    return sorted(ids)
+    if not all(is_segment_id(sid) for sid in train_ids):
+        raise PublishError(
+            "training samples must be farm segment ids (lowercase UUIDs): "
+            "only a dataset fetched from the farm can be published"
+        )
+    if len(train_ids) > MAX_TRAINING_SEGMENTS:
+        raise PublishError(
+            f"{len(train_ids)} training segments exceed the farm's "
+            f"{MAX_TRAINING_SEGMENTS} per publish"
+        )
+    return train_ids
 
 
 def build_request(run: Path, dataset: Path) -> dict[str, Any]:
@@ -275,7 +280,7 @@ def build_request(run: Path, dataset: Path) -> dict[str, Any]:
         # holdout metrics live in the report behind holdout_report_r2_key.
         "val_metrics": {"val_accuracy": round(val_accuracy, 6), "n_val_windows": n_val},
         "name_metrics": published_names,
-        "training_source_ids": training_source_ids(
+        "training_segment_ids": training_segment_ids(
             split_path, dataset / "manifest.jsonl"
         ),
     }
@@ -377,6 +382,13 @@ class FarmClient:
         return answer
 
 
+def input_format(manifest: dict[str, Any]) -> str | None:
+    """The input format a published model reads (input_desc.format)."""
+    desc = manifest.get("input_desc")
+    fmt = desc.get("format") if isinstance(desc, dict) else None
+    return fmt if isinstance(fmt, str) else None
+
+
 def next_version(current: dict[str, Any] | None, major: bool) -> str:
     if current is None:
         return FIRST_VERSION
@@ -462,7 +474,7 @@ def _record(body: dict[str, Any], answer: dict[str, Any]) -> dict[str, Any]:
         "sha256": body["sha256"],
         "byte_size": body["byte_size"],
         "holdout_report_r2_key": body["holdout_report_r2_key"],
-        "training_sources": len(body["training_source_ids"]),
+        "training_segments": len(body["training_segment_ids"]),
         "farm": answer,
     }
 
@@ -513,6 +525,18 @@ def publish(
         _write_json(challenger / "publish.json", record)
         return record
 
+    if current is not None and input_format(current) != body["input_desc"]["format"]:
+        # A new input format breaks every client that can't feed it
+        # (MODEL_CONTRACT.md §5): the major version and min_client_version
+        # move together, and only the maintainer knows which app version
+        # first reads it.
+        if not body.get("min_client_version"):
+            raise PublishError(
+                "the model's input format changes from the current model's: set "
+                f"{MIN_CLIENT_VERSION_ENV} to the first app version that reads "
+                "it (MODEL_CONTRACT.md §3.6, §5)"
+            )
+        major = True
     version = version or next_version(current, major)
     if VERSION_RE.fullmatch(version) is None:
         raise PublishError(f"version {version!r} is not trick-v<major>.<minor>")
@@ -589,8 +613,8 @@ def main(
         how = "published (the answer was lost; the farm's current model confirms it)"
     else:
         how = (
-            f"published, {farm_answer.get('training_sources_recorded')} of "
-            f"{record['training_sources']} training sources recorded"
+            f"published from {record['training_segments']} training segments, "
+            f"{farm_answer.get('training_sources_recorded')} sources recorded"
         )
     print(f"{record['version']}: {how}; {record['byte_size']}-byte artifact")
     return EXIT_OK

@@ -1,8 +1,11 @@
 # Smoke fixture
 
 Tiny deterministic synthetic dataset for the `train.py` smoke test
-(turnip-ml#13). Eight 32-frame @10Hz samples (MoveNet-17 keypoints, 0-1
-coords) with trick segments. Motion signatures are deliberately separable —
+(turnip-ml#13). Eight 32-frame @10Hz samples with trick segments, generated
+as MoveNet-17 keypoints and stored after the segment transform
+(`Training/segment_transform.py`): 13 TKS1 joints in torso lengths, as the
+farm's segments arrive. Trick boundaries sit between window starts, so no
+window is half trick. Motion signatures are deliberately separable —
 the smoke run must reach 100% val accuracy; anything less is a
 training-pipeline bug, not data noise.
 

@@ -34,7 +34,7 @@ SMOKE_CONFIG = REPO / "Training" / "config" / "smoke.toml"
 # and a sample's window accuracy is exactly its share of cork windows.
 CLASSES = ["background", "cork"]
 WINDOW = 2
-N_FEATURES = 68  # train.featurize_window: 17 joints x (x, y) x (mean, speed)
+N_FEATURES = 52  # train.featurize_window: 13 joints x (x, y) x (mean, speed)
 HOLDOUT_WINDOWS = 100
 
 
@@ -135,7 +135,7 @@ class LeakageGapTest(LeakageGapTestCase):
             {
                 "sample_id": sid,
                 "fps": 10,
-                "keypoints": [[[0.0, 0.0, 1.0]] * 17] * frames,
+                "keypoints": [[[0.0, 0.0, 1.0]] * 13] * frames,
                 "tricks": tricks,
             },
         )
@@ -228,20 +228,6 @@ class LeakageGapTest(LeakageGapTestCase):
         gap = self._report()["val_minus_holdout"]
         self.assertEqual(gap["holdout_window_accuracy"], 0.7)
         self.assertEqual(gap["n_holdout_windows_unseen_label"], 10)
-
-    def test_held_back_windows_reach_the_window_count(self) -> None:
-        split = {"h1": "holdout"}
-        self.split_path.write_text(json.dumps(split))
-        self._sample("h1", [seg("cork", 0, 8)], frames=8)
-        rec = json.loads((self.samples_dir / "h1.json").read_text())
-        rec["held_back_windows"] = [[0, 4]]
-        write_json(self.samples_dir / "h1.json", rec)
-        [sample] = leakage_gap.load_split_samples(split, self.samples_dir, "holdout")
-        self.assertEqual(sample["held_back_windows"], [(0, 4)])
-        rec["held_back_windows"] = [[4, 4]]
-        write_json(self.samples_dir / "h1.json", rec)
-        with self.assertRaises(ValueError):
-            leakage_gap.load_split_samples(split, self.samples_dir, "holdout")
 
     def test_no_holdout_window_fails_closed(self) -> None:
         # Every holdout sample shorter than window_frames: no window, so
@@ -533,14 +519,17 @@ class LikeForLikeTest(LeakageGapTestCase):
         lines = [
             ln
             for ln in lines
-            if not ln.startswith(("split_path", "samples_dir", "epochs"))
+            if not ln.startswith(
+                ("split_path", "samples_dir", "epochs", "learning_rate")
+            )
         ]
-        # One epoch keeps val accuracy strictly between 0 and 1, so the
+        # One small step keeps val accuracy strictly between 0 and 1, so the
         # equality below can't hold vacuously.
         lines += [
             f'split_path = "{self.split_path}"',
             f'samples_dir = "{SMOKE / "samples"}"',
             "epochs = 1",
+            "learning_rate = 0.001",
         ]
         config.write_text("\n".join(lines) + "\n")
         run = self.tmp / "run"

@@ -12,8 +12,12 @@ samples_dir = "data/dataset/samples"
 out_dir = "data/run/challenger"
 
 # Hyperparameters: the full-run values from config/full.toml.
-window_frames = 16
-window_stride = 8
+# Segments are a clip plus 0.5 s (5 frames) of context each side
+# (TRAINING_DESIGN.md §2.5): a window must be shorter than 10 frames for one
+# lying mostly in context, a background window, to exist at all.
+# *(Judgment call on 8 / 4.)*
+window_frames = 8
+window_stride = 4
 
 learning_rate = 0.1
 epochs = 500
@@ -26,8 +30,9 @@ l2 = 0.0001
 class_balance_exponent = 0.5
 background_ratio = 0.2
 # Background margin (TRAINING_DESIGN.md §2.5): windows within this many
-# seconds of a labeled segment are excluded from the background pool —
-# a starting guess, tuned against validation (§10 Q2).
-background_margin_seconds = 2.0
+# seconds of a labeled segment are excluded from the background pool. 0 for
+# segments: every context frame is within 0.5 s of the clip, so any margin
+# would leave no background at all.
+background_margin_seconds = 0.0
 
 init_checkpoint = "data/champion/model.npz"

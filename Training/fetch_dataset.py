@@ -1,56 +1,70 @@
 #!/usr/bin/env python3
-"""Training dataset fetch: farm label export + R2 pose blobs -> train.py samples.
+"""Training dataset fetch: farm segment export + R2 TKS1 blobs -> train.py samples.
+
+The farm exports training pose only as segments: short windows cut
+around each labeled clip and re-targeted onto a standard body
+(turnip-farm BACKEND_DESIGN.md §1.2.24, POSE_FORMAT.md §12;
+TRAINING_DESIGN.md §1, §2). Each export entry is one segment with its
+clip's labels and provenance; none carries a source, clip, account or
+timestamp.
 
 Subcommands
 -----------
-count --out-state FILE [--state FILE] [--out-sources FILE]
-    Pages `GET /api/labels/export?since=<watermark>` and prints
-    {"new_labels": N, "changed_sources": M}: the label rows changed since
-    the watermark in --state (omit --state on the very first run to count
-    everything), and the sources they belong to. The newest cursor seen is
-    written to --out-state as {"watermark": ...}; the pipeline stores it
-    only after the whole run succeeds, so the watermark always means "last
-    successful export". --out-sources writes the changed source ids as a
-    sorted JSON array: the fixture gate's --ingested list. Taken after the
-    dataset pull, it covers every new row the challenger trained on, and
-    it includes old sources whose labels were edited (a relabel can poison
-    as well as a new upload).
+count --out-state FILE [--state FILE] [--out-segments FILE]
+    Full pull of `GET /api/labels/export` (segments only, no blobs).
+    Segment ids are random and the export's cursor is a page position,
+    not a change marker, so what changed is read from the segment ids
+    themselves: --state holds the ids of the last successful run's pull,
+    and every id not in it is new. A re-cut (after any clip or label
+    edit on its source) gives a segment a fresh id, so a relabel counts
+    as new as well as an upload. Prints {"new_segments": N,
+    "new_labels": M}: the new segments and their label count (the
+    nightly trigger). --out-state gets this pull's ids as
+    {"segment_ids": [...]}; the pipeline stores it only after the whole
+    run succeeds. A state from before segments ({"watermark": ...}), or
+    no --state, counts every segment as new. --out-segments writes the
+    new segment ids as a sorted JSON array: the fixture gate's
+    --ingested list. Taken after the dataset pull, it covers every new
+    segment the challenger trained on.
 
 build --out DIR --cache DIR
     Full pull of the export (never incremental: deletions, purges,
-    quarantines, releases and replaced label sets change what is
-    training-eligible, and the export does not report deletions). Right
-    after the pull, every cached blob whose source is absent from it is
-    deleted, so data deleted farm-side never outlives one full pull here.
-    Then for each source it fetches the pose blob from R2, caches it under
-    its r2_key, verifies it against `blob_sha256` (the SHA-256 of the
-    stored `.tkp1.gz` bytes) on download and on every cache read (a
-    mismatch on read means the source was re-contributed, or the file is
-    corrupt: it is fetched again), and decodes it. Writes into DIR, which
-    must not exist yet (built in a temporary sibling directory, moved into
-    place on success):
-      samples/<source_id>.json  train.py's sample format: sample_id (the
-                                source id), fps 10, keypoints
-                                [frame][17][x, y, confidence] (gap frames
-                                kept as zeros), one trick entry per
-                                (clip, canonical name) on the clip window,
-                                held_back_windows (below), and the label
-                                provenance (below)
-      manifest.jsonl            {"sample_id", "source_id"} per sample, the
-                                split_dataset.py input (splits group by
-                                source)
-      dataset_manifest.json     pinned taxonomy_version and its curated
-                                canonical names, export cursor, the
-                                held-back names, counts and sorted
-                                sample ids
-      unmapped_labels.log       "<count>\t<token>" per unmapped label token,
-                                the taxonomy curation queue
+    quarantines and releases change what is training-eligible, and the
+    export does not report deletions). Right after the pull, every
+    cached blob whose segment is absent from it is deleted, so data
+    deleted farm-side never outlives one full pull here. Then for each
+    segment it fetches the TKS1 blob from R2, caches it under its
+    r2_key, verifies it against `blob_sha256` on download and on every
+    cache read, and decodes it (tks1.py). Writes into DIR, which must not
+    exist yet (built in a temporary sibling directory, moved into place
+    on success):
+      samples/<segment_id>.json  train.py's sample format: sample_id (the
+                                 segment id), fps 10, keypoints
+                                 [frame][13][x, y, confidence] in TKS1
+                                 joint order and torso lengths (missing
+                                 joints and gap frames as zeros),
+                                 split_bucket, one trick entry per
+                                 canonical name on the clip window
+                                 (window_start, window_end), and the
+                                 label provenance (below)
+      manifest.jsonl             {"sample_id", "source_id"} per sample,
+                                 the split_dataset.py input. source_id is
+                                 "bucket-<split_bucket>": the farm gives
+                                 every segment of one source the same
+                                 bucket, so splitting by it keeps a
+                                 session on one side
+      dataset_manifest.json      pinned taxonomy_version and its curated
+                                 canonical names, the held-back names,
+                                 counts and sorted sample ids
+      unmapped_labels.log        "<count>\\t<token>" per unmapped label
+                                 token, the taxonomy curation queue
     Raw labels are canonicalized at one pinned taxonomy version: the
     farm's current one, i.e. the greatest taxonomy_version in the export's
-    taxonomy or rows, so a curation-only bump applies to every label at the
-    next run (see canonicalize.py for the per-raw resolution).
+    taxonomy or labels, so a curation-only bump applies to every label at
+    the next run (see canonicalize.py for the per-raw resolution).
     A label that canonicalizes to no name at all (only parentheticals or
-    delimiters) contributes nothing; a clip left without names is dropped.
+    delimiters) contributes nothing; a segment left without names is
+    dropped.
 
 Rare-trick hold-back
 --------------------
@@ -70,30 +84,29 @@ page gives, and a page without either field holds every trick back
 (fail closed). Unmapped tokens have no count, so they are held back
 too. A malformed field is an error.
 
-A clip that carries any held-back name is held back whole: it leaves no
-trick entry (so no name, train count or holdout metric), and its window
-is written to the sample's `held_back_windows` instead, which train.py
-never trains on, as a name or as background. dataset_manifest.json
-records the held-back names (publish_model.py refuses a model that
-names one); stdout carries only how many names and clips were held
-back.
+A segment that carries any held-back name is held back whole: no sample
+is written for it, so the trick has no name, train count or holdout
+metric, and its context frames train as nothing either.
+dataset_manifest.json records the held-back names (publish_model.py
+refuses a model that names one); stdout carries only how many names and
+segments were held back.
 
 Provenance
 ----------
-Every export row carries its label's provenance (BACKEND_DESIGN.md
-§1.2.18, TRAINING_DESIGN.md §1): `origin` ("typed", "vocabulary" or
-"model"), and the clip's `proposal_model_version` (null for the heuristic
+Every segment carries its clip's provenance (BACKEND_DESIGN.md §1.2.18,
+TRAINING_DESIGN.md §1): `proposal_model_version` (null for the heuristic
 detector or a manual clip), `suggested_names` (the names that model
 pre-filled, or on a blind clip would have; [] when none) and
-`suggestions_withheld` (the clip is in the blind sample). All four are
-required. A sample carries them as the farm sent them:
-  tricks[].origins   the sorted distinct origins of the clip's raw labels
-                     that canonicalized to this entry's name: one, unless
-                     two raw labels with different origins merged
-  clips              {clip_id: {"proposal_model_version",
-                     "suggested_names", "suggestions_withheld"}} for each
-                     clip with a trick entry; suggested_names verbatim, in
-                     the farm's order, not canonicalized
+`suggestions_withheld` (the clip is in the blind sample), and each label
+its `origin` ("typed", "vocabulary" or "model"). A sample carries them as
+the farm sent them:
+  tricks[].origins   the sorted distinct origins of the segment's raw
+                     labels that canonicalized to this entry's name: one,
+                     unless two raw labels with different origins merged
+  clips              {segment_id: {"proposal_model_version",
+                     "suggested_names", "suggestions_withheld"}};
+                     suggested_names verbatim, in the farm's order, not
+                     canonicalized
 Nothing here reads them yet; TRAINING_DESIGN.md §6.4 is what will.
 
 Environment (never argv: values would land in process lists and CI logs)
@@ -101,32 +114,38 @@ Environment (never argv: values would land in process lists and CI logs)
 TURNIP_FARM_URL       farm base URL (https; http only for localhost)
 TURNIP_PIPELINE_KEY   service key sent as a Bearer token
 R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
-                      pose-blob bucket (build only; needs boto3)
+                      segment-blob bucket (build only; needs boto3)
 
-Privacy: training data carries no account identifier. The farm exports
-none, and an export row that carries a user_id is refused rather than
-passed along. Stdout and stderr carry counts only, never raw labels,
-provenance values, cursors or pose values; CI logs of this public
-repository are public. The dataset and the blob cache belong under data/
-(gitignored) and must never be uploaded as a CI artifact or cache.
+Privacy: training data carries no account or source identifier. The farm
+exports none, and a segment that carries a user_id or a source_id is
+refused rather than passed along. Stdout and stderr carry counts only,
+never raw labels, provenance values, segment ids or pose values; CI logs
+of this public repository are public. The dataset and the blob cache
+belong under data/ (gitignored) and must never be uploaded as a CI
+artifact or cache.
 
-Determinism: rows are re-sorted after the pull (keyset pages split sources
-arbitrarily), JSON keys are sorted, float32 pose values are written
-losslessly, and nothing carries a timestamp, so the same export and blobs
-always produce byte-identical files.
+Determinism: segments are re-sorted by id after the pull, JSON keys are
+sorted, float32 pose values are written losslessly, and nothing carries a
+timestamp, so the same export and blobs always produce byte-identical
+files.
 
-Fail closed: a malformed page or row (including one carrying a user_id),
-rows that disagree about a source or
-clip, a duplicate label row, a stuck or cycling cursor, a clip window
-outside its pose sequence, a checksum mismatch or an undecodable blob are
-errors (exit 2), never skipped. For provenance, malformed means: a field
-missing; an origin outside the three; a proposal_model_version that is
-neither null nor a non-empty string; suggested_names that is not a list
-of non-empty strings; a suggestions_withheld that is not a boolean;
-suggested names or a blind clip without a proposal_model_version (the
-farm's clips_suggestions_need_model CHECK); or origin "model" on a clip
-with no proposal_model_version or with suggestions_withheld (both refused
-by POST /api/clips, BACKEND_DESIGN.md §7.3).
+Fail closed: a malformed page or segment (including one carrying a
+user_id or source_id), a duplicate segment id, a stuck or cycling
+cursor, a frame_count that disagrees with the blob, a checksum mismatch
+or an undecodable blob are errors (exit 2), never skipped. A segment is
+malformed when: a field is missing; segment_id is not a lowercase UUID;
+r2_key is not segments/<segment_id>.tks1.gz; blob_sha256 is not 64
+lowercase hex; frame_count, window_start, window_end are not integers
+with 0 <= window_start < window_end <= frame_count; split_bucket is not
+0-9; labels is empty, unsorted or names a trick twice, or a label has a
+blank trick_name, a taxonomy_version below 1 or an origin outside the
+three; proposal_model_version is neither null nor a non-empty string;
+suggested_names is not a list of non-empty strings; suggestions_withheld
+is not a boolean; suggested names or a blind clip come without a
+proposal_model_version (the farm's clips_suggestions_need_model CHECK);
+or a label has origin "model" on a segment with no
+proposal_model_version or with suggestions_withheld (both refused by
+POST /api/clips, BACKEND_DESIGN.md §7.3).
 """
 
 from __future__ import annotations
@@ -150,7 +169,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
-import tkp1
+import tks1
 from canonicalize import Taxonomy, TaxonomyError
 
 EXIT_OK = 0
@@ -160,6 +179,7 @@ EXPORT_PATH = "/api/labels/export"
 HTTP_TIMEOUT_S = 60.0
 MAX_PAGE_BYTES = 64 * 1024 * 1024
 FPS = 10
+SPLIT_BUCKETS = 10
 
 FARM_URL_ENV = "TURNIP_FARM_URL"
 PIPELINE_KEY_ENV = "TURNIP_PIPELINE_KEY"
@@ -174,8 +194,29 @@ CONTRIBUTOR_MINIMUM_FIELD = "contributor_minimum"
 # A label's origin (BACKEND_DESIGN.md §1.2.18): typed by hand, picked from
 # the vocabulary's suggestions, or pre-filled by the trick model and kept.
 ORIGINS = ("typed", "vocabulary", "model")
-# The only files the blob cache writes, under <cache>/poses/.
-CACHE_ENTRY_RE = re.compile(r"([0-9a-f]{64})\.tkp1\.gz(\.tmp)?")
+SEGMENT_FIELDS = frozenset(
+    {
+        "segment_id",
+        "r2_key",
+        "blob_sha256",
+        "frame_count",
+        "window_start",
+        "window_end",
+        "split_bucket",
+        "proposal_model_version",
+        "suggested_names",
+        "suggestions_withheld",
+        "labels",
+    }
+)
+LABEL_FIELDS = frozenset({"trick_name", "origin", "taxonomy_version"})
+# Fields that would tie a segment to a person or a session.
+IDENTIFYING_FIELDS = ("user_id", "source_id")
+# The only files the blob cache writes, under <cache>/segments/.
+CACHE_ENTRY_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r"\.tks1\.gz(\.tmp)?"
+)
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 Transport = Callable[[str, dict[str, str]], Any]
@@ -187,27 +228,31 @@ class FetchError(Exception):
 
 
 @dataclass(frozen=True)
-class LabelRow:
-    source_id: str
+class Label:
+    trick_name: str
+    origin: str
+    taxonomy_version: int
+
+
+@dataclass(frozen=True)
+class Segment:
+    segment_id: str
     r2_key: str
     blob_sha256: str
-    clip_id: str
-    start_frame: int
-    end_frame: int
-    trick_name: str
-    taxonomy_version: int
-    origin: str
-    # The clip's provenance, repeated on each of its label rows.
+    frame_count: int
+    window_start: int
+    window_end: int
+    split_bucket: int
     proposal_model_version: str | None
     suggested_names: tuple[str, ...]
     suggestions_withheld: bool
+    labels: tuple[Label, ...]
 
 
 @dataclass(frozen=True)
 class ExportPull:
-    rows: list[LabelRow]
+    segments: list[Segment]  # sorted by segment_id
     taxonomy: list[tuple[str, str, int]]
-    cursor: str | None  # the newest non-null next_cursor seen
     # Distinct contributors per canonical name, the minimum over the pages
     # (module docstring, "Rare-trick hold-back").
     contributor_counts: dict[str, int]
@@ -227,99 +272,125 @@ def _hex64(value: Any) -> bool:
     return isinstance(value, str) and HEX64_RE.fullmatch(value) is not None
 
 
-def parse_row(i: int, row: Any) -> LabelRow:
-    fields = {
-        "source_id",
-        "r2_key",
-        "blob_sha256",
-        "clip_id",
-        "start_frame",
-        "end_frame",
-        "trick_name",
-        "taxonomy_version",
-        "origin",
-        "proposal_model_version",
-        "suggested_names",
-        "suggestions_withheld",
-    }
-    if not isinstance(row, dict) or not fields <= set(row):
-        raise FetchError(f"export row {i} is missing fields")
-    if "user_id" in row:
-        raise FetchError(
-            f"export row {i} carries a user_id; training data must carry no "
-            "account identifier"
-        )
-    source_id = row["source_id"]
-    if not _hex64(source_id):
-        raise FetchError(f"export row {i}: source_id is not 64 lowercase hex chars")
-    if row["r2_key"] != f"poses/{source_id}.tkp1.gz":
-        raise FetchError(f"export row {i}: r2_key does not match its source_id")
-    if not _hex64(row["blob_sha256"]):
-        raise FetchError(f"export row {i}: blob_sha256 is not 64 lowercase hex chars")
-    clip_id = row["clip_id"]
+def is_segment_id(value: Any) -> bool:
+    """A lowercase UUID, as the farm mints segment ids."""
+    if not isinstance(value, str):
+        return False
     try:
-        canonical_clip = str(uuid.UUID(clip_id)) if isinstance(clip_id, str) else None
+        return str(uuid.UUID(value)) == value
     except ValueError:
-        canonical_clip = None
-    if canonical_clip != clip_id:
-        raise FetchError(f"export row {i}: clip_id is not a lowercase UUID")
-    start, end = row["start_frame"], row["end_frame"]
-    if not (_is_int(start) and _is_int(end) and 0 <= start < end):
-        raise FetchError(f"export row {i}: needs integer 0 <= start_frame < end_frame")
-    name = row["trick_name"]
+        return False
+
+
+def _parse_label(i: int, j: int, label: Any) -> Label:
+    where = f"export segment {i} label {j}"
+    if not isinstance(label, dict) or set(label) != LABEL_FIELDS:
+        raise FetchError(f"{where} must be {{trick_name, origin, taxonomy_version}}")
+    name = label["trick_name"]
     if not isinstance(name, str) or not name.strip():
-        raise FetchError(f"export row {i}: trick_name must be a non-empty string")
-    version = row["taxonomy_version"]
+        raise FetchError(f"{where}: trick_name must be a non-empty string")
+    version = label["taxonomy_version"]
     if not (_is_int(version) and version >= 1):
-        raise FetchError(f"export row {i}: taxonomy_version must be an integer >= 1")
-    # Provenance (BACKEND_DESIGN.md §1.2.18). Errors name the field, never
-    # the value: a suggested name is label text.
-    origin = row["origin"]
+        raise FetchError(f"{where}: taxonomy_version must be an integer >= 1")
+    # Errors name the field, never the value: a label is text.
+    origin = label["origin"]
     if not isinstance(origin, str) or origin not in ORIGINS:
-        raise FetchError(f"export row {i}: origin must be one of {', '.join(ORIGINS)}")
-    model_version = row["proposal_model_version"]
+        raise FetchError(f"{where}: origin must be one of {', '.join(ORIGINS)}")
+    return Label(name, origin, version)
+
+
+def parse_segment(i: int, entry: Any) -> Segment:
+    if not isinstance(entry, dict):
+        raise FetchError(f"export segment {i} is not an object")
+    for field in IDENTIFYING_FIELDS:
+        if field in entry:
+            raise FetchError(
+                f"export segment {i} carries a {field}; training data must carry "
+                "no account or source identifier"
+            )
+    if not SEGMENT_FIELDS <= set(entry):
+        raise FetchError(f"export segment {i} is missing fields")
+    segment_id = entry["segment_id"]
+    if not is_segment_id(segment_id):
+        raise FetchError(f"export segment {i}: segment_id is not a lowercase UUID")
+    if entry["r2_key"] != f"segments/{segment_id}.tks1.gz":
+        raise FetchError(f"export segment {i}: r2_key does not match its segment_id")
+    if not _hex64(entry["blob_sha256"]):
+        raise FetchError(
+            f"export segment {i}: blob_sha256 is not 64 lowercase hex chars"
+        )
+    frames, start, end = (
+        entry["frame_count"],
+        entry["window_start"],
+        entry["window_end"],
+    )
+    if not (
+        _is_int(frames)
+        and _is_int(start)
+        and _is_int(end)
+        and 0 <= start < end <= frames
+    ):
+        raise FetchError(
+            f"export segment {i}: needs integers "
+            "0 <= window_start < window_end <= frame_count"
+        )
+    bucket = entry["split_bucket"]
+    if not (_is_int(bucket) and 0 <= bucket < SPLIT_BUCKETS):
+        raise FetchError(f"export segment {i}: split_bucket must be 0-9")
+    raw_labels = entry["labels"]
+    if not isinstance(raw_labels, list) or not raw_labels:
+        raise FetchError(f"export segment {i}: labels must be a non-empty list")
+    labels = tuple(_parse_label(i, j, label) for j, label in enumerate(raw_labels))
+    names = [label.trick_name for label in labels]
+    if names != sorted(set(names)):
+        raise FetchError(
+            f"export segment {i}: labels must be sorted with no trick twice"
+        )
+    model_version = entry["proposal_model_version"]
     if model_version is not None and not (
         isinstance(model_version, str) and model_version
     ):
         raise FetchError(
-            f"export row {i}: proposal_model_version must be a non-empty string or null"
+            f"export segment {i}: proposal_model_version must be a non-empty "
+            "string or null"
         )
-    suggested = row["suggested_names"]
+    suggested = entry["suggested_names"]
     if not isinstance(suggested, list) or not all(
         isinstance(n, str) and n for n in suggested
     ):
         raise FetchError(
-            f"export row {i}: suggested_names must be a list of non-empty strings"
+            f"export segment {i}: suggested_names must be a list of non-empty strings"
         )
-    withheld = row["suggestions_withheld"]
+    withheld = entry["suggestions_withheld"]
     if not isinstance(withheld, bool):
-        raise FetchError(f"export row {i}: suggestions_withheld must be a boolean")
+        raise FetchError(f"export segment {i}: suggestions_withheld must be a boolean")
     # The farm's clips_suggestions_need_model CHECK: suggested names and the
     # blind sample both need the model that proposed them.
     if model_version is None and (suggested or withheld):
         raise FetchError(
-            f"export row {i}: suggested_names or suggestions_withheld without a "
-            "proposal_model_version"
+            f"export segment {i}: suggested_names or suggestions_withheld without "
+            "a proposal_model_version"
         )
     # POST /api/clips refuses these (BACKEND_DESIGN.md §7.3): a kept
     # suggestion needs a model that proposed it and showed it.
-    if origin == "model" and (model_version is None or withheld):
+    if any(label.origin == "model" for label in labels) and (
+        model_version is None or withheld
+    ):
         raise FetchError(
-            f"export row {i}: origin model on a clip whose model showed no names"
+            f"export segment {i}: origin model on a clip whose model showed no names"
         )
-    return LabelRow(
-        source_id=source_id,
-        r2_key=row["r2_key"],
-        blob_sha256=row["blob_sha256"],
-        clip_id=clip_id,
-        start_frame=start,
-        end_frame=end,
-        trick_name=name,
-        taxonomy_version=version,
-        origin=origin,
+    return Segment(
+        segment_id=segment_id,
+        r2_key=entry["r2_key"],
+        blob_sha256=entry["blob_sha256"],
+        frame_count=frames,
+        window_start=start,
+        window_end=end,
+        split_bucket=bucket,
         proposal_model_version=model_version,
         suggested_names=tuple(suggested),
         suggestions_withheld=withheld,
+        labels=labels,
     )
 
 
@@ -449,14 +520,14 @@ class ExportClient:
         }
         self.transport = transport or http_get_json
 
-    def pull(self, since: str | None = None) -> ExportPull:
-        """Every row after `since` (None: the whole export)."""
-        rows: list[LabelRow] = []
+    def pull(self) -> ExportPull:
+        """The whole export, page by page."""
+        segments: list[Segment] = []
         taxonomy: set[tuple[str, str, int]] = set()
         counts: list[dict[str, int]] = []
         minimums: list[int | None] = []
-        cursor = since
-        seen: set[str | None] = {since}
+        cursor: str | None = None
+        seen: set[str | None] = {None}
         while True:
             query = (
                 ""
@@ -464,8 +535,8 @@ class ExportClient:
                 else "?" + urllib.parse.urlencode({"since": cursor})
             )
             page = self.transport(self.base_url + EXPORT_PATH + query, self.headers)
-            if not isinstance(page, dict) or not isinstance(page.get("rows"), list):
-                raise FetchError("export page must be an object with a rows array")
+            if not isinstance(page, dict) or not isinstance(page.get("segments"), list):
+                raise FetchError("export page must be an object with a segments array")
             page_taxonomy = page.get("taxonomy", [])
             if not isinstance(page_taxonomy, list):
                 raise FetchError("export page taxonomy must be an array")
@@ -476,23 +547,33 @@ class ExportClient:
                 raise FetchError(
                     "export next_cursor must be a non-empty string or null"
                 )
-            offset = len(rows)
-            rows.extend(parse_row(offset + i, r) for i, r in enumerate(page["rows"]))
+            offset = len(segments)
+            segments.extend(
+                parse_segment(offset + i, s) for i, s in enumerate(page["segments"])
+            )
             taxonomy.update(parse_taxonomy(i, t) for i, t in enumerate(page_taxonomy))
             counts.append(parse_contributor_counts(page))
             minimums.append(parse_contributor_minimum(page))
-            if not page["rows"] or next_cursor is None:
+            if not page["segments"] or next_cursor is None:
                 break
             if next_cursor in seen:
                 raise FetchError("export cursor did not advance")
             seen.add(next_cursor)
             cursor = next_cursor
+        ids = [s.segment_id for s in segments]
+        if len(set(ids)) != len(ids):
+            raise FetchError("export returned a segment twice")
         known = [m for m in minimums if m is not None]
         minimum = max(known) if known and len(known) == len(minimums) else None
-        return ExportPull(rows, sorted(taxonomy), cursor, _min_counts(counts), minimum)
+        return ExportPull(
+            sorted(segments, key=lambda s: s.segment_id),
+            sorted(taxonomy),
+            _min_counts(counts),
+            minimum,
+        )
 
 
-# -- pose blobs ----------------------------------------------------------------
+# -- segment blobs -------------------------------------------------------------
 
 
 def _sha256(data: bytes) -> str:
@@ -506,14 +587,14 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 
 class BlobCache:
-    """Pose blobs keyed by r2_key; verified on download and on every read."""
+    """Segment blobs keyed by r2_key; verified on download and on every read."""
 
     def __init__(self, cache_dir: Path, get: BlobGetter):
         self.cache_dir = cache_dir
         self.get = get
 
     def fetch(self, r2_key: str, sha256: str) -> bytes:
-        # r2_key is validated as poses/<64 hex>.tkp1.gz, so this stays
+        # r2_key is validated as segments/<uuid>.tks1.gz, so this stays
         # inside the cache directory.
         path = self.cache_dir / r2_key
         try:
@@ -521,8 +602,7 @@ class BlobCache:
                 data = path.read_bytes()
                 if _sha256(data) == sha256:
                     return data
-                # Re-contributed source or corrupt entry: the bucket is the
-                # truth.
+                # Corrupt entry: the bucket is the truth.
                 path.unlink()
         except OSError as e:
             raise FetchError(f"cannot use blob cache {self.cache_dir}: {e}") from e
@@ -544,15 +624,15 @@ class BlobCache:
         return data
 
     def prune(self, keep: set[str]) -> int:
-        """Delete cached blobs whose source is not in `keep`; returns the count.
+        """Delete cached blobs whose segment is not in `keep`; returns the count.
 
-        Only files this cache writes are touched (poses/<64 hex>.tkp1.gz and
+        Only files this cache writes are touched (segments/<uuid>.tks1.gz and
         leftover .tmp siblings), never anything else in the directory.
         """
-        poses = self.cache_dir / "poses"
+        directory = self.cache_dir / "segments"
         pruned = 0
         try:
-            entries = sorted(poses.iterdir()) if poses.is_dir() else []
+            entries = sorted(directory.iterdir()) if directory.is_dir() else []
             for path in entries:
                 match = CACHE_ENTRY_RE.fullmatch(path.name)
                 if match is None or not path.is_file():
@@ -594,7 +674,7 @@ def r2_client_from_env(purpose: str) -> tuple[Any, str, tuple[type[Exception], .
 
 
 def r2_getter_from_env() -> BlobGetter:
-    client, bucket, errors = r2_client_from_env("build (pose blobs)")
+    client, bucket, errors = r2_client_from_env("build (segment blobs)")
 
     def get(r2_key: str) -> bytes:
         try:
@@ -609,42 +689,13 @@ def r2_getter_from_env() -> BlobGetter:
 # -- dataset -------------------------------------------------------------------
 
 
-def _clip_provenance(row: LabelRow) -> dict[str, Any]:
-    """The clip-level provenance a row repeats, as the sample carries it."""
+def _provenance(segment: Segment) -> dict[str, Any]:
+    """The clip provenance a segment carries, as the sample keeps it."""
     return {
-        "proposal_model_version": row.proposal_model_version,
-        "suggested_names": list(row.suggested_names),
-        "suggestions_withheld": row.suggestions_withheld,
+        "proposal_model_version": segment.proposal_model_version,
+        "suggested_names": list(segment.suggested_names),
+        "suggestions_withheld": segment.suggestions_withheld,
     }
-
-
-def _group(rows: list[LabelRow]) -> dict[str, dict[str, list[LabelRow]]]:
-    """source_id -> clip_id -> rows, checking per-source/per-clip agreement."""
-    sources: dict[str, dict[str, list[LabelRow]]] = {}
-    seen_labels: set[tuple[str, str]] = set()
-    for row in sorted(rows, key=lambda r: (r.source_id, r.clip_id, r.trick_name)):
-        label = (row.clip_id, row.trick_name)
-        if label in seen_labels:
-            raise FetchError("export returned a duplicate label row")
-        seen_labels.add(label)
-        clips = sources.setdefault(row.source_id, {})
-        first = next(iter(clips.values()))[0] if clips else row
-        if (first.r2_key, first.blob_sha256) != (row.r2_key, row.blob_sha256):
-            raise FetchError(f"rows for source {row.source_id} disagree on its blob")
-        clip_rows = clips.setdefault(row.clip_id, [])
-        if clip_rows and (clip_rows[0].start_frame, clip_rows[0].end_frame) != (
-            row.start_frame,
-            row.end_frame,
-        ):
-            raise FetchError(f"rows for clip {row.clip_id} disagree on its window")
-        if clip_rows and _clip_provenance(clip_rows[0]) != _clip_provenance(row):
-            raise FetchError(f"rows for clip {row.clip_id} disagree on its provenance")
-        clip_rows.append(row)
-    # A clip id belongs to exactly one source.
-    owners = Counter(clip for clips in sources.values() for clip in clips)
-    if any(n > 1 for n in owners.values()):
-        raise FetchError("a clip_id appears under two sources")
-    return sources
 
 
 def _dump(data: Any) -> str:
@@ -653,24 +704,23 @@ def _dump(data: Any) -> str:
 
 def build_dataset(pull: ExportPull, blobs: BlobCache, out_dir: Path) -> dict[str, Any]:
     """Write the dataset into out_dir (must not exist). Returns the stats."""
-    # Prune first: an empty pull means every cached source is gone, which
+    # Prune first: an empty pull means every cached segment is gone, which
     # is exactly when deleting matters.
-    pruned = blobs.prune({row.source_id for row in pull.rows})
-    if not pull.rows:
+    pruned = blobs.prune({s.segment_id for s in pull.segments})
+    if not pull.segments:
         raise FetchError("the export is empty: nothing to train on")
     if out_dir.exists():
         raise FetchError(f"{out_dir} already exists; use a fresh directory per run")
-    # The farm's current version: the greatest in the taxonomy (or rows),
+    # The farm's current version: the greatest in the taxonomy (or labels),
     # so curation applies without waiting for labels at the new version.
     pinned = max(
-        [row.taxonomy_version for row in pull.rows]
+        [label.taxonomy_version for s in pull.segments for label in s.labels]
         + [version for _, _, version in pull.taxonomy]
     )
     try:
         taxonomy = Taxonomy(pull.taxonomy, pinned)
     except TaxonomyError as e:
         raise FetchError(f"taxonomy: {e}") from e
-    sources = _group(pull.rows)
 
     try:
         out_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -680,7 +730,7 @@ def build_dataset(pull: ExportPull, blobs: BlobCache, out_dir: Path) -> dict[str
     except OSError as e:
         raise FetchError(f"cannot create {out_dir}: {e}") from e
     try:
-        stats = _write_dataset(pull, sources, taxonomy, blobs, staging)
+        stats = _write_dataset(pull, taxonomy, blobs, staging)
         staging.rename(out_dir)
     except OSError as e:
         raise FetchError(f"cannot write dataset to {out_dir}: {e}") from e
@@ -693,108 +743,90 @@ def build_dataset(pull: ExportPull, blobs: BlobCache, out_dir: Path) -> dict[str
 
 
 def _write_dataset(
-    pull: ExportPull,
-    sources: dict[str, dict[str, list[LabelRow]]],
-    taxonomy: Taxonomy,
-    blobs: BlobCache,
-    staging: Path,
+    pull: ExportPull, taxonomy: Taxonomy, blobs: BlobCache, staging: Path
 ) -> dict[str, Any]:
     """Write samples one at a time (a dataset need not fit in memory)."""
     (staging / "samples").mkdir()
     unmapped: Counter[str] = Counter()
-    clips_dropped = 0
-    clips_held_back = 0
+    dropped = 0
+    held_back = 0
     held_back_names: set[str] = set()
     sample_ids: list[str] = []
-    for source_id, clips in sources.items():
-        first = next(iter(clips.values()))[0]
-        try:
-            pose = tkp1.decode_gz(blobs.fetch(first.r2_key, first.blob_sha256))
-        except tkp1.Tkp1Error as e:
-            raise FetchError(f"{first.r2_key}: {e}") from e
-        tricks: list[dict[str, Any]] = []
-        held_back: set[tuple[int, int]] = set()
-        provenance: dict[str, dict[str, Any]] = {}
-        for clip_id, rows in clips.items():
-            start, end = rows[0].start_frame, rows[0].end_frame
-            if end > pose.frame_count:
-                raise FetchError(
-                    f"clip {clip_id} ends at frame {end}, past the "
-                    f"{pose.frame_count}-frame pose sequence"
-                )
-            # canonical name -> the origins of the raw labels that gave it.
-            names: dict[str, set[str]] = {}
-            for row in rows:
-                canonical, tokens = taxonomy.canonicalize(row.trick_name)
-                for n in canonical:
-                    names.setdefault(n, set()).add(row.origin)
-                unmapped.update(tokens)
-            if not names:
-                clips_dropped += 1
-                continue
-            rare = {
-                n
-                for n in names
-                if pull.contributor_minimum is None
-                or pull.contributor_counts.get(n, 0) < pull.contributor_minimum
-            }
-            if rare:
-                # The whole clip: a combo window labeled with only its
-                # common names would teach the model the wrong thing.
-                held_back_names |= rare
-                held_back.add((start, end))
-                clips_held_back += 1
-                continue
-            # One entry per (clip, name): a combo clip is several entries on
-            # one window. Read them through evaluate.ground_truth_segments,
-            # which merges each window into one multi-name segment.
-            tricks.extend(
-                {
-                    "clip_id": clip_id,
-                    "name": n,
-                    "origins": sorted(names[n]),
-                    "start_frame": start,
-                    "end_frame": end,
-                }
-                for n in sorted(names)
-            )
-            provenance[clip_id] = _clip_provenance(rows[0])
-        tricks.sort(
-            key=lambda t: (t["start_frame"], t["end_frame"], t["clip_id"], t["name"])
-        )
-        sample = {
-            "sample_id": source_id,
-            "fps": FPS,
-            "keypoints": pose.keypoints,
-            "tricks": tricks,
-            "held_back_windows": [list(w) for w in sorted(held_back)],
-            "clips": provenance,
+    buckets: dict[str, int] = {}
+    for segment in pull.segments:
+        # canonical name -> the origins of the raw labels that gave it.
+        names: dict[str, set[str]] = {}
+        for label in segment.labels:
+            canonical, tokens = taxonomy.canonicalize(label.trick_name)
+            for n in canonical:
+                names.setdefault(n, set()).add(label.origin)
+            unmapped.update(tokens)
+        if not names:
+            dropped += 1
+            continue
+        rare = {
+            n
+            for n in names
+            if pull.contributor_minimum is None
+            or pull.contributor_counts.get(n, 0) < pull.contributor_minimum
         }
-        path = staging / "samples" / f"{source_id}.json"
+        if rare:
+            held_back_names |= rare
+            held_back += 1
+            continue
+        data = blobs.fetch(segment.r2_key, segment.blob_sha256)
+        try:
+            frames = tks1.decode_gz(data)
+        except tks1.Tks1Error as e:
+            raise FetchError(f"segment {segment.segment_id}: {e}") from e
+        if len(frames) != segment.frame_count:
+            raise FetchError(
+                f"segment {segment.segment_id}: blob has {len(frames)} frames, "
+                f"the export says {segment.frame_count}"
+            )
+        # One entry per canonical name on the clip window: a combo is several
+        # entries on one window, read through evaluate.ground_truth_segments.
+        tricks = [
+            {
+                "clip_id": segment.segment_id,
+                "name": n,
+                "origins": sorted(names[n]),
+                "start_frame": segment.window_start,
+                "end_frame": segment.window_end,
+            }
+            for n in sorted(names)
+        ]
+        sample = {
+            "sample_id": segment.segment_id,
+            "fps": FPS,
+            "keypoints": frames,
+            "split_bucket": segment.split_bucket,
+            "tricks": tricks,
+            "clips": {segment.segment_id: _provenance(segment)},
+        }
+        path = staging / "samples" / f"{segment.segment_id}.json"
         path.write_text(_dump(sample), encoding="utf-8")
-        sample_ids.append(source_id)
+        sample_ids.append(segment.segment_id)
+        buckets[segment.segment_id] = segment.split_bucket
 
-    sample_ids.sort()
     stats = {
         "samples": len(sample_ids),
-        "clips": sum(len(clips) for clips in sources.values())
-        - clips_dropped
-        - clips_held_back,
-        "clips_dropped_without_names": clips_dropped,
-        "clips_held_back": clips_held_back,
+        "segments": len(pull.segments),
+        "segments_dropped_without_names": dropped,
+        "segments_held_back": held_back,
         "names_held_back": len(held_back_names),
-        "label_rows": len(pull.rows),
+        "label_rows": sum(len(s.labels) for s in pull.segments),
         "taxonomy_version": taxonomy.version,
         "unmapped_tokens": len(unmapped),
     }
     manifest = {
         **stats,
         # The curated names at the pin: what the farm's vocabulary for this
-        # taxonomy_version holds. Unmapped tokens train, but a model that
-        # names one is not published (publish_model.py): the manifest is
-        # public and the token is a contributor's free text.
+        # taxonomy_version holds. Unmapped tokens train only if the farm
+        # counts them, and a model that names one is not published
+        # (publish_model.py): the manifest is public and the token is a
+        # contributor's free text.
         "canonical_names": taxonomy.canonical_names,
-        "export_cursor": pull.cursor,
         # Names with fewer than the farm's contributor_minimum contributors
         # (null: no minimum, so every name): never trained or published
         # (TRAINING_DESIGN.md §6.2).
@@ -803,7 +835,10 @@ def _write_dataset(
         "sample_ids": sample_ids,
     }
     (staging / "manifest.jsonl").write_text(
-        "".join(_dump({"sample_id": s, "source_id": s}) for s in sample_ids),
+        "".join(
+            _dump({"sample_id": s, "source_id": f"bucket-{buckets[s]}"})
+            for s in sample_ids
+        ),
         encoding="utf-8",
     )
     (staging / "dataset_manifest.json").write_text(
@@ -818,17 +853,24 @@ def _write_dataset(
 # -- CLI -----------------------------------------------------------------------
 
 
-def read_state(path: Path) -> str | None:
+def read_state(path: Path) -> set[str]:
+    """The segment ids of the last successful run's pull.
+
+    A state from before segments ({"watermark": ...}) names no segment, so
+    every segment counts as new once, on the first run after the switch.
+    """
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         raise FetchError(f"cannot read state file {path}: {e}") from e
-    if not isinstance(state, dict) or set(state) != {"watermark"}:
-        raise FetchError(f'state file {path} must be {{"watermark": ...}}')
-    watermark = state["watermark"]
-    if watermark is not None and not (isinstance(watermark, str) and watermark):
-        raise FetchError(f"state file {path}: watermark must be a string or null")
-    return watermark
+    if isinstance(state, dict) and set(state) == {"watermark"}:
+        return set()
+    if not isinstance(state, dict) or set(state) != {"segment_ids"}:
+        raise FetchError(f'state file {path} must be {{"segment_ids": [...]}}')
+    ids = state["segment_ids"]
+    if not isinstance(ids, list) or not all(is_segment_id(s) for s in ids):
+        raise FetchError(f"state file {path}: segment_ids must be segment ids")
+    return set(ids)
 
 
 def write_json_file(path: Path, data: Any) -> None:
@@ -837,10 +879,6 @@ def write_json_file(path: Path, data: Any) -> None:
         _write_atomic(path, _dump(data).encode("utf-8"))
     except OSError as e:
         raise FetchError(f"cannot write {path}: {e}") from e
-
-
-def write_state(path: Path, watermark: str | None) -> None:
-    write_json_file(path, {"watermark": watermark})
 
 
 def client_from_env(transport: Transport | None) -> ExportClient:
@@ -855,19 +893,19 @@ def client_from_env(transport: Transport | None) -> ExportClient:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fetch the training dataset.")
     sub = p.add_subparsers(dest="command", required=True)
-    count = sub.add_parser("count", help="count label rows since the watermark")
-    count.add_argument("--state", type=Path, help="stored state with the watermark")
+    count = sub.add_parser("count", help="count segments new since the last run")
+    count.add_argument("--state", type=Path, help="the last run's segment ids")
     count.add_argument(
-        "--out-state", type=Path, required=True, help="where to write the new watermark"
+        "--out-state", type=Path, required=True, help="where to write this pull's ids"
     )
     count.add_argument(
-        "--out-sources",
+        "--out-segments",
         type=Path,
-        help="where to write the changed source ids (the fixture gate's --ingested)",
+        help="where to write the new segment ids (the fixture gate's --ingested)",
     )
     build = sub.add_parser("build", help="full pull into a fresh dataset directory")
     build.add_argument("--out", type=Path, required=True, help="dataset directory")
-    build.add_argument("--cache", type=Path, required=True, help="pose-blob cache")
+    build.add_argument("--cache", type=Path, required=True, help="segment-blob cache")
     return p.parse_args(argv)
 
 
@@ -880,15 +918,17 @@ def main(
     try:
         client = client_from_env(transport)
         if args.command == "count":
-            since = read_state(args.state) if args.state else None
-            pull = client.pull(since)
-            changed = sorted({row.source_id for row in pull.rows})
-            write_state(args.out_state, pull.cursor)
-            if args.out_sources:
-                write_json_file(args.out_sources, changed)
+            previous = read_state(args.state) if args.state else set()
+            pull = client.pull()
+            new = [s for s in pull.segments if s.segment_id not in previous]
+            write_json_file(
+                args.out_state, {"segment_ids": [s.segment_id for s in pull.segments]}
+            )
+            if args.out_segments:
+                write_json_file(args.out_segments, [s.segment_id for s in new])
             result: dict[str, Any] = {
-                "new_labels": len(pull.rows),
-                "changed_sources": len(changed),
+                "new_segments": len(new),
+                "new_labels": sum(len(s.labels) for s in new),
             }
         else:
             blobs = BlobCache(args.cache, blob_getter or r2_getter_from_env())

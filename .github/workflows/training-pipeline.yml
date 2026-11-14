@@ -10,12 +10,13 @@
 #              the promotion gate against it. No secrets; both run
 #              directories are uploaded as an artifact (synthetic data
 #              only).
-#   farm       the real run, from the `training` Environment: count label
-#              rows changed since the stored watermark (skip at 50 or
+#   farm       the real run, from the `training` Environment: count the
+#              labels on segments new since the stored watermark, the last
+#              successful run's segment ids (skip at 50 or
 #              fewer unless `force`, or a scheduled retrain is due: then
 #              the run trains from scratch and the promotion gate runs as
-#              a refresh, TRAINING_DESIGN.md §2.1), full pull + pose blobs,
-#              the changed-source list, then the shared chain. Logs and
+#              a refresh, TRAINING_DESIGN.md §2.1), full pull + segment
+#              blobs, the new-segment list, then the shared chain. Logs and
 #              artifacts of this public repository are public, so nothing
 #              per-sample is printed or uploaded as an artifact: the run
 #              directory goes to the private R2 bucket. A promoted champion (or a
@@ -189,8 +190,8 @@ jobs:
         name: Install training + export dependencies
         run: pip install -r Training/requirements-export.txt
 
-      # training/state/export_state.json  the watermark (never printed: the
-      #                                   cursor may embed raw label text)
+      # training/state/export_state.json  the watermark: the last successful
+      #                                   run's segment ids (never printed)
       # training/state/retrain_state.json the date of the last full
       #                                   (from-scratch) retrain
       # training/champion/current.json    the champion pointer, if any:
@@ -259,7 +260,7 @@ jobs:
           echo "due=$due" >> "$GITHUB_OUTPUT"
 
       - if: steps.config.outputs.configured == 'true'
-        name: Count label rows changed since the watermark
+        name: Count labels on segments new since the watermark
         id: count
         env:
           RETRAIN_DUE: ${{ steps.schedule.outputs.due }}
@@ -269,9 +270,9 @@ jobs:
           python Training/fetch_dataset.py count "${state[@]}" \
             --out-state data/state/count_state.json > data/count.json
           new=$(python -c 'import json; print(json.load(open("data/count.json"))["new_labels"])')
-          echo "new label rows since the watermark: $new"
+          echo "labels on new segments since the watermark: $new"
           if [ "$new" -le 50 ] && [ "$FORCE" != "true" ] && [ "$RETRAIN_DUE" != "true" ]; then
-            echo "::notice::$new new label rows (50 or fewer): skipping this run."
+            echo "::notice::$new labels on new segments (50 or fewer): skipping this run."
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -282,17 +283,17 @@ jobs:
         run: |
           python Training/fetch_dataset.py build --out data/dataset --cache data/blob-cache
 
-      # Taken after the dataset pull, so it covers every new row the
+      # Taken after the dataset pull, so it covers every new segment the
       # challenger trains on (TRAINING_DESIGN.md §7): the fixture gate's
-      # --ingested (pipeline.sh's default INGESTED). Its cursor becomes the
-      # new watermark.
+      # --ingested (pipeline.sh's default INGESTED). Its segment ids become
+      # the new watermark.
       - if: steps.count.outputs.run == 'true'
-        name: List the sources changed since the watermark
+        name: List the segments new since the watermark
         run: |
           state=()
           [ -f data/state/export_state.json ] && state=(--state data/state/export_state.json)
           python Training/fetch_dataset.py count "${state[@]}" \
-            --out-state data/state/new_state.json --out-sources data/run/ingested.json
+            --out-state data/state/new_state.json --out-segments data/run/ingested.json
 
       # PUBLISH: a champion promoted past both gates is published
       # (Training/publish_model.py, with the job's farm and R2 credentials);
@@ -369,7 +370,10 @@ jobs:
       # A fixture regression quarantines tonight's suspect sources
       # farm-side (TRAINING_DESIGN.md §7 step 2): POST /api/quarantine with
       # the gate's quarantine.json, so the export leaves them out until the
-      # maintainer releases or purges them. It runs after the run record and
+      # maintainer releases or purges them. The list now holds segment ids,
+      # which the farm's endpoint does not take yet: report_quarantine.py
+      # refuses them, so a regression fails the run and holds the watermark
+      # until the farm can quarantine by segment (§7). It runs after the run record and
       # the decision log are stored, so a failed send leaves both for
       # review, fails the run and keeps the watermark held. The farm skips
       # sources already under quarantine, so the next run just sends again.

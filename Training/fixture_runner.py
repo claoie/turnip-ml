@@ -43,6 +43,10 @@ Fixture set (fixtures.json)
 
 - id: unique, lowercase [a-z0-9._-].
 - pose_sha256: the pose blob (TKP1, Training/tkp1.py), 10 Hz canonical.
+  The runner scores it as the client would: after the segment transform
+  over the whole pose (Training/segment_transform.py, MODEL_CONTRACT.md
+  §3.6). A pose with no frame that has both hips and both shoulders has
+  no transform and is refused.
 - segments: the maintainer's labels in the pose's frame indices,
   end-exclusive, inside the pose. Names are canonical trick names
   (normalized, no "+", not "background"); a combo is one segment with
@@ -105,6 +109,7 @@ import evaluate
 import numpy as np
 import numpy.typing as npt
 import predict
+import segment_transform
 import tkp1
 import train
 from canonicalize import normalize
@@ -293,7 +298,8 @@ def compare(fixtures_path: Path, scores_path: Path) -> str | None:
 
 
 def load_pose(poses_dir: Path, fixture: Fixture) -> npt.NDArray[np.float64]:
-    """The fixture's keypoints, from a blob verified against pose_sha256."""
+    """The fixture's keypoints after the segment transform, from a TKP1 blob
+    verified against pose_sha256."""
     path = poses_dir / f"{fixture.pose_sha256}.tkp1.gz"
     where = f"fixture {fixture.id!r}"
     try:
@@ -309,9 +315,16 @@ def load_pose(poses_dir: Path, fixture: Fixture) -> npt.NDArray[np.float64]:
         _fail(f"{where}: {path} does not match its pose_sha256")
     try:
         pose = tkp1.decode_gz(data)
-        keypoints = train.check_keypoints(pose.keypoints, fixture.id)
-    except ValueError as e:  # Tkp1Error is a ValueError
+    except tkp1.Tkp1Error as e:
         _fail(f"{where}: undecodable pose blob {path.name}: {e}")
+    # The model reads the take after the segment transform, as the client
+    # applies it (MODEL_CONTRACT.md §3.6): the fixture is the whole take.
+    transformed = segment_transform.transform(pose.keypoints)
+    if transformed is None:
+        _fail(f"{where}: no frame has both hips and both shoulders to scale by")
+    keypoints = train.check_keypoints(
+        segment_transform.frames_as_array(transformed), fixture.id
+    )
     for start, end, _ in fixture.segments:
         if end > pose.frame_count:
             _fail(

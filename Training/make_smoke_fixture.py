@@ -1,13 +1,19 @@
 """Generate the tiny deterministic smoke-test fixture for train.py.
 
 Writes Training/fixtures/smoke/manifest.jsonl and samples/*.json: eight
-synthetic 32-frame @10Hz samples (MoveNet-17 keypoints) with trick segments.
+synthetic 32-frame @10Hz samples with trick segments. Each is generated as
+MoveNet-17 keypoints (make_sample, which make_synthetic_fixtures.py also
+uses for its TKP1 fixture poses) and stored after the segment transform
+(Training/segment_transform.py), in the TKS1 body frame the farm's
+segments arrive in.
 Motion signatures are deliberately separable so the smoke run must reach
 100% val accuracy — anything less is a training-pipeline bug, not data noise.
 
   background: near-static pose + tiny jitter
-  gainer:     strong vertical oscillation   (high |vy|)
-  corkscrew:  strong horizontal oscillation (high |vx|)
+  gainer:     strong vertical oscillation   (high |vy|), arms swinging
+              further than the body
+  corkscrew:  strong horizontal oscillation (high |vx|), the body
+              twisting narrower
 
 Deterministic: the seed fixes every random draw; floats are rounded to 6dp so
 the files are byte-stable. Regenerate with:
@@ -24,6 +30,8 @@ import json
 import math
 import random
 from pathlib import Path
+
+import segment_transform
 
 FRAMES = 32
 FPS = 10
@@ -53,18 +61,28 @@ BASE_POSE = [
 # (sample_id, source_id, [(trick_name, start_frame, end_frame)]). source_id
 # groups samples as if cut from one source video, so the splitter's
 # source grouping has something to keep together.
+# Trick boundaries sit midway between window starts (2 mod 4, with the
+# smoke config's 8-frame windows at stride 4), so every window is at least
+# 6/8 one thing: no window is half trick, half background.
 SAMPLES: list[tuple[str, str, list[tuple[str, int, int]]]] = [
-    ("smoke-001", "source-a", [("gainer", 4, 20)]),
-    ("smoke-002", "source-a", [("corkscrew", 8, 24)]),
+    ("smoke-001", "source-a", [("gainer", 2, 22)]),
+    ("smoke-002", "source-a", [("corkscrew", 6, 26)]),
     ("smoke-003", "source-a", []),
-    ("smoke-004", "source-a", [("gainer", 4, 12), ("corkscrew", 20, 28)]),
-    ("smoke-005", "source-b", [("corkscrew", 4, 20)]),
-    ("smoke-006", "source-b", [("gainer", 12, 28)]),
+    ("smoke-004", "source-a", [("gainer", 2, 14), ("corkscrew", 18, 30)]),
+    ("smoke-005", "source-b", [("corkscrew", 2, 22)]),
+    ("smoke-006", "source-b", [("gainer", 10, 30)]),
     ("smoke-007", "source-c", []),
-    ("smoke-008", "source-c", [("gainer", 4, 20)]),
+    ("smoke-008", "source-c", [("gainer", 2, 22)]),
 ]
 
 AMP = 0.18  # motion amplitude (fraction of frame)
+# A trick changes the body's shape, not only its place, since the model
+# reads poses about the body's root (train.featurize_window): on a gainer
+# the elbows and wrists (MoveNet 7-10) swing further than the body, and a
+# corkscrew twists the body, narrowing it by up to TWIST.
+ARM_SWING = 1.5
+ARMS = range(7, 11)
+TWIST = 0.6
 WAVES = 2  # oscillation cycles per trick segment
 JITTER = 0.0035  # background noise stddev
 
@@ -91,12 +109,17 @@ def make_sample(
         frame = []
         for j, (bx, by) in enumerate(BASE_POSE):
             dx = dy = 0.0
+            width = 1.0
             for name, s, e in tricks:
                 if s <= f < e:
                     ox, oy = trick_offset(name, f, s, e)
+                    if name == "gainer" and j in ARMS:
+                        oy *= ARM_SWING
+                    if name == "corkscrew":
+                        width -= TWIST * abs(ox) / AMP
                     dx += ox
                     dy += oy
-            x = bx + dx + rng.gauss(0, JITTER)
+            x = 0.5 + (bx - 0.5) * width + dx + rng.gauss(0, JITTER)
             y = by + dy + rng.gauss(0, JITTER)
             score = min(1.0, max(0.5, 0.92 + rng.gauss(0, 0.02)))
             frame.append([round(x, 6), round(y, 6), round(score, 6)])
@@ -117,7 +140,13 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest_lines = []
     for sample_id, source_id, tricks in SAMPLES:
-        keypoints = make_sample(rng, tricks)
+        transformed = segment_transform.transform(make_sample(rng, tricks))
+        if transformed is None:
+            raise ValueError(f"{sample_id}: no torso to scale by")
+        keypoints = [
+            [[round(v, 6) for v in joint] for joint in frame]
+            for frame in segment_transform.frames_as_array(transformed)
+        ]
         rec = {
             "sample_id": sample_id,
             "fps": FPS,

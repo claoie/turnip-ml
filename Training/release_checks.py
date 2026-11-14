@@ -29,12 +29,15 @@ What is checked
    arguments alike, is either
    - a floating-point tensor equal, at the precision it is stored in,
      to one of the model's parameters: feat_mean, 1 / feat_std, W
-     (transposed) or b; or
+     (transposed) or b;
+   - a floating-point scalar (rank 0): the feature math's own constants,
+     such as 0.5 for a midpoint; or
    - a non-floating tensor (shapes, axes, flags, dtype names) of at most
      MAX_SMALL_VALUE elements, each string at most MAX_STRING_LENGTH
      characters.
-   A pose window is at least window_frames x 34 values and an embedding
-   68, so neither fits the second rule, and neither equals a parameter.
+   A pose window is at least window_frames x 26 values and an embedding
+   52, so neither fits the last two rules, and neither equals a
+   parameter.
 4. The weight file holds only blobs the program references, with no
    bytes after the last one beyond alignment padding.
 5. The model's metadata carries only METADATA_KEYS (and the program
@@ -267,7 +270,7 @@ def _check_value(
     else:
         raise ReleaseCheckError("program holds a value of unknown storage")
     if dtype in FLOAT_DTYPES:
-        if not _is_parameter(values, FLOAT_DTYPES[dtype], params):
+        if dims and not _is_parameter(values, FLOAT_DTYPES[dtype], params):
             raise ReleaseCheckError(
                 f"program holds a float tensor of {values.size} values that is "
                 "none of the model's parameters"

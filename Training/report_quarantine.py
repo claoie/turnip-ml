@@ -2,8 +2,10 @@
 """Send the fixture gate's quarantine rows to the farm: POST /api/quarantine.
 
 turnip-ml#51, docs/TRAINING_DESIGN.md §7 step 2. On a fixture regression
-fixture_gate.py writes quarantine.json, one row per source changed since
-the watermark. This puts those sources under an open quarantine farm-side,
+fixture_gate.py writes quarantine.json, one row per id the farm job
+listed as new since the watermark. Since the switch to segments those
+are segment ids, which the farm cannot quarantine yet: they are refused
+here (TRAINING_DESIGN.md §7). This puts those sources under an open quarantine farm-side,
 so the export leaves them out until the maintainer releases or purges them
 (farm master plan §6). The workflow's farm job runs it after a regression
 and advances the watermark only once it succeeds; nothing else sends.
@@ -77,6 +79,7 @@ from fetch_dataset import (
     PIPELINE_KEY_ENV,
     farm_url_allowed,
     farm_urlopen,
+    is_segment_id,
 )
 
 EXIT_OK = 0
@@ -134,6 +137,12 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
                 f"row {i} must have exactly the keys source_id, reason and metrics"
             )
         source_id, reason, metrics = row["source_id"], row["reason"], row["metrics"]
+        if is_segment_id(source_id):
+            raise QuarantineError(
+                f"row {i} names a training segment, not a source: the farm's "
+                "POST /api/quarantine takes source ids only, and segments carry "
+                "none (TRAINING_DESIGN.md §7)"
+            )
         if not isinstance(source_id, str) or HEX64_RE.fullmatch(source_id) is None:
             raise QuarantineError(
                 f"row {i}: source_id must be a farm source id (64 lowercase hex)"

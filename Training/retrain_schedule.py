@@ -4,7 +4,8 @@
 TRAINING_DESIGN.md §2.1, §8. Every dataset is a full pull, so data
 deleted farm-side never reaches a new training run. But the nightly run
 fine-tunes the champion, whose weights carry everything it was ever
-trained on, and it only runs when more than 50 label rows are new. So
+trained on, and it only runs when more than 50 labels on new segments
+come in. So
 the farm job also retrains from scratch on a fixed schedule: once the
 last full retrain is RETRAIN_INTERVAL_DAYS old, the next nightly run
 trains from scratch whatever the label count, and promote.py --refresh

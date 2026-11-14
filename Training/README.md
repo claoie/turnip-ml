@@ -6,15 +6,18 @@ what this repo validates; see the root README for repo-wide conventions.
 
 ## Layout
 
-- `fetch_dataset.py` — builds the dataset from the farm's label export and
-  the R2 pose blobs (`count` and `build`). See its docstring for the full
-  contract.
+- `fetch_dataset.py` — builds the dataset from the farm's segment export
+  and the R2 `TKS1` segment blobs (`count` and `build`). See its
+  docstring for the full contract.
+- `tks1.py` — the `TKS1` segment-blob codec (turnip-farm
+  `POSE_FORMAT.md` §12).
 - `split_dataset.py` — deterministic train/val/holdout splitter grouped by
-  `source_id` (turnip-ml#12). See its docstring for the full contract.
+  the manifest's `source_id`, the farm's split bucket for segments
+  (turnip-ml#12). See its docstring for the full contract.
 - `train.py` — champion training / fine-tuning script (turnip-ml#13).
   Hermetic TOML config, deterministic, CI smoke-tested.
 - `membership_inference.py` — the membership-inference check: can the
-  model's outputs tell training sources from holdout sources? Written
+  model's outputs tell training segments from holdout ones? Written
   into the holdout report; the promotion gate archives a model that
   fails it (`docs/TRAINING_DESIGN.md` §6.2).
 - `name_metrics.py` — per-name holdout precision/recall plus holdout and
@@ -73,17 +76,19 @@ byte-for-byte on the same interpreter is a bug.
 
 ## The dataset
 
-`fetch_dataset.py build` writes one `samples/<source_id>.json` per source:
-the pose keypoints at 10 Hz and one `tricks` entry per (clip, canonical
-name) on the clip's window, plus `manifest.jsonl` (the splitter's input)
-and `dataset_manifest.json`. Samples also carry each label's provenance
+`fetch_dataset.py build` writes one `samples/<segment_id>.json` per farm
+segment: its 13 `TKS1` joints at 10 Hz (on the farm's standard body, in
+torso lengths), its `split_bucket`, and one `tricks` entry per canonical
+name on the segment's clip window. It also writes `manifest.jsonl` (the
+splitter's input, grouping each segment by `bucket-<split_bucket>`) and
+`dataset_manifest.json`. Samples also carry each label's provenance
 (`docs/TRAINING_DESIGN.md` §1, §6.4):
 
 - `tricks[].origins` — how the name was given: `typed`, `vocabulary` or
   `model` (a model suggestion the user kept). Sorted; more than one only
   when two raw labels with different origins canonicalize to the same
   name.
-- `clips` — per clip id, the clip's `proposal_model_version` (`null` for
+- `clips` — keyed by the segment id, the clip's `proposal_model_version` (`null` for
   the heuristic detector or a manual clip), `suggested_names` (what that
   model pre-filled, or on a blind clip would have, verbatim; `[]` when
   none) and `suggestions_withheld` (the clip is in the blind sample).
@@ -97,10 +102,13 @@ format does not require it.
 A trick with fewer distinct contributors than the farm's
 `contributor_minimum` is held back whole. The counts come from the
 export's `trick_contributors`; a trick it doesn't list has none, and an
-export without either field holds every trick back. A held-back trick's
-clips leave no trick entry and go to the sample's `held_back_windows`,
-which `train.py` never trains on, and `dataset_manifest.json` lists the
-held-back names (`docs/TRAINING_DESIGN.md` §6.2).
+export without either field holds every trick back. A segment carrying a
+held-back trick gets no sample at all, and `dataset_manifest.json` lists
+the held-back names (`docs/TRAINING_DESIGN.md` §6.2).
+
+`train.py` reads samples in that body frame. The smoke fixture is
+generated as MoveNet keypoints and stored after the same transform
+(`segment_transform.py`), so it looks like farm data to every script.
 
 ## Splitting a manifest
 
@@ -207,10 +215,11 @@ The workflow has two modes:
      recorded. Then the run trains from scratch, with `REFRESH=true`:
      the promotion gate replaces the champion unless the challenger is
      more than 2% worse;
-  3. `fetch_dataset.py count`: skips the run at 50 or fewer new label rows
-     unless a retrain is due (dispatch `force` overrides);
+  3. `fetch_dataset.py count`: skips the run at 50 or fewer labels on
+     segments new since the watermark (the last successful run's segment
+     ids) unless a retrain is due (dispatch `force` overrides);
   4. `fetch_dataset.py build`: full pull into `data/dataset`;
-  5. `fetch_dataset.py count --out-sources`: the changed-source list;
+  5. `fetch_dataset.py count --out-segments`: the new-segment list;
   6. `pipeline.sh` (below);
   7. records `data/run` under `training/runs/<run id>/` in R2; stores
      what `pipeline.sh` staged in `data/run/champion_update/` as a new
@@ -220,12 +229,13 @@ The workflow has two modes:
      when a from-scratch challenger became the champion; stores the
      decision log;
   8. after a fixture regression, sends `quarantine.json` to the farm with
-     `report_quarantine.py` (below): the export leaves the suspect
-     sources out until the maintainer releases or purges them;
+     `report_quarantine.py` (below). The list holds segment ids, which
+     the farm's endpoint doesn't take yet, so the send fails, and with
+     it the run (`docs/TRAINING_DESIGN.md` §7);
   9. advances the watermark. After a regression only once the farm has
      accepted every quarantine request: a failed send fails the run and
-     the watermark holds, so the next run's changed-source list still
-     covers the suspect sources and sends them again.
+     the watermark holds, so the next run's new-segment list still
+     covers the suspect segments.
 - **`synthetic`** (dispatch default) rehearses the same chain on the smoke
   fixture and a synthetic fixture set, with no secrets, twice: a first run
   with no champion bootstraps one, a second runs the fixture gate and the
@@ -278,10 +288,10 @@ python Training/publish_model.py --run data/run --dataset data/dataset
 
 1. Builds the whole `POST /api/models` body first: the descriptors of the
    exported model, `val_metrics`, `name_metrics.json`, the dataset's
-   pinned `taxonomy_version`, and `training_source_ids` (the train split's
-   sources). A dataset that isn't the farm's (64-hex source ids) is
-   refused before anything is uploaded, so `synthetic` mode can never
-   publish. So is a model whose trick names include one that isn't a
+   pinned `taxonomy_version`, and `training_segment_ids` (the train
+   split's segments). A dataset that isn't the farm's (segment ids are
+   UUIDs) is refused before anything is uploaded, so `synthetic` mode can
+   never publish. So is a model whose trick names include one that isn't a
    curated canonical name (`dataset_manifest.json`'s `canonical_names`):
    unmapped labels train, but they are contributors' free text and the
    manifest is public. Map them in the taxonomy first
@@ -295,6 +305,10 @@ python Training/publish_model.py --run data/run --dataset data/dataset
    `trick-v1.0` before the first; `--major` or `--version` override it.
    If the current model already is this artifact (same sha256), an
    earlier run published it and lost the answer: nothing more is done.
+   If the current model reads another input format (`input_desc.format`,
+   `TKP1` before the switch to segments), the publish is a major bump and
+   needs `MIN_CLIENT_VERSION`, the first app version that applies
+   `docs/MODEL_CONTRACT.md` §3.6; without it, nothing is published.
 4. Uploads the artifact to `models/<version>.mlpackage.zip` and the holdout
    report to `reports/<version>-holdout.json`, reads each back and checks its sha256. It never overwrites a key that
    holds other bytes.
@@ -319,8 +333,9 @@ from the environment and, in this order:
    before sending anything: `source_id` a farm source id (64 lowercase
    hex), `reason` non-empty and at most 1000 characters, `metrics` an
    object or null, no other key, no source listed twice. `synthetic`
-   mode's sources are not farm ids, so it can never quarantine. An empty
-   file sends nothing.
+   mode's sources are not farm ids, so it can never quarantine. A
+   segment id is refused with its own message: the farm quarantines
+   sources only, and segments carry none. An empty file sends nothing.
 2. Sends one `POST /api/quarantine` body `{source_ids, reason, metrics}`
    per reason and metrics, at most 10000 ids each (the farm's limit), in
    a fixed order.
@@ -340,7 +355,7 @@ repository's logs and artifacts are public, so the gates' decision records
 go to files (`data/run/fixture_gate/decision.json`,
 `data/run/promotion.json`, the decision log), not the log. Run it locally
 the same way: put a dataset in `data/dataset/` (`fetch_dataset.py build`,
-or `make_smoke_fixture.py --out data/dataset`), the changed-source list
+or `make_smoke_fixture.py --out data/dataset`), the new-segment list
 in `data/run/ingested.json` (`[]` will do locally; it is required only
 when the fixture gate will run, i.e. with a champion and a scoreable
 fixture set), and run `Training/pipeline.sh`. Point `FIXTURES` and `FIXTURE_POSES` at

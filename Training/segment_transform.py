@@ -223,6 +223,15 @@ def transform(frames: Sequence[Frame]) -> list[OutFrame] | None:
     return [retarget_frame(f, scale, cx, cy, i) for i, f in enumerate(frames)]
 
 
+def frames_as_array(frames: Sequence[OutFrame]) -> list[list[list[float]]]:
+    """[T][13][x, y, c] with missing joints as zeros: the sample keypoints
+    train.py reads, the same layout as a decoded TKS1 blob."""
+    return [
+        [list(joint) if joint is not None else [0.0, 0.0, 0.0] for joint in frame]
+        for frame in frames
+    ]
+
+
 def model_input(frames: Sequence[OutFrame]) -> list[list[float]]:
     """[T, 40] rows: 13 joints x (x, y, c) in JOINTS order, missing joints
     as zeros, then the gap indicator (1.0 when every joint is missing)."""

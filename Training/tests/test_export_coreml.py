@@ -26,6 +26,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import export_coreml
+import segment_transform
 import tkp1
 import train
 
@@ -62,8 +63,11 @@ class LoadModelTest(SmokeModel):
     def test_descriptors_describe_the_window_classifier(self) -> None:
         ckpt = export_coreml.load_model(self.model)
         input_desc, output_desc = export_coreml.descriptors(ckpt)
-        self.assertEqual(input_desc["format"], "TKP1")
-        self.assertEqual(input_desc["shape"], ["T", 52])
+        self.assertEqual(input_desc["format"], "TKS1")
+        self.assertEqual(input_desc["keypoint_count"], 13)
+        self.assertEqual(input_desc["joints"], list(segment_transform.JOINTS))
+        self.assertEqual(input_desc["transform"], "MODEL_CONTRACT.md §3.6")
+        self.assertEqual(input_desc["shape"], ["T", 40])
         self.assertEqual(input_desc["min_frames"], 8)
         self.assertEqual(input_desc["max_frames"], tkp1.MAX_FRAMES)
         self.assertEqual(
@@ -81,7 +85,7 @@ class LoadModelTest(SmokeModel):
             output_desc["embedding"],
             {
                 "output_name": "window_embeddings",
-                "shape": ["N", 68],
+                "shape": ["N", 52],
                 "window_frames": 8,
                 "window_stride": 4,
             },
@@ -178,7 +182,7 @@ class ExportTest(SmokeModel):
         )
         lo, ch = inp.type.multiArrayType.shapeRange.sizeRanges
         self.assertEqual((lo.lowerBound, lo.upperBound), (8, tkp1.MAX_FRAMES))
-        self.assertEqual((ch.lowerBound, ch.upperBound), (52, 52))
+        self.assertEqual((ch.lowerBound, ch.upperBound), (40, 40))
         self.assertEqual(
             [o.name for o in spec.description.output],
             ["window_probs", "window_embeddings"],
@@ -233,7 +237,7 @@ class ExportTest(SmokeModel):
             with zipfile.ZipFile(io.BytesIO(artifact)) as zf:
                 zf.extractall(tmp)
             mlmodel = ct.models.MLModel(str(Path(tmp) / export_coreml.PACKAGE_NAME))
-            pose = np.full((32, 52), 0.9, dtype=np.float32)
+            pose = np.full((32, 40), 0.9, dtype=np.float32)
             got = mlmodel.predict({"pose": pose})
         self.assertTrue(np.all(np.isfinite(got["window_probs"])))
         self.assertTrue(np.all(np.isfinite(got["window_embeddings"])))
@@ -261,7 +265,7 @@ class ExportTest(SmokeModel):
                 logits = (feats - ckpt["feat_mean"]) / ckpt["feat_std"] @ ckpt["W"]
                 want = train._softmax(np, logits + ckpt["b"])
                 gap = (kps[:, :, 2].sum(axis=1) == 0)[:, None]
-                pose = np.concatenate([kps.reshape(n, 51), gap], axis=1)
+                pose = np.concatenate([kps.reshape(n, 39), gap], axis=1)
                 out = mlmodel.predict({"pose": pose.astype(np.float32)})
                 got, emb = out["window_probs"], out["window_embeddings"]
                 with self.subTest(path.name):
