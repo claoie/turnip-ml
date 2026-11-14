@@ -66,6 +66,22 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(decide(0.80, 0.85, 0.05, "val_accuracy")[0], "promote")
 
 
+class RefreshDecideTest(unittest.TestCase):
+    def test_refresh_promotes_down_to_the_tolerance(self) -> None:
+        threshold = -promote.REFRESH_TOLERANCE
+        # 50 -> 49 is exactly -1/50, the same double as -0.02: promotes.
+        self.assertEqual(decide(50.0, 49.0, threshold, "val_accuracy")[0], "promote")
+        self.assertEqual(decide(50.0, 48.9, threshold, "val_accuracy")[0], "archive")
+        # No change at all promotes a refresh, where a normal run archives.
+        self.assertEqual(decide(0.8, 0.8, threshold, "val_accuracy")[0], "promote")
+        self.assertEqual(decide(0.8, 0.8, 0.01, "val_accuracy")[0], "archive")
+
+    def test_refresh_promotes_zero_over_zero(self) -> None:
+        threshold = -promote.REFRESH_TOLERANCE
+        self.assertEqual(decide(0.0, 0.0, threshold, "val_accuracy")[0], "promote")
+        self.assertEqual(decide(0.0, 0.0, 0.01, "val_accuracy")[0], "archive")
+
+
 class RunTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -329,6 +345,42 @@ class RunTest(unittest.TestCase):
                 )
                 self.assertEqual(code, EXIT_ERROR)
         self.assertFalse(self.registry.exists())  # nothing recorded
+
+    def test_failed_membership_inference_archives_a_refresh(self):
+        champion = self.write_metrics("champion.json", val_accuracy=0.80)
+        same = self.write_metrics("same.json", val_accuracy=0.80)
+        report = self.write_report("failed.json", passed=False, auc=0.75)
+        threshold = -promote.REFRESH_TOLERANCE
+        record, code = promote.run(
+            champion, same, "val_accuracy", threshold, self.registry, report, True
+        )
+        self.assertEqual(code, EXIT_ARCHIVE)
+        self.assertIn("membership-inference check did not pass", record["reason"])
+        self.assertIs(record["refresh"], True)
+
+    def test_main_refresh(self):
+        champion = self.write_metrics("champion.json", val_accuracy=0.80)
+        same = self.write_metrics("same.json", val_accuracy=0.80)
+        base = [
+            "--champion",
+            str(champion),
+            "--challenger",
+            str(same),
+            "--registry",
+            str(self.registry),
+            "--holdout-report",
+            str(self.report),
+        ]
+        self.assertEqual(promote.main(base), EXIT_ARCHIVE)
+        self.assertEqual(promote.main([*base, "--refresh"]), EXIT_PROMOTE)
+        entries = json.loads(self.registry.read_text(encoding="utf-8"))
+        self.assertEqual([e["refresh"] for e in entries], [False, True])
+        self.assertEqual(entries[1]["threshold"], -promote.REFRESH_TOLERANCE)
+        # The refresh sets the threshold: both is a usage error.
+        self.assertEqual(
+            promote.main([*base, "--refresh", "--threshold", "0.01"]), EXIT_ERROR
+        )
+        self.assertEqual(len(json.loads(self.registry.read_text())), 2)
 
     def test_main_exit_codes(self):
         champion = self.write_metrics("champion.json", val_accuracy=0.80)

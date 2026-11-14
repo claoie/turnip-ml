@@ -50,6 +50,10 @@
 #   SPLIT_RATIOS   "train val holdout" split targets (default 0.8 0.1 0.1)
 #   FROM_SCRATCH   "true" trains without data/champion as the base (the
 #                  gates still compare against it)
+#   REFRESH        "true": a scheduled retrain (Training/retrain_schedule.py,
+#                  TRAINING_DESIGN.md §2.1). Needs FROM_SCRATCH=true; the
+#                  promotion gate runs with --refresh, so the challenger
+#                  replaces the champion unless it is clearly worse.
 #   FIXTURES       fixture set (default Training/fixtures/tricks/fixtures.json)
 #   FIXTURE_POSES  its pose blobs (default data/fixture-poses)
 #   INGESTED       JSON array of source ids (default data/run/ingested.json)
@@ -64,7 +68,9 @@
 #                  recorded but not published.
 #
 # Outputs besides data/run/challenger/ (fixture_scores.json included):
-#   outcome.json          what ran and what it decided (the workflow reads it)
+#   outcome.json          what ran and what it decided (the workflow reads
+#                         it; retrain_schedule.py record reads from_scratch
+#                         and promotion)
 #   fixture_gate/         the gate's decision.json and quarantine.json
 #   promotion.json        the promotion gate's decision
 #   champion/             the champion's re-scored fixture scores, if any
@@ -87,6 +93,7 @@ FIXTURE_POSES=${FIXTURE_POSES:-data/fixture-poses}
 INGESTED=${INGESTED:-$RUN/ingested.json}
 REGISTRY=${REGISTRY:-Training/registry.json}
 BOOTSTRAP=${BOOTSTRAP_CHAMPION:-false}
+REFRESH=${REFRESH:-false}
 read -r TRAIN_RATIO VAL_RATIO HOLDOUT_RATIO <<<"${SPLIT_RATIOS:-0.8 0.1 0.1}"
 SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
 UPDATE=$RUN/champion_update
@@ -116,6 +123,9 @@ if [ "$BOOTSTRAP" = "true" ]; then
     die "BOOTSTRAP_CHAMPION=true, but a champion exists; bootstrap only seeds the first one"
   [ "$scoreable" = true ] ||
     die "BOOTSTRAP_CHAMPION=true, but $FIXTURES has nothing to score: the first champion needs fixture scores; add fixtures first"
+fi
+if [ "$REFRESH" = true ] && [ "${FROM_SCRATCH:-false}" != true ]; then
+  die "REFRESH=true needs FROM_SCRATCH=true: a scheduled retrain starts from scratch"
 fi
 if [ "$has_champion" = true ] && [ "$scoreable" = true ] && [ ! -f "$INGESTED" ]; then
   die "the fixture gate needs the changed-source list at $INGESTED"
@@ -250,9 +260,13 @@ challenger the first champion."
     echo "fixture gate: $gate"
 
     if [ "$gate" = pass ] && [ -f "$CHAMPION/metrics.json" ]; then
+      refresh_args=()
+      if [ "$REFRESH" = true ]; then
+        refresh_args=(--refresh)
+      fi
       status=0
       python Training/promote.py --champion "$CHAMPION/metrics.json" \
-        --challenger "$RUN/challenger/metrics.json" \
+        --challenger "$RUN/challenger/metrics.json" "${refresh_args[@]}" \
         --holdout-report "$RUN/challenger/holdout_report.json" \
         --registry "$REGISTRY" >"$RUN/promotion.json" || status=$?
       case $status in
@@ -324,20 +338,33 @@ fixture gate, so it is never published (the first gated promotion is)."
 else
   STOP="$STOP Publishing: not run (nothing was promoted)."
 fi
+if [ "$REFRESH" = true ]; then
+  case $promotion in
+    promote) STOP="$STOP Scheduled retrain: the from-scratch challenger \
+replaced the champion." ;;
+    *) STOP="$STOP Scheduled retrain: the champion was not replaced, so \
+the next run retrains from scratch again." ;;
+  esac
+fi
 if [ -d "$UPDATE" ]; then
   python Training/champion_slot.py manifest "$UPDATE"
 fi
 echo "$STOP"
 
+from_scratch=false
+if [ "$config" = Training/config/pipeline.toml ]; then
+  from_scratch=true
+fi
 python - "$RUN" "$config" "$STOP" "$gate" "$promotion" "$rescored" \
-  "$scoreable" "$champion_scores" "$membership" >>"$SUMMARY" <<'EOF'
+  "$scoreable" "$champion_scores" "$membership" "$from_scratch" "$REFRESH" \
+  >>"$SUMMARY" <<'EOF'
 import json
 import sys
 from pathlib import Path
 
 run = Path(sys.argv[1])
 (config, stop, gate, promotion, rescored, scoreable, champion_scores,
- membership) = sys.argv[2:]
+ membership, from_scratch, refresh) = sys.argv[2:]
 
 
 def load(path):
@@ -355,6 +382,8 @@ outcome = {
     "promotion": promotion,
     "champion_rescored": rescored == "true",
     "fixtures_scoreable": scoreable == "true",
+    "from_scratch": from_scratch == "true",
+    "refresh": refresh == "true",
     "leakage_flagged": gap.get("flagged", False),
     "leakage_streak": gap.get("streak_promoted_runs_over_threshold", 0),
     "membership_inference": membership,
