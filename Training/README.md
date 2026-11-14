@@ -28,6 +28,12 @@ what this repo validates; see the root README for repo-wide conventions.
 - `release_checks.py` — confirms an exported artifact carries nothing
   but the model's parameters: no pose sequences, no per-example
   embeddings (`docs/TRAINING_DESIGN.md` §6.2).
+- `segment_transform.py` — the reference segment transform: canonical
+  pose onto the farm's standard body (`TKS1`), which a client applies
+  before a segment-trained model (`docs/MODEL_CONTRACT.md` §3.6).
+- `make_segment_vectors.py` — writes its fixture vectors,
+  `fixtures/segment_transform/vectors.json`, which the client tests
+  against.
 - `make_smoke_fixture.py` — generates the tiny synthetic smoke fixture.
 - `fixture_runner.py` — scores a model on the trick-labeled fixture set
   and writes the fixture gate's input (turnip-ml#27); also the one place

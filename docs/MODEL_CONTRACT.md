@@ -398,6 +398,119 @@ contract, and the training measures built on it (`TRAINING_DESIGN.md`
 - **Everything else in §3.3 is unchanged:** NMS, merge, the pre-fill
   bar, the blind draw, and provenance.
 
+### 3.6 Segment input (models trained on farm segments)
+
+The farm now exports training pose only as **segments**: short windows
+around each labeled clip, re-targeted onto a standard body
+(turnip-farm `docs/POSE_FORMAT.md` §12, `BACKEND_DESIGN.md` §1.2.24). A
+model trained on them must see the same body frame at inference, so the
+client applies the same transform, without the noise, before it runs
+the model.
+
+**Status.** The transform, its reference implementation
+(`Training/segment_transform.py`) and its fixture vectors
+(`Training/fixtures/segment_transform/vectors.json`) are built. No
+published model takes this input yet: training on segments is the
+follow-up that switches the dataset. Until a model's
+`input_desc.format` is `"TKS1"`, the client feeds §3.1's `TKP1` input.
+The switch changes the input shape, so it bumps the model major version
+and `min_client_version` together (§5).
+
+#### 3.6.1 The transform
+
+The client runs it over the **take**: one person's scored canonical
+10 Hz frames, the sequence it runs the model over (§3.1). Input frames
+are 17 MoveNet keypoints `(x, y, confidence)` in `TKP1` units; a
+keypoint is detected iff its confidence is > 0.
+
+Per frame:
+
+- **Root:** the midpoint of the hips (keypoints 11, 12). A frame missing
+  either hip has no root and is a **gap frame**: all 13 output joints
+  missing.
+- **Neck:** the midpoint of the shoulders (5, 6), missing if either is.
+  It positions the shoulders and the head; it is not an output joint.
+- **Head:** the mean of the detected face keypoints 0–4, its confidence
+  the mean of theirs; missing if none is detected.
+- **Placement:** the root goes to `(root − center) / scale`. Every
+  other joint is placed from its parent's output position, along the
+  observed parent→child direction, at the standard bone length:
+
+  | Joint (TKS1 index) | `TKP1` keypoint | Parent | Bone length |
+  |---|---|---|---|
+  | neck (not output) | mid(5, 6) | root | 1.00 |
+  | left_hip (7), right_hip (8) | 11, 12 | root | 0.20 |
+  | left_shoulder (1), right_shoulder (2) | 5, 6 | neck | 0.35 |
+  | head (0) | mean of 0–4 | neck | 0.45 |
+  | left_elbow (3), right_elbow (4) | 7, 8 | shoulder | 0.55 |
+  | left_wrist (5), right_wrist (6) | 9, 10 | elbow | 0.50 |
+  | left_knee (9), right_knee (10) | 13, 14 | hip | 0.85 |
+  | left_ankle (11), right_ankle (12) | 15, 16 | knee | 0.80 |
+
+  Lengths are in torso lengths. Joints are placed in this table's order,
+  so a parent is always placed before its children.
+- **Missing joints:** a joint is missing when it is not detected, when
+  its parent is missing, or when it coincides with its parent (a
+  zero-length bone has no direction). A missing joint is `(0, 0, 0)`.
+- **Confidence:** the observed confidence of the joint, unchanged.
+
+Over the take (the only two statistics that span frames):
+
+- **scale:** the median, over frames with a root and a neck, of
+  `|neck − root|` in `TKP1` units; for an even count, the mean of the
+  two middle values. A take with no such frame has no output, and the
+  client does not run the model on it.
+- **center:** the mean root over frames with a root.
+
+**Model input:** `[T, 40]` float32, per frame the 13 joints' `(x, y,
+confidence)` in TKS1 order (`TKS1_JOINTS`), then the gap indicator: 1.0
+on a gap frame, else 0.0.
+
+**Numerics:** compute in float64 from the float32 inputs, round outputs
+to float32. The fixture vectors hold nine cases, one per rule above,
+each with its input, its 13-joint output and its model input. A client
+matches them at an absolute tolerance of 1e-5.
+
+Over a whole sequence this is the farm's `retargetSegment`
+(`src/ingest/segments.ts`) with the noise left out. Run on the same
+input, the two agree exactly: on the fixture vectors and on 300 random
+sequences with missing joints, gap frames and zero-length bones.
+
+#### 3.6.2 Where training and inference differ
+
+The farm runs the transform over the **segment** (a clip ± 0.5 s), the
+client over the **take**, because the client can't know where the clip
+is: that is what the model is looking for. Everything per frame is
+identical. Three things differ:
+
+1. **Noise.** The farm adds Gaussian noise (σ 0.02 torso lengths) to
+   every stored x and y. The client adds none. This is intended:
+   the noise is a privacy measure, not part of the model's input.
+2. **Center.** The farm centers on the segment's mean root, the client
+   on the take's. All of a segment's positions are therefore offset by
+   one constant: the segment's mean root, in torso lengths, measured
+   from the take's. The baseline's features include each joint's mean
+   position, so this offset reaches the model.
+   **Proposed fix (turnip-ml, no farm change):** make the model's
+   window features independent of the center. Subtract the window's
+   mean root, over the frames that have one, from every present joint
+   before averaging. Compute speeds only between frames where the joint
+   is present. A constant offset then cancels exactly on both sides, and
+   the segment's place in the picture stays out of the data. This lands
+   with the dataset switch, which redefines the features anyway.
+3. **Scale.** The farm divides root positions by the segment's median
+   torso length, the client by the take's. Bone lengths are standard,
+   so only root motion scales, by the ratio of the two medians. The
+   client can't reproduce the segment's median.
+   **Proposed fix (turnip-farm, one line):** in `retargetSegment`, take
+   the torso median over the whole canonical blob (`pose.frames`), not
+   the `[from, to)` slice. The farm cuts segments from the contributed
+   source; when that is the take's pose (§6 question 11), the client's
+   take median is then the same number. Only the median changes: the center can stay
+   per segment (fix 2), and nothing new is stored. Until the farm
+   changes, segment-trained models see root motion scaled by
+   `take median / segment median`.
+
 ## 4. OTA update flow
 
 - The client polls `GET /api/models/current` on app launch and on
@@ -510,3 +623,9 @@ contract, and the training measures built on it (`TRAINING_DESIGN.md`
     freezes the encoder, an embedding-space identifier in
     `output_desc.embedding` would let clients keep embeddings across
     versions that share it.
+11. Segment input (§3.6.2) — the farm's torso median over the whole
+    source (one line in `retargetSegment`) makes the client's scale
+    exact; until then root motion is scaled by take median ÷ segment
+    median. Whether the source the farm cuts from is always the same
+    frame sequence as the take the client runs the model over (one
+    person, same span) is worth confirming in `CONTRIBUTION_DESIGN.md`.
