@@ -35,7 +35,11 @@ what this repo validates; see the root README for repo-wide conventions.
 - `fixture_gate.py` — fixture regression gate (anti-poisoning).
 - `report_quarantine.py` — sends a fixture regression's `quarantine.json`
   to the farm (`POST /api/quarantine`, turnip-ml#51); `farm` mode only.
-- `promote.py` — champion/challenger promotion gate.
+- `promote.py` — champion/challenger promotion gate; `--refresh` for a
+  scheduled retrain.
+- `retrain_schedule.py` — the fixed retrain schedule: whether a
+  from-scratch retrain is due, and recording one
+  (`docs/TRAINING_DESIGN.md` §2.1).
 - `make_synthetic_fixtures.py` — generates a synthetic fixture set for
   the tests and the pipeline's synthetic rehearsal.
 - `config/smoke.toml` — smoke-test hyperparameters (used in CI).
@@ -187,20 +191,27 @@ The workflow has two modes:
      SHA-256 (`champion_slot.py verify`). A hand-placed, unversioned
      `champion/model.npz` is still restored, with a warning that it
      cannot be verified;
-  2. `fetch_dataset.py count`: skips the run at 50 or fewer new label rows
-     (dispatch `force` overrides);
-  3. `fetch_dataset.py build`: full pull into `data/dataset`;
-  4. `fetch_dataset.py count --out-sources`: the changed-source list;
-  5. `pipeline.sh` (below);
-  6. records `data/run` under `training/runs/<run id>/` in R2; stores
+  2. `retrain_schedule.py due`: a full retrain is due when the last one
+     (`training/state/retrain_state.json`) is 30 days old or none is
+     recorded. Then the run trains from scratch, with `REFRESH=true`:
+     the promotion gate replaces the champion unless the challenger is
+     more than 2% worse;
+  3. `fetch_dataset.py count`: skips the run at 50 or fewer new label rows
+     unless a retrain is due (dispatch `force` overrides);
+  4. `fetch_dataset.py build`: full pull into `data/dataset`;
+  5. `fetch_dataset.py count --out-sources`: the changed-source list;
+  6. `pipeline.sh` (below);
+  7. records `data/run` under `training/runs/<run id>/` in R2; stores
      what `pipeline.sh` staged in `data/run/champion_update/` as a new
      champion version, and only then rewrites `champion/current.json`, so
-     an upload that fails partway changes nothing; stores the decision
-     log;
-  7. after a fixture regression, sends `quarantine.json` to the farm with
+     an upload that fails partway changes nothing; then
+     `retrain_schedule.py record` notes today as the last full retrain
+     when a from-scratch challenger became the champion; stores the
+     decision log;
+  8. after a fixture regression, sends `quarantine.json` to the farm with
      `report_quarantine.py` (below): the export leaves the suspect
      sources out until the maintainer releases or purges them;
-  8. advances the watermark. After a regression only once the farm has
+  9. advances the watermark. After a regression only once the farm has
      accepted every quarantine request: a failed send fails the run and
      the watermark holds, so the next run's changed-source list still
      covers the suspect sources and sends them again.

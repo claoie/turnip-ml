@@ -65,6 +65,21 @@ what those PRs implement, it says so explicitly.
 - **Blob cache.** Pose blobs may be cached locally, keyed by `r2_key`
   and verified against `blob_sha256`. After each full pull, every
   cached blob whose source is absent from the pull is deleted.
+- **Scheduled retrain.** A full pull keeps deleted data out of new
+  training, but the nightly run fine-tunes the champion, whose weights
+  carry everything it was ever trained on, and it runs only past 50 new
+  label rows. So the farm job also retrains from scratch on a fixed
+  schedule (`Training/retrain_schedule.py`). Once the last full retrain
+  is 30 days old, or none is recorded, the next nightly run trains from
+  scratch whatever the label count. Its promotion gate runs as a
+  refresh (§8), so the challenger replaces the champion unless it is
+  clearly worse. *(Judgment call on 30 days, §10 Q12.)*
+  - A from-scratch challenger that becomes the champion (promoted or
+    bootstrapped) records the date in R2
+    (`training/state/retrain_state.json`).
+  - Until one lands, every nightly run tries again. Data deleted right
+    after a full retrain leaves the published model within about 30
+    days, plus any nights a gate refuses the refresh.
 
 ### 2.2 Canonicalization (raw → canonical)
 
@@ -378,8 +393,8 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   (`BACKEND_DESIGN.md` §9 Q8, EDPB Opinion 28/2024). The holdout report
   gains a membership-inference check: can the model's outputs tell
   training sources from holdout sources better than chance? Models are
-  retrained on a set schedule, so deleted data leaves within one cycle
-  (§2.1).
+  retrained from scratch on a set schedule, so deleted data leaves within
+  one cycle (§2.1, scheduled retrain).
 - **Release checks: nothing but the model ships.** No pose sequences
   and no per-example embeddings ship inside a model artifact (the
   second is the farm's privacy plan, `BACKEND_DESIGN.md` §8.1).
@@ -605,6 +620,12 @@ one review can clear.
   challenger beats the champion by **≥ 1% relative** improvement on the
   configured validation metric —
   `(challenger − champion) / champion ≥ 0.01` (PR #20).
+- **Refresh:** a scheduled retrain (§2.1) exists to replace the
+  champion, whose weights still carry data deleted since it was
+  trained, so it need not beat the champion. `promote.py --refresh`
+  promotes it unless it is more than 2% worse, relative
+  (`(challenger − champion) / champion ≥ −0.02`). *(Judgment call on
+  2%.)* The fixture gate runs before it as for every challenger.
 - **Judgment call:** for the production architecture (§4.2), the
   promotion metric should be the segment-quality composite (segment F1
   / mAP), not raw window accuracy — `val_accuracy` (PR #20's default)
@@ -680,6 +701,9 @@ one review can clear.
     is the closest offline proxy, and the contract's fixed clip-embedding
     rule makes that replay match the client.
 12. Rare-trick hold-back (§6.2) — the farm's `contributor_minimum` of 5
-    distinct contributors before a trick ships is a starting point.
-    Open: the retrain schedule that bounds how long deleted data stays
-    in a model.
+    distinct contributors before a trick ships is a starting point. The
+    retrain schedule that bounds how long deleted data stays in a model
+    (§2.1) is a starting point too: a from-scratch retrain every 30 days
+    that replaces the champion unless it is more than 2% worse. Open:
+    what to do when a gate keeps refusing the refresh, beyond retrying
+    nightly.
