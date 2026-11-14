@@ -388,13 +388,31 @@ estimation is MoveNet's job, and fine-tuning it is off the table
   leakage (§2.6). The holdout's people are outside the contributor
   pool, so a model that learned individuals rather than tricks shows
   up as a gap here.
-- **Proposed (not yet implemented): anonymity evidence.** Every device
-  receives the model, so treating it as anonymous needs evidence
+- **Anonymity evidence: membership inference.** Every device receives
+  the model, so treating it as anonymous needs evidence
   (`BACKEND_DESIGN.md` §9 Q8, EDPB Opinion 28/2024). The holdout report
-  gains a membership-inference check: can the model's outputs tell
-  training sources from holdout sources better than chance? Models are
-  retrained from scratch on a set schedule, so deleted data leaves within
-  one cycle (§2.1, scheduled retrain).
+  carries a membership-inference check (`Training/membership_inference.py`):
+  can the model's outputs tell training sources from holdout sources
+  better than chance?
+  - **Attack:** a confidence attack (Yeom et al., 2018). Each window
+    scores the model's probability for its true label, windowed and
+    standardized as training saw it; a source scores the mean over its
+    windows. A window whose label the model has no class for is left
+    out and counted.
+  - **Measure:** the ROC AUC of training-source scores against
+    holdout-source scores. 0.5 is chance.
+  - **Pass** iff AUC ≤ 0.60 and each side has at least 20 sources.
+    *(Judgment call on both, §10 Q6.)* With 20 holdout sources a model
+    that leaks nothing still scores above 0.60 in about 7% of runs;
+    fewer sources give no evidence either way, so the check fails
+    rather than pass on noise.
+  - The holdout's people are outside the contributor pool (§2.6), so a
+    model that learned individuals fails as well as one that memorized
+    sources. That errs on the side of failing.
+  - The promotion gate archives a challenger that did not pass (§8).
+- **Scheduled retrain.** Models are retrained from scratch on a set
+  schedule, so deleted data leaves within one cycle (§2.1, scheduled
+  retrain).
 - **Release checks: nothing but the model ships.** No pose sequences
   and no per-example embeddings ship inside a model artifact (the
   second is the farm's privacy plan, `BACKEND_DESIGN.md` §8.1).
@@ -617,15 +635,20 @@ one review can clear.
 
 - **Champion/challenger:** `Training/promote.py` compares the
   challenger's `metrics.json` against the champion's. Promote iff the
-  challenger beats the champion by **≥ 1% relative** improvement on the
-  configured validation metric —
-  `(challenger − champion) / champion ≥ 0.01` (PR #20).
+  challenger passed the membership-inference check in its holdout
+  report (§6.2) and beats the champion by **≥ 1% relative** improvement
+  on the configured validation metric —
+  `(challenger − champion) / champion ≥ 0.01` (PR #20). A challenger
+  that did not pass the check archives whatever its metric, and a
+  report without the check is an input error.
 - **Refresh:** a scheduled retrain (§2.1) exists to replace the
   champion, whose weights still carry data deleted since it was
   trained, so it need not beat the champion. `promote.py --refresh`
   promotes it unless it is more than 2% worse, relative
   (`(challenger − champion) / champion ≥ −0.02`). *(Judgment call on
-  2%.)* The fixture gate runs before it as for every challenger.
+  2%.)* The fixture gate runs before it as for every challenger, and
+  a refresh that did not pass the membership-inference check archives
+  like any other.
 - **Judgment call:** for the production architecture (§4.2), the
   promotion metric should be the segment-quality composite (segment F1
   / mAP), not raw window accuracy — `val_accuracy` (PR #20's default)
@@ -637,9 +660,11 @@ one review can clear.
   `Training/registry.json`; the nightly job keeps it in the private
   bucket as `training/registry.json`, next to every champion version;
   the farm's `models` table once `POST /api/models` exists).
-- **Gate order:** fixture regression (§6.3) → holdout evaluation
-  (§6.2, recorded) → promotion gate. A candidate that regresses on
-  fixtures never reaches champion/challenger comparison.
+- **Gate order:** holdout evaluation and the membership-inference check
+  (§6.2, recorded) → fixture regression (§6.3) → promotion gate. A
+  candidate that regresses on fixtures never reaches champion/challenger
+  comparison. A bootstrapped first champion (§6.3) passes no gate, the
+  check included; it is never published.
 - **Rollback:** the registry and the farm `models` table retain every
   promoted champion. Rollback publishes a new `models` row that
   re-promotes the previous champion's artifacts — a new unique
@@ -683,8 +708,11 @@ one review can clear.
    measurement before it can gate anything.
 5. Promotion metric for the production architecture (§8) — segment
    composite vs window accuracy.
-6. Membership-inference check (§6.2) — which attack, and what
-   advantage over chance counts as passing.
+6. Membership-inference check (§6.2) — a confidence attack, passing at
+   AUC ≤ 0.60 with at least 20 sources a side, is a starting point. A
+   stronger attack (shadow models, per-window rather than per-source
+   scores) or val sources as the non-members, which share the
+   contributor pool, may replace it.
 7. Person-leakage threshold (§2.6) — 0.05 absolute over three promoted
    runs is a starting point.
 8. Class-balance scheme (§2.7) — 1/√count is a starting point.

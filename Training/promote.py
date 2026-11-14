@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Champion/challenger promotion gate.
 
-ML pipeline step 6: promote the challenger only if it beats the current
-champion by >=1% on validation; otherwise archive it and try next cycle.
-The decision (metrics, timestamps) is recorded in the model registry.
+ML pipeline step 6: promote the challenger only if it passed the
+membership-inference check and beats the current champion by >=1% on
+validation; otherwise archive it and try next cycle. The decision
+(metrics, timestamps) is recorded in the model registry.
 
 Inputs
 ------
 --champion    metrics.json from Training/train.py for the current champion.
 --challenger  metrics.json from Training/train.py for the challenger.
+--holdout-report
+              the challenger's holdout_report.json, carrying the
+              "membership_inference" block Training/membership_inference.py
+              writes (TRAINING_DESIGN.md §6.2).
 --metric      validation metric key present in both files.
               Default: val_accuracy.
 --threshold   minimum *relative* improvement required to promote, as a
@@ -23,6 +28,9 @@ Inputs
 
 Decision rule
 -------------
+A challenger whose membership-inference check did not pass archives,
+whatever its metric: its outputs may tell its training sources apart.
+Otherwise:
     improvement = (challenger - champion) / champion      (champion != 0)
 Promote iff improvement >= threshold. When the champion's metric is 0,
 promote iff the challenger's metric is > 0; 0-vs-0 is "no improvement"
@@ -35,8 +43,9 @@ A scheduled retrain exists to replace the champion, whose weights still
 carry data deleted since it was trained (TRAINING_DESIGN.md §2.1), so it
 need not beat the champion: it promotes unless it is more than
 REFRESH_TOLERANCE (2%) worse, relative. *(Judgment call on 2%.)* The
-fixture gate runs before it as for every challenger. The record carries
-"refresh": true.
+fixture gate runs before it as for every challenger, and a refresh that
+did not pass the membership-inference check archives like any other.
+The record carries "refresh": true.
 
 Exit codes: 0 = promote, 3 = archive, 2 = input/usage error (fail closed).
 
@@ -51,9 +60,10 @@ record.
 Fail closed
 -----------
 Missing/unreadable files, invalid JSON, a missing or non-numeric
-(non-finite) metric, a non-finite or negative threshold, or a malformed
-existing registry file are errors, never silently treated as "archive"
-or "promote".
+(non-finite) metric, a holdout report without a membership_inference
+block or whose "passed" is not a boolean, a non-finite or negative
+threshold, or a malformed existing registry file are errors, never
+silently treated as "archive" or "promote".
 
 Concurrency note: two gate runs appending to the same registry file at
 once can interleave; the nightly scheduled trigger runs one gate at a
@@ -105,6 +115,17 @@ def metric_value(metrics: dict[str, Any], name: str, path: Path) -> float:
     if not math.isfinite(value):
         raise GateError(f"metric {name!r} in {path} is not finite: {value!r}")
     return float(value)
+
+
+def membership_inference(report_path: Path) -> dict[str, Any]:
+    """The holdout report's membership_inference block, validated."""
+    report = load_metrics(report_path)
+    block = report.get("membership_inference")
+    if not isinstance(block, dict):
+        raise GateError(f"{report_path} has no membership_inference block")
+    if not isinstance(block.get("passed"), bool):
+        raise GateError(f"{report_path} membership_inference.passed is not a boolean")
+    return block
 
 
 def decide(
@@ -170,6 +191,7 @@ def run(
     metric: str,
     threshold: float,
     registry_path: Path,
+    holdout_report_path: Path,
     refresh: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """Evaluate the gate. Returns (decision_record, exit_code)."""
@@ -177,8 +199,17 @@ def run(
     challenger_metrics = load_metrics(challenger_path)
     champion_v = metric_value(champion_metrics, metric, champion_path)
     challenger_v = metric_value(challenger_metrics, metric, challenger_path)
+    privacy = membership_inference(holdout_report_path)
 
     decision, improvement, reason = decide(champion_v, challenger_v, threshold, metric)
+    if not privacy["passed"]:
+        decision = "archive"
+        reason = (
+            "membership-inference check did not pass "
+            f"(auc {privacy.get('auc')}, max {privacy.get('max_auc')}; "
+            f"{privacy.get('n_holdout_sources')} holdout sources, "
+            f"min {privacy.get('min_sources')})"
+        )
     record = {
         "decided_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "metric": metric,
@@ -190,6 +221,7 @@ def run(
         "reason": reason,
         "champion_metrics": champion_metrics,
         "challenger_metrics": challenger_metrics,
+        "membership_inference": privacy,
         "refresh": refresh,
     }
 
@@ -217,6 +249,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--challenger", required=True, type=Path, help="metrics.json for the challenger"
+    )
+    p.add_argument(
+        "--holdout-report",
+        required=True,
+        type=Path,
+        help="the challenger's holdout_report.json (membership_inference block)",
     )
     p.add_argument(
         "--metric",
@@ -262,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
             args.metric,
             threshold,
             args.registry,
+            args.holdout_report,
             args.refresh,
         )
     except GateError as e:

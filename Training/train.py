@@ -584,15 +584,24 @@ def train_classifier(
     return np.asarray(W), np.asarray(b), l0, l1
 
 
+def predict_proba(
+    xp: types.ModuleType,
+    X: npt.NDArray[np.float64],
+    W: npt.NDArray[np.float64],
+    b: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """Per-window class probabilities, one row per window of X, as an xp
+    array."""
+    return _softmax(xp, X @ xp.asarray(W) + xp.asarray(b))
+
+
 def predict(
     xp: types.ModuleType,
     X: npt.NDArray[np.float64],
     W: npt.NDArray[np.float64],
     b: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.int64]:
-    return np.asarray(
-        xp.argmax(_softmax(xp, X @ xp.asarray(W) + xp.asarray(b)), axis=1)
-    )
+    return np.asarray(xp.argmax(predict_proba(xp, X, W, b), axis=1))
 
 
 def load_checkpoint(path: Path) -> dict[str, Any]:

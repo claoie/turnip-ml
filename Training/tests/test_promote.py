@@ -87,9 +87,26 @@ class RunTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.registry = self.root / "registry.json"
+        self.report = self.write_report(passed=True)
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def write_report(self, name="holdout_report.json", **block):
+        """A holdout report carrying a membership_inference block."""
+        report = {
+            "f1": 0.9,
+            "membership_inference": {
+                "auc": 0.5,
+                "max_auc": 0.6,
+                "min_sources": 20,
+                "n_holdout_sources": 20,
+                **block,
+            },
+        }
+        path = self.root / name
+        path.write_text(json.dumps(report), encoding="utf-8")
+        return path
 
     def write_metrics(self, name, **metrics):
         path = self.root / name
@@ -104,7 +121,7 @@ class RunTest(unittest.TestCase):
             "challenger.json", val_accuracy=0.82, train_loss=0.3
         )
         record, code = promote.run(
-            champion, challenger, "val_accuracy", 0.01, self.registry
+            champion, challenger, "val_accuracy", 0.01, self.registry, self.report
         )
         self.assertEqual(code, EXIT_PROMOTE)
         self.assertEqual(record["decision"], "promote")
@@ -123,7 +140,7 @@ class RunTest(unittest.TestCase):
         champion = self.write_metrics("champion.json", val_accuracy=0.80)
         challenger = self.write_metrics("challenger.json", val_accuracy=0.805)
         record, code = promote.run(
-            champion, challenger, "val_accuracy", 0.01, self.registry
+            champion, challenger, "val_accuracy", 0.01, self.registry, self.report
         )
         self.assertEqual(code, EXIT_ARCHIVE)
         self.assertEqual(record["decision"], "archive")
@@ -134,8 +151,8 @@ class RunTest(unittest.TestCase):
         champion = self.write_metrics("champion.json", val_accuracy=0.80)
         c1 = self.write_metrics("c1.json", val_accuracy=0.82)
         c2 = self.write_metrics("c2.json", val_accuracy=0.79)
-        promote.run(champion, c1, "val_accuracy", 0.01, self.registry)
-        promote.run(champion, c2, "val_accuracy", 0.01, self.registry)
+        promote.run(champion, c1, "val_accuracy", 0.01, self.registry, self.report)
+        promote.run(champion, c2, "val_accuracy", 0.01, self.registry, self.report)
         entries = json.loads(self.registry.read_text(encoding="utf-8"))
         self.assertEqual([e["decision"] for e in entries], ["promote", "archive"])
 
@@ -144,7 +161,7 @@ class RunTest(unittest.TestCase):
         # written to registry.json.tmp then atomically replaced.
         champion = self.write_metrics("champion.json", val_accuracy=0.80)
         c1 = self.write_metrics("c1.json", val_accuracy=0.82)
-        promote.run(champion, c1, "val_accuracy", 0.01, self.registry)
+        promote.run(champion, c1, "val_accuracy", 0.01, self.registry, self.report)
         self.assertFalse((self.root / "registry.json.tmp").exists())
         entries = json.loads(self.registry.read_text(encoding="utf-8"))
         self.assertEqual(len(entries), 1)
@@ -152,7 +169,9 @@ class RunTest(unittest.TestCase):
     def test_custom_metric_key(self):
         champion = self.write_metrics("champion.json", val_f1=0.70)
         challenger = self.write_metrics("challenger.json", val_f1=0.78)
-        record, code = promote.run(champion, challenger, "val_f1", 0.05, self.registry)
+        record, code = promote.run(
+            champion, challenger, "val_f1", 0.05, self.registry, self.report
+        )
         self.assertEqual(code, EXIT_PROMOTE)
         self.assertEqual(record["metric"], "val_f1")
 
@@ -161,10 +180,20 @@ class RunTest(unittest.TestCase):
         champion = self.write_metrics("champion.json", val_accuracy=0.80)
         challenger = self.write_metrics("challenger.json", val_accuracy=0.82)
         r1, _ = promote.run(
-            champion, challenger, "val_accuracy", 0.01, self.root / "r1.json"
+            champion,
+            challenger,
+            "val_accuracy",
+            0.01,
+            self.root / "r1.json",
+            self.report,
         )
         r2, _ = promote.run(
-            champion, challenger, "val_accuracy", 0.01, self.root / "r2.json"
+            champion,
+            challenger,
+            "val_accuracy",
+            0.01,
+            self.root / "r2.json",
+            self.report,
         )
         for key in (
             "metric",
@@ -179,25 +208,89 @@ class RunTest(unittest.TestCase):
         ):
             self.assertEqual(r1[key], r2[key], key)
 
+    # -- membership-inference check ---------------------------------------
+    def test_failed_membership_inference_archives_a_clear_win(self):
+        champion = self.write_metrics("champion.json", val_accuracy=0.50)
+        challenger = self.write_metrics("challenger.json", val_accuracy=0.90)
+        report = self.write_report("failed.json", passed=False, auc=0.75)
+        record, code = promote.run(
+            champion, challenger, "val_accuracy", 0.01, self.registry, report
+        )
+        self.assertEqual(code, EXIT_ARCHIVE)
+        self.assertEqual(record["decision"], "archive")
+        self.assertIn("membership-inference check did not pass", record["reason"])
+        self.assertIs(record["membership_inference"]["passed"], False)
+        entries = json.loads(self.registry.read_text(encoding="utf-8"))
+        self.assertEqual(entries[0]["decision"], "archive")
+
+    def test_passed_membership_inference_is_recorded(self):
+        champion = self.write_metrics("champion.json", val_accuracy=0.50)
+        challenger = self.write_metrics("challenger.json", val_accuracy=0.90)
+        record, code = promote.run(
+            champion, challenger, "val_accuracy", 0.01, self.registry, self.report
+        )
+        self.assertEqual(code, EXIT_PROMOTE)
+        self.assertIs(record["membership_inference"]["passed"], True)
+
+    def test_membership_inference_block_is_required(self):
+        champion = self.write_metrics("champion.json", val_accuracy=0.50)
+        challenger = self.write_metrics("challenger.json", val_accuracy=0.90)
+        no_block = self.root / "no_block.json"
+        no_block.write_text(json.dumps({"f1": 0.9}), encoding="utf-8")
+        for name, report in (
+            ("no block", no_block),
+            ("passed null", self.write_report("r1.json", passed=None)),
+            ("passed not a bool", self.write_report("r2.json", passed=1)),
+            ("no file", self.root / "absent.json"),
+        ):
+            with self.subTest(name), self.assertRaises(promote.GateError):
+                promote.run(
+                    champion, challenger, "val_accuracy", 0.01, self.registry, report
+                )
+        self.assertFalse(self.registry.exists())  # nothing recorded
+
+    def test_main_requires_the_holdout_report(self):
+        champion = self.write_metrics("champion.json", val_accuracy=0.50)
+        challenger = self.write_metrics("challenger.json", val_accuracy=0.90)
+        with self.assertRaises(SystemExit) as cm:
+            promote.main(
+                [
+                    "--champion",
+                    str(champion),
+                    "--challenger",
+                    str(challenger),
+                    "--registry",
+                    str(self.registry),
+                ]
+            )
+        self.assertEqual(cm.exception.code, 2)
+        self.assertFalse(self.registry.exists())
+
     # -- fail-closed paths -------------------------------------------------
     def test_missing_metric_key(self):
         champion = self.write_metrics("champion.json", val_accuracy=0.80)
         challenger = self.write_metrics("challenger.json", train_loss=0.3)
         with self.assertRaises(promote.GateError):
-            promote.run(champion, challenger, "val_accuracy", 0.01, self.registry)
+            promote.run(
+                champion, challenger, "val_accuracy", 0.01, self.registry, self.report
+            )
         self.assertFalse(self.registry.exists())  # nothing recorded
 
     def test_non_numeric_metric(self):
         champion = self.write_metrics("champion.json", val_accuracy="high")
         challenger = self.write_metrics("challenger.json", val_accuracy=0.82)
         with self.assertRaises(promote.GateError):
-            promote.run(champion, challenger, "val_accuracy", 0.01, self.registry)
+            promote.run(
+                champion, challenger, "val_accuracy", 0.01, self.registry, self.report
+            )
 
     def test_bool_metric_rejected(self):
         champion = self.write_metrics("champion.json", val_accuracy=True)
         challenger = self.write_metrics("challenger.json", val_accuracy=0.82)
         with self.assertRaises(promote.GateError):
-            promote.run(champion, challenger, "val_accuracy", 0.01, self.registry)
+            promote.run(
+                champion, challenger, "val_accuracy", 0.01, self.registry, self.report
+            )
 
     def test_nan_metric_rejected(self):
         champion = self.write_metrics("champion.json", val_accuracy=0.80)
@@ -205,7 +298,9 @@ class RunTest(unittest.TestCase):
         nan_path = self.root / "nan.json"
         nan_path.write_text('{"val_accuracy": NaN}', encoding="utf-8")
         with self.assertRaises(promote.GateError):
-            promote.run(champion, nan_path, "val_accuracy", 0.01, self.registry)
+            promote.run(
+                champion, nan_path, "val_accuracy", 0.01, self.registry, self.report
+            )
 
     def test_missing_file(self):
         with self.assertRaises(promote.GateError):
@@ -215,6 +310,7 @@ class RunTest(unittest.TestCase):
                 "val_accuracy",
                 0.01,
                 self.registry,
+                self.report,
             )
 
     def test_malformed_registry_refused(self):
@@ -222,7 +318,9 @@ class RunTest(unittest.TestCase):
         champion = self.write_metrics("champion.json", val_accuracy=0.80)
         challenger = self.write_metrics("challenger.json", val_accuracy=0.82)
         with self.assertRaises(promote.GateError):
-            promote.run(champion, challenger, "val_accuracy", 0.01, self.registry)
+            promote.run(
+                champion, challenger, "val_accuracy", 0.01, self.registry, self.report
+            )
 
     def test_non_finite_threshold_rejected(self):
         # A nan/inf threshold must fail closed (exit 2), never silently
@@ -241,10 +339,24 @@ class RunTest(unittest.TestCase):
                         bad,
                         "--registry",
                         str(self.registry),
+                        "--holdout-report",
+                        str(self.report),
                     ]
                 )
                 self.assertEqual(code, EXIT_ERROR)
         self.assertFalse(self.registry.exists())  # nothing recorded
+
+    def test_failed_membership_inference_archives_a_refresh(self):
+        champion = self.write_metrics("champion.json", val_accuracy=0.80)
+        same = self.write_metrics("same.json", val_accuracy=0.80)
+        report = self.write_report("failed.json", passed=False, auc=0.75)
+        threshold = -promote.REFRESH_TOLERANCE
+        record, code = promote.run(
+            champion, same, "val_accuracy", threshold, self.registry, report, True
+        )
+        self.assertEqual(code, EXIT_ARCHIVE)
+        self.assertIn("membership-inference check did not pass", record["reason"])
+        self.assertIs(record["refresh"], True)
 
     def test_main_refresh(self):
         champion = self.write_metrics("champion.json", val_accuracy=0.80)
@@ -256,6 +368,8 @@ class RunTest(unittest.TestCase):
             str(same),
             "--registry",
             str(self.registry),
+            "--holdout-report",
+            str(self.report),
         ]
         self.assertEqual(promote.main(base), EXIT_ARCHIVE)
         self.assertEqual(promote.main([*base, "--refresh"]), EXIT_PROMOTE)
@@ -278,6 +392,8 @@ class RunTest(unittest.TestCase):
             str(challenger),
             "--registry",
             str(self.registry),
+            "--holdout-report",
+            str(self.report),
         ]
         self.assertEqual(promote.main(base), EXIT_PROMOTE)
         weak = self.write_metrics("weak.json", val_accuracy=0.801)
@@ -290,6 +406,8 @@ class RunTest(unittest.TestCase):
                     str(weak),
                     "--registry",
                     str(self.registry),
+                    "--holdout-report",
+                    str(self.report),
                 ]
             ),
             EXIT_ARCHIVE,
@@ -304,6 +422,8 @@ class RunTest(unittest.TestCase):
                     str(missing),
                     "--registry",
                     str(self.registry),
+                    "--holdout-report",
+                    str(self.report),
                 ]
             ),
             EXIT_ERROR,

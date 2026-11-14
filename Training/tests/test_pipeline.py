@@ -25,6 +25,12 @@ SOURCE_B = "b" * 64
 # (FROM_SCRATCH, BOOTSTRAP_CHAMPION, ...) is set by the test or not at all.
 INHERITED_ENV = ("HOME", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT")
 FULL_SLOT = ["champion.json", "fixture_scores.json", "metrics.json", "model.npz"]
+# The smoke dataset has 4 train and 2 holdout sources, far below the
+# membership-inference check's minimum, so the template's copy of the check
+# is made lenient: every test but the one that checks the real constants
+# exercises the gates behind it.
+MI_STRICT = "MAX_AUC = 0.60\nMIN_SOURCES = 20\n"
+MI_LENIENT = "MAX_AUC = 1.0\nMIN_SOURCES = 1\n"
 
 # Built once for the module (see setUpModule).
 BIN: Path
@@ -76,6 +82,7 @@ def setUpModule():
         TEMPLATE / "Training",
         ignore=shutil.ignore_patterns("__pycache__", "registry.json"),
     )
+    set_mi_constants(TEMPLATE, MI_LENIENT)
     for script, out in (
         ("make_smoke_fixture.py", "data/dataset"),
         ("make_synthetic_fixtures.py", "data/fixtures"),
@@ -93,6 +100,16 @@ def setUpModule():
         raise RuntimeError(f"bootstrap run failed:\n{result.stderr}")
     shutil.move(TEMPLATE / "data" / "run", TEMPLATE / "data" / "bootstrap")
     (TEMPLATE / "data" / "registry.json").unlink(missing_ok=True)
+
+
+def set_mi_constants(root, constants):
+    """Rewrite the membership-inference thresholds in a copy of Training/."""
+    path = Path(root) / "Training" / "membership_inference.py"
+    text = path.read_text()
+    current = MI_LENIENT if MI_LENIENT in text else MI_STRICT
+    if current not in text:
+        raise RuntimeError("membership_inference.py constants moved")
+    path.write_text(text.replace(current, constants))
 
 
 class PipelineTestCase(unittest.TestCase):
@@ -164,6 +181,7 @@ def outcome(
     scoreable=True,
     leakage_flagged=False,
     leakage_streak=0,
+    membership="pass",
     from_scratch=False,
     refresh=False,
 ):
@@ -175,6 +193,7 @@ def outcome(
         "refresh": refresh,
         "leakage_flagged": leakage_flagged,
         "leakage_streak": leakage_streak,
+        "membership_inference": membership,
         "promotion": promotion,
     }
 
@@ -397,6 +416,25 @@ class GatesTest(PipelineTestCase):
             self.assertIn("PUBLISH is not true", result.stdout)
             self.assertFalse((self.run_dir / "challenger" / "publish.json").exists())
 
+    def test_failed_membership_inference_archives_the_challenger(self):
+        # The real constants: the smoke dataset's 2 holdout sources are
+        # under the minimum, so the check fails and a challenger that
+        # would otherwise promote is archived.
+        set_mi_constants(self.root, MI_STRICT)
+        self.seed_champion(**{"metrics.json": {"val_accuracy": 0.5}})
+        result = self.ok(PUBLISH="true")
+        self.assertEqual(self.outcome(), outcome("pass", "archive", membership="fail"))
+        self.assertEqual(self.update_files(), [])
+        self.assertIn("membership-inference check", result.stdout)
+        self.assertIn("nothing was promoted", result.stdout)
+        report = self.load(self.run_dir / "challenger" / "holdout_report.json")
+        self.assertIs(report["membership_inference"]["passed"], False)
+        self.assertEqual(report["membership_inference"]["n_holdout_sources"], 2)
+        promotion = self.load(self.run_dir / "promotion.json")
+        self.assertEqual(promotion["decision"], "archive")
+        summary = (self.root / "summary.md").read_text()
+        self.assertIn("Membership inference (§6.2): fail", summary)
+
     def test_scheduled_retrain_replaces_an_equal_champion(self):
         # The from-scratch challenger matches the champion's val accuracy
         # (the smoke data is separable): a normal run archives it, a
@@ -423,6 +461,30 @@ class GatesTest(PipelineTestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("REFRESH=true needs FROM_SCRATCH=true", result.stderr)
         self.assertFalse(self.run_dir.exists())
+
+    def test_a_refresh_that_fails_membership_inference_is_archived(self):
+        # A scheduled retrain needs no improvement, but the
+        # membership-inference check still applies to it.
+        set_mi_constants(self.root, MI_STRICT)
+        self.seed_champion()
+        result = self.ok(FROM_SCRATCH="true", REFRESH="true")
+        self.assertEqual(
+            self.outcome(),
+            outcome(
+                "pass",
+                "archive",
+                membership="fail",
+                from_scratch=True,
+                refresh=True,
+            ),
+        )
+        self.assertEqual(self.update_files(), [])
+        self.assertIn("membership-inference check", result.stdout)
+        self.assertIn("the next run retrains from scratch again", result.stdout)
+        promotion = self.load(self.run_dir / "promotion.json")
+        self.assertEqual(promotion["decision"], "archive")
+        self.assertIs(promotion["refresh"], True)
+        self.assertIs(promotion["membership_inference"]["passed"], False)
 
     def test_champion_without_metrics_runs_the_gate_only(self):
         self.seed_champion()

@@ -13,6 +13,10 @@ what this repo validates; see the root README for repo-wide conventions.
   `source_id` (turnip-ml#12). See its docstring for the full contract.
 - `train.py` — champion training / fine-tuning script (turnip-ml#13).
   Hermetic TOML config, deterministic, CI smoke-tested.
+- `membership_inference.py` — the membership-inference check: can the
+  model's outputs tell training sources from holdout sources? Written
+  into the holdout report; the promotion gate archives a model that
+  fails it (`docs/TRAINING_DESIGN.md` §6.2).
 - `name_metrics.py` — per-name holdout precision/recall plus holdout and
   train counts (from `train.py`'s `metrics.json`), the manifest's
   `name_metrics` (turnip-ml#41).
@@ -35,8 +39,9 @@ what this repo validates; see the root README for repo-wide conventions.
 - `fixture_gate.py` — fixture regression gate (anti-poisoning).
 - `report_quarantine.py` — sends a fixture regression's `quarantine.json`
   to the farm (`POST /api/quarantine`, turnip-ml#51); `farm` mode only.
-- `promote.py` — champion/challenger promotion gate; `--refresh` for a
-  scheduled retrain.
+- `promote.py` — champion/challenger promotion gate; reads the holdout
+  report's membership-inference check, and `--refresh` for a scheduled
+  retrain.
 - `retrain_schedule.py` — the fixed retrain schedule: whether a
   from-scratch retrain is due, and recording one
   (`docs/TRAINING_DESIGN.md` §2.1).
@@ -225,7 +230,8 @@ The workflow has two modes:
 `Training/pipeline.sh` is the shared chain: `split_dataset.py` →
 `train.py` (`config/pipeline-finetune.toml` when a champion was restored,
 else `config/pipeline.toml`; dispatch `from_scratch` forces the latter) →
-`predict.py` on holdout → `evaluate.py` → `name_metrics.py` →
+`predict.py` on holdout → `evaluate.py` → `membership_inference.py` →
+`name_metrics.py` →
 `fixture_runner.py` on the challenger → `fixture_gate.py` against the
 champion's recorded fixture scores (re-scoring the champion once when they
 are missing or from another fixture set) → `promote.py` if the gate passed
@@ -244,6 +250,10 @@ job summary:
   the first champion. Bootstrap records the champion's fixture scores, so
   it is refused while the fixture set has nothing to score;
 - a fixture regression: promotion is skipped;
+- a challenger that failed the membership-inference check: the
+  promotion gate archives it. The smoke fixture has 2 holdout sources,
+  under the check's minimum of 20, so the `synthetic` rehearsal's
+  second run always archives;
 - a champion without `metrics.json`: the fixture gate runs, but the
   promotion gate has nothing to compare against and does not;
 - publishing follows a gated promotion only: a bootstrapped champion
