@@ -577,6 +577,84 @@ class HoldBackTest(FetchTestCase):
                 self.assertFalse((self.root / f"o{i}").exists())
 
 
+# "raiz" is a raw of the canonical "raiz flip"; no raw is "raiz flip".
+RAIZ_TAXONOMY = [
+    *TAXONOMY,
+    {"raw": "raiz", "canonical": "raiz flip", "taxonomy_version": 1},
+]
+RAIZ_COUNTS = {**COUNTS, "raiz flip": MINIMUM}
+
+
+def resolved(entry, *canonicals):
+    """The entry with the farm's labels[].canonical set, label by label."""
+    labels = [
+        {**label, "canonical": c}
+        for label, c in zip(entry["labels"], canonicals, strict=True)
+    ]
+    return {**entry, "labels": labels}
+
+
+class LabelCanonicalTest(FetchTestCase):
+    """labels[].canonical: the farm's resolution of a name (farm #81)."""
+
+    def export(self, *entries):
+        return FakeExport(list(entries), taxonomy=RAIZ_TAXONOMY, counts=RAIZ_COUNTS)
+
+    def test_a_canonical_only_name_trains_under_the_farms_canonical(self):
+        entry = segment(3, [("Raiz Flip", "vocabulary", 1)])
+        stats = self.build(self.export(resolved(entry, "raiz flip")))
+        self.assertEqual(self.sample(3)["tricks"][0]["name"], "raiz flip")
+        self.assertEqual(stats["unmapped_tokens"], 0)
+        self.assertEqual(
+            (self.root / "dataset" / "unmapped_labels.log").read_text(), ""
+        )
+        # Without the field, the raw lookup misses it: an unmapped token.
+        stats = self.build(self.export(entry), out="without")
+        self.assertEqual(stats["unmapped_tokens"], 1)
+
+    def test_a_double_spaced_name_uses_the_farms_canonical(self):
+        entry = segment(3, [("Cork  Screw", "typed", 1)])
+        stats = self.build(self.export(resolved(entry, "cork")))
+        self.assertEqual(self.sample(3)["tricks"][0]["name"], "cork")
+        self.assertEqual(stats["unmapped_tokens"], 0)
+
+    def test_the_farms_canonical_wins_over_the_raw_lookup(self):
+        entry = segment(3, [("corkscrew", "typed", 1)])
+        self.build(self.export(resolved(entry, "gainer")))
+        self.assertEqual(self.sample(3)["tricks"][0]["name"], "gainer")
+
+    def test_a_null_canonical_is_canonicalized_here_as_unmapped(self):
+        entry = segment(5, [("Mystery Flip", "typed", 1)], start=0, end=40)
+        stats = self.build(self.export(resolved(entry, None)))
+        self.assertEqual(self.sample(5)["tricks"][0]["name"], "mystery flip")
+        self.assertEqual(stats["unmapped_tokens"], 1)
+        log = (self.root / "dataset" / "unmapped_labels.log").read_text()
+        self.assertEqual(log, "1\tmystery flip\n")
+
+    def test_a_missing_canonical_uses_the_raw_lookup(self):
+        entry = segment(3, [("corkscrew", "typed", 1)])
+        self.assertNotIn("canonical", entry["labels"][0])
+        self.build(self.export(entry))
+        self.assertEqual(self.sample(3)["tricks"][0]["name"], "cork")
+
+    def test_labels_may_mix_resolved_and_unresolved(self):
+        entry = segment(3, [("Cork", "typed", 1), ("hook", "typed", 1)])
+        entry = {
+            **entry,
+            "labels": [{**entry["labels"][0], "canonical": "cork"}, entry["labels"][1]],
+        }
+        self.build(self.export(entry))
+        self.assertEqual(
+            [t["name"] for t in self.sample(3)["tricks"]], ["cork", "hook"]
+        )
+
+    def test_malformed_canonical_is_refused(self):
+        entry = segment(3, [("Cork", "typed", 1)])
+        for bad in ("", "Cork", " cork", "cork  screw", "cork+gainer", 7, ["cork"]):
+            with self.subTest(canonical=bad):
+                self.assert_build_refused([resolved(entry, bad)])
+
+
 class SegmentValidationTest(FetchTestCase):
     def test_malformed_segments(self):
         cork = [("Cork", "typed", 1)]

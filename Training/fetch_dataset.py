@@ -58,10 +58,17 @@ build --out DIR --cache DIR
                                  counts and sorted sample ids
       unmapped_labels.log        "<count>\\t<token>" per unmapped label
                                  token, the taxonomy curation queue
-    Raw labels are canonicalized at one pinned taxonomy version: the
-    farm's current one, i.e. the greatest taxonomy_version in the export's
-    taxonomy or labels, so a curation-only bump applies to every label at
-    the next run (see canonicalize.py for the per-raw resolution).
+    A label whose `canonical` is a string trains as that name: the farm
+    resolved it by its normalized form against every taxonomy raw and
+    canonical (turnip-farm BACKEND_DESIGN.md §1.2.25, §7.3), which also
+    finds a canonical-only name or one typed with odd spacing or case. A
+    label whose `canonical` is null (a pre-vocabulary free-text name) or
+    missing (an export from before the field) is canonicalized here, as
+    before: at one pinned taxonomy version, the farm's current one (the
+    greatest taxonomy_version in the export's taxonomy or labels, so a
+    curation-only bump applies to every label at the next run; see
+    canonicalize.py for the per-raw resolution). Its unmapped tokens train
+    under their normalized form and go to the curation queue.
     A label that canonicalizes to no name at all (only parentheticals or
     delimiters) contributes nothing; a segment left without names is
     dropped.
@@ -170,7 +177,7 @@ from pathlib import Path
 from typing import IO, Any
 
 import tks1
-from canonicalize import Taxonomy, TaxonomyError
+from canonicalize import Taxonomy, TaxonomyError, normalize
 
 EXIT_OK = 0
 EXIT_ERROR = 2
@@ -210,6 +217,9 @@ SEGMENT_FIELDS = frozenset(
     }
 )
 LABEL_FIELDS = frozenset({"trick_name", "origin", "taxonomy_version"})
+# The farm's resolution of trick_name (BACKEND_DESIGN.md §7.3): optional,
+# so an export from before the field still reads.
+LABEL_CANONICAL = "canonical"
 # Fields that would tie a segment to a person or a session.
 IDENTIFYING_FIELDS = ("user_id", "source_id")
 # The only files the blob cache writes, under <cache>/segments/.
@@ -232,6 +242,9 @@ class Label:
     trick_name: str
     origin: str
     taxonomy_version: int
+    # The farm's canonical name; None when it sent null or no field, and
+    # the label is canonicalized here instead.
+    canonical: str | None = None
 
 
 @dataclass(frozen=True)
@@ -284,8 +297,12 @@ def is_segment_id(value: Any) -> bool:
 
 def _parse_label(i: int, j: int, label: Any) -> Label:
     where = f"export segment {i} label {j}"
-    if not isinstance(label, dict) or set(label) != LABEL_FIELDS:
-        raise FetchError(f"{where} must be {{trick_name, origin, taxonomy_version}}")
+    if not isinstance(label, dict) or not (
+        LABEL_FIELDS <= set(label) <= LABEL_FIELDS | {LABEL_CANONICAL}
+    ):
+        raise FetchError(
+            f"{where} must be {{trick_name, origin, taxonomy_version, canonical?}}"
+        )
     name = label["trick_name"]
     if not isinstance(name, str) or not name.strip():
         raise FetchError(f"{where}: trick_name must be a non-empty string")
@@ -296,7 +313,17 @@ def _parse_label(i: int, j: int, label: Any) -> Label:
     origin = label["origin"]
     if not isinstance(origin, str) or origin not in ORIGINS:
         raise FetchError(f"{where}: origin must be one of {', '.join(ORIGINS)}")
-    return Label(name, origin, version)
+    canonical = label.get(LABEL_CANONICAL)
+    if canonical is not None and not (
+        isinstance(canonical, str)
+        and canonical
+        and canonical == normalize(canonical)
+        and "+" not in canonical
+    ):
+        raise FetchError(
+            f'{where}: canonical must be null or a normalized name without "+"'
+        )
+    return Label(name, origin, version, canonical)
 
 
 def parse_segment(i: int, entry: Any) -> Segment:
@@ -757,7 +784,10 @@ def _write_dataset(
         # canonical name -> the origins of the raw labels that gave it.
         names: dict[str, set[str]] = {}
         for label in segment.labels:
-            canonical, tokens = taxonomy.canonicalize(label.trick_name)
+            if label.canonical is not None:
+                canonical, tokens = [label.canonical], []
+            else:
+                canonical, tokens = taxonomy.canonicalize(label.trick_name)
             for n in canonical:
                 names.setdefault(n, set()).add(label.origin)
             unmapped.update(tokens)

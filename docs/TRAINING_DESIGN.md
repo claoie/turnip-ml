@@ -100,6 +100,21 @@ Applied **at dataset build time**, pinned to a single `taxonomy_version`
 for the whole training run. The farm preserves raw free-text strings
 forever; training consumes canonical names via `label_taxonomy`.
 
+- **The farm's resolution comes first.** Each exported label may carry
+  `canonical`: the farm's resolution of `trick_name` by its normalized
+  form (trim, collapse whitespace runs, lowercase) against every
+  taxonomy raw **and** canonical (`BACKEND_DESIGN.md` §1.2.25, §7.3).
+  When it is a string, the label trains as that name. This finds what
+  an exact raw lookup misses: a name accepted through a canonical with
+  no raw row (after `labels:promote`), or one typed with odd spacing or
+  case.
+- **`null` or missing falls back to the steps below.** `null` marks a
+  pre-vocabulary free-text label the farm could not resolve, so it goes
+  through the lookup here and its unknown tokens are unmapped (step 4).
+  A missing field (an export from before it) gets the same treatment.
+- A `canonical` that is not a normalized name without `+` is malformed:
+  the build fails.
+
 - **The pin is the farm's current version:** the greatest
   `taxonomy_version` in the taxonomy the export ships, not the greatest
   among the label rows. A curation-only bump (new mappings, no new
@@ -110,7 +125,7 @@ forever; training consumes canonical names via `label_taxonomy`.
   lookup). The export must therefore ship the whole table, not only the
   versions present in its rows (`BACKEND_DESIGN.md` §7.3).
 
-Deterministic pipeline per label string:
+Deterministic pipeline per label string without a farm `canonical`:
 
 1. Normalize: lowercase, trim, collapse internal whitespace.
 2. Strip parentheticals like `(combo)`.
